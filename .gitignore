@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Real settings carry secrets; the tracked template documents every key with
+# blank values, so a missing key breaks the next person's first run visibly.
+functionapp/local.settings.json
+
+# Real inputs and generated artifacts, including the live-printer test page.
+# live-printer-check.ps1 writes its throwaway copy to TEMP; make_test_pdf.py
+# with no argument writes here.
+out/
+samples/
+*.key
+.DS_Store
+Thumbs.db
+*.code-workspace
+
+# Machine-specific notes: paths, shims, local revert steps.
+CLAUDE.local.md
+
+# Single-developer repo: the assistant's permission allowlist is machine-local
+# and accumulates session-scoped temp paths.
+.claude/settings.local.json
+.claude/settings.json
+
+# Azurite local emulator artifacts
+__azurite_db*.json
+__blobstorage__/
+__queuestorage__/
+AzuriteConfig
+
+# Local-only documents: working plans, drafts, one-off analyses. Tracked docs
+# live directly under docs/ and docs/ai/.
+docs/gitignore/

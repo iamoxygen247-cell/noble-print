@@ -1,0 +1,159 @@
+{
+  "_comment": [
+    "Noble's real Universal Print registration, captured from the Azure portal on",
+    "2026-08-30 America/Vancouver (Universal Print > Printers >",
+    "Brother DCP-L2540DW series:",
+    "Overview, Properties > Printer defaults, and Connectors).",
+    "",
+    "These are RESOURCE IDENTIFIERS, not credentials: they name objects inside the",
+    "tenant and are useless without a token. The printer share id is a routine",
+    "request parameter Power Automate passes on every call. No secret is here.",
+    "",
+    "Why it earns a place in the suite: the printer id and the share id are two",
+    "DIFFERENT GUIDs, and mixing them up is exactly defect F3 -- Resubmit cancelled",
+    "against the wrong one, got a 404, and reported a clean cancel while the",
+    "original job stayed alive to print twice. With both real values here, that",
+    "class of mistake fails with a legible diff instead of two lookalikes.",
+    "",
+    "DATE NOTE, so nobody 'corrects' it: the prose above says 2026-08-30 and the",
+    "ISO fields below say 2026-08-31. Both are right. The instants are UTC, as",
+    "Graph returns them; 2026-08-31T00:54Z is 2026-08-30 17:54 in",
+    "America/Vancouver, which is the clock this project renders Print_Message in."
+  ],
+
+  "capturedOn": "2026-08-31T00:54:00Z",
+
+  "printer": {
+    "id": "ffa65a34-615c-493b-9eff-d227133293ac",
+    "displayName": "Brother DCP-L2540DW series",
+    "model": "DCP-L2540DW series",
+    "manufacturer": "Brother Industries, Ltd",
+    "registeredDateTime": "2026-08-28T20:29:13.0057041Z",
+    "lastSeenDateTime": "2026-08-31T00:54:00Z",
+    "isAcceptingJobs": true,
+    "status": {
+      "_source": "CORRECTED 2026-08-30 from the live API via live-printer-check.ps1.",
+      "_note": [
+        "The API returns 'idle'. The PORTAL displays 'Ready'. They are not the",
+        "same string, and an earlier revision of this file recorded the portal's",
+        "display text as if it were an API value -- so two tests asserted a state",
+        "Graph never returns. printerProcessingState is documented as",
+        "unknown | idle | processing | stopped; 'ready' is not a member."
+      ],
+      "state": "idle",
+      "details": []
+    }
+  },
+
+  "share": {
+    "_source": [
+      "RE-SHARED 2026-08-31 16:14 UTC. The printer share was deleted and created",
+      "again in the portal, which MINTS A NEW SHARE ID. The old one,",
+      "5de37377-8b08-459f-b7a6-670349acb4f7, is dead: Graph answers it with",
+      "404 'The printer share id ... does not match any registered printers.'",
+      "",
+      "The PRINTER id did not change and cannot -- registeredDateTime above is",
+      "still 2026-08-28. That asymmetry is the point worth remembering: the id",
+      "this pipeline passes on every call (the share) is the volatile one, and",
+      "the id it never receives from the caller (the printer, resolved at",
+      "preflight) is the stable one. Anywhere the share id is written down --",
+      "README, docs, this fixture, the Power Automate Flow bodies, the",
+      "live-printer-check.ps1 default -- goes stale the moment someone re-shares.",
+      "",
+      "So a 404 on the share route means 'look up the share id again', NOT",
+      "'the printer is gone'."
+    ],
+    "id": "a11f0263-68b7-45f4-b042-f1b4b30b60a3",
+    "displayName": "Brother DCP-L2540DW series",
+    "createdDateTime": "2026-08-31T16:14:00Z",
+    "isAcceptingJobs": true,
+    "status": {
+      "state": "idle",
+      "details": []
+    },
+    "printer": {
+      "id": "ffa65a34-615c-493b-9eff-d227133293ac"
+    },
+    "capabilities": {
+      "_source": "CORRECTED 2026-08-30 from the live API via live-printer-check.ps1.",
+      "_note": [
+        "contentTypes is the CAPABILITY list and holds TWO entries. An earlier",
+        "revision recorded only application/pdf, taken from the portal's",
+        "Properties > Printer defaults page -- but that page shows the DEFAULT",
+        "content type, not everything the device accepts. capabilities and",
+        "defaults are different objects and the portal does not label which is",
+        "which. Read capabilities from the API, never from a settings page.",
+        "",
+        "What matters for this pipeline is unchanged and now verified against the",
+        "service rather than a screenshot: application/pdf IS supported, so the",
+        "PDFs pulled out of SharePoint go straight to the device with no OXPS",
+        "conversion.",
+        "",
+        "'Fit PDF to page' and 'Multipage layout' are GREYED OUT in the portal --",
+        "the device does not support them. JOB_CONFIGURATION must never start",
+        "sending either; test_real_printer.py asserts that."
+      ],
+      "contentTypes": [
+        "application/pdf",
+        "application/oxps"
+      ],
+      "isColorPrintingSupported": false,
+      "supportsFitPdfToPage": false,
+      "colorModes": ["grayscale"],
+      "duplexModes": ["oneSided"],
+      "orientations": ["portrait", "landscape"],
+      "qualities": ["medium"],
+      "outputBins": ["auto"],
+      "pagesPerSheet": [1],
+      "copiesPerJob": {"start": 1, "end": 999}
+    },
+    "defaults": {
+      "_source": "VERIFIED from Properties > Printer defaults, 2026-08-30.",
+      "copiesPerJob": 1,
+      "contentType": "application/pdf",
+      "pagesPerSheet": 1,
+      "orientation": "portrait",
+      "outputBin": "auto",
+      "fitPdfToPage": null,
+      "multipageLayout": null,
+      "colorMode": "grayscale",
+      "quality": "medium",
+      "duplexMode": "oneSided"
+    }
+  },
+
+  "connectors": {
+    "_source": "CONFIRMED 2026-08-30 by live-printer-check.ps1 -DiagnoseOnly: 0 connectors on this printer AND 0 in the whole tenant.",
+    "_note": [
+      "SETTLED 2026-08-30: this printer is UNIVERSAL PRINT READY and registered",
+      "DIRECTLY. No connector is needed and none exists.",
+      "",
+      "How it was settled -- by measurement, not inference. scripts/",
+      "live-printer-check.ps1 submitted a real job while the API reported 0",
+      "connectors on this printer AND 0 across the entire tenant. Job id 6 went",
+      "pending -> processing -> completed in about five seconds and a page came",
+      "out of the tray. Nothing could have been bridging it, so the service is",
+      "talking to the device itself.",
+      "",
+      "Two earlier answers are kept here because both were wrong in instructive",
+      "ways. The first claimed this was confirmed by the Overview blade reading",
+      "'Last seen: 2 minutes ago / Ready / accepting jobs' -- it was not: a",
+      "connector's heartbeat updates last-seen exactly as a native printer's",
+      "does, so those signals fit both cases. The second treated 0 connectors as",
+      "decisive -- it was not either, for the same reason: 0 connectors is what",
+      "you see both when none is needed and when one is missing. Only putting",
+      "paper in the tray separated them.",
+      "",
+      "Operational consequence, now that it is known: there is NO Windows host in",
+      "this path. Nothing to keep powered on, nothing to patch, no single point",
+      "of failure between Universal Print and the device.",
+      "",
+      "Deliberately NOT checked by the app. Listing connectors needs the",
+      "PrintConnector.Read.All scope, and it would tell us less than",
+      "isAcceptingJobs and status.state already do -- which the preflight reads.",
+      "Adding an admin-consented permission for a weaker signal is a bad trade.",
+      "The diagnostic script asks for it; the Function App does not."
+    ],
+    "value": []
+  }
+}

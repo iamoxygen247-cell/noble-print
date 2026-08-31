@@ -1,0 +1,939 @@
+# noble-print — SharePoint → Universal Print utility
+
+> **First implementation step:** create `noble-print/docs/` and save this file there as
+> `docs/design.md`. Plan mode is read-only except for the plan file. Also copy
+> `docs/project-playbook.md` from `noble-invoice-process` into `docs/ai/project-playbook.md`
+> (cited below as §P-n).
+
+---
+
+## 1. Context
+
+Noble Homes has a SharePoint document library whose files carry four columns:
+`Print_Status`, `Print_JobId`, `Print_Message`, `Printer_Name`. An upstream process drops files
+in with `Print_Status = "PRINT_READY"`. They must reach a physical printer through Microsoft
+Universal Print, with the outcome written back onto each file so **the library is both the work
+queue and the audit trail** — no separate database.
+
+This repo (`noble-print/`, empty today) holds a Python Azure Function App with three named HTTP
+endpoints that Power Automate calls on a schedule.
+
+**Design goal beyond the immediate requirement:** this is a *utility*, expected to be reused by
+other workflows. Reuse comes from **layering and single-source-of-truth constants** (§P-2.2), not
+a runtime configuration engine — see §9. Volume/traffic scaling is explicitly a non-goal.
+
+### Endpoint names
+
+| Name | Route | Responsibility |
+|---|---|---|
+| **Submit** | `POST /api/print/submit` | Claim the oldest `PRINT_READY` files and create print jobs |
+| **Poll** | `POST /api/print/status` | Check `PRINT_PENDING` jobs, mark the finished ones |
+| **Resubmit** | `POST /api/print/resubmit` | Cancel and retry outstanding jobs older than 72 h |
+
+Referred to by name throughout — never "endpoint 1/2/3".
+
+### Agreed decisions
+
+| Question | Choice |
+|---|---|
+| Universal Print auth | Refresh token in Key Vault, device-code bootstrap, rotated on use |
+| Printer identifier | **Printer share id** → `/print/shares/{id}/...` |
+| Batch model | Small synchronous batch (default **5**, max 15); the flow loops on `remainingReady` |
+| `Print_Message` clock | `America/Vancouver` |
+| Resubmit scope | **`PRINT_PENDING` + `PRINT_FAILED` only** (not `PRINT_READY`, not blank) |
+| Reuse mechanism | Fixed constants in one module; no profile/config engine |
+| Job configuration | Fixed `{"copies": 1}`; printer defaults decide duplex/colour/paper |
+| Poll on canceled/aborted | Mark `PRINT_FAILED` immediately |
+
+---
+
+## 2. Requirements trace
+
+| # | Requirement | Where | Notes |
+|---|---|---|---|
+| R1 | Four columns exist | §5.4 write matrix | Internal names resolved at runtime by `displayName` (§6.2) |
+| R2 | An endpoint Power Automate can call | **Submit**, §3 | Function-key auth |
+| R3 | Retrieve the **oldest 15** `PRINT_READY` files from a library | **Submit** step 4 | ⚠️ **Deviation:** default batch **5**, range 1–15, per the agreed loop model. `"batchSize": 15` reproduces the literal wording |
+| R4 | Call Universal Print to create a print job | **Submit** 5.3–5.6 | 4 calls: create → upload session → upload → start |
+| R5 | On success → `PRINT_PENDING`, `Printer_Name` = printer id, `Print_JobId` = job id | §5.4 | ⚠️ **Ordering change:** status+printer written *before* submission as an atomic claim; job id after. End state identical. Rationale §5.3 |
+| R6 | On failure → `PRINT_FAILED`, `Printer_Name`, `Print_Message` = the error | §5.4 | ⚠️ Message carries the error from **whichever step failed**, not only Universal Print's text — a SharePoint-side failure must not be reported as a printer fault |
+| R7 | Inputs: folder, library, PrinterId | **Submit** request | Plus optional `batchSize` |
+| R8 | A second endpoint to check job status | **Poll** | |
+| R9 | Query the folder, **last 20 days**, `PRINT_STATUS = "PRINT_PENDING"` | **Poll** step 1 | Window on `createdDateTime`, consistent with R16 |
+| R10 | `COMPLETED` → `PRINT_COMPLETED` | **Poll** step 3 | |
+| R11 | `Print_Message` = when it printed, `printed on 2026-08-01 14:23:23` | **Poll** step 3 | ⚠️ `printJob` has **no completion field**, so no exact answer exists. Uses the printer's own `acknowledgedDateTime`, falling back to the moment Poll observed completion; rendered in `America/Vancouver`. Documented, not fabricated (§P-3.5). **Revised — see below.** |
+| R12 | A third endpoint to re-submit outstanding jobs | **Resubmit** | |
+| R13 | `PRINT_PENDING` **or** `PRINT_FAILED` | **Resubmit** step 1 | |
+| R14 | Past 20 days | **Resubmit** step 2 | |
+| R15 | Older than 72 hours from the initial print request | **Resubmit** step 2 | |
+| R16 | Initial print request time = SharePoint file creation time | **Resubmit** step 2 | `listItem.createdDateTime` |
+| R17 | "Outstanding = `PRINT_STATUS` ≠ `PRINT_COMPLETED`" | **Resubmit** step 1 | ⚠️ **Contradiction resolved:** R17 also captures `PRINT_READY` and blank. You chose R13's literal reading |
+| R18 | Python | throughout | Azure Functions Python v2 model |
+| R19 | Reuse learnings/structure from `noble-invoice-process` | §8, §9, §13 | Playbook §§2.1–2.8, 5–7 applied |
+| R20 | Testing in the design | §10 | Five tiers |
+
+> **R11 revised 2026-08-30, after reading a real job back.** The original note said Universal Print
+> "returns no completion timestamp" and used that to justify stamping `Print_Message` with the moment
+> Poll happened to look. The first half is still true — Microsoft's `printJob` reference lists no
+> completion property. The second half did not follow from it. Reading job `6` out of the live service
+> showed `acknowledgedDateTime`, documented as "the dateTimeOffset when the job was acknowledged",
+> which nobody had noticed because `FakeGraph` did not model the field — so every test in the suite
+> agreed with an incomplete picture of the resource.
+>
+> The two candidates are not equally good:
+>
+> | Source | Belongs to | Measured on job `6` |
+> |---|---|---|
+> | `acknowledgedDateTime` | the **job** — stable, same answer on every re-read | 05:25:03Z, ~10 s before the page finished |
+> | the moment Poll looked | **our cron** — moves if the schedule changes | up to a full 10-minute interval late |
+>
+> Poll now prefers the acknowledgement and falls back to the observed time when a job carries none.
+> Resubmit's `completed_late` branch uses the same source, because two paths writing one column must
+> agree. `tests/test_acknowledged_time.py`.
+>
+> The lesson is about the fake, not the field: **a fixture that omits a property teaches everyone the
+> property does not exist.** `FakeGraph.add_job` now models `acknowledgedDateTime`, `isFetchable` and
+> `errorCode`.
+
+### Gaps in the requirement, surfaced
+
+- **G1 — The 20-day cliff.** A file stuck at `PRINT_PENDING` beyond 20 days is excluded by **both**
+  Poll and Resubmit and becomes permanently invisible. This follows from the requirement's own
+  window. No behaviour change; mitigation is `scripts/test.py --stale` plus a KQL/SharePoint check
+  (§13.7). Documented in the runbook.
+- **G2 — `Printer_Name` holds an id, not a name.** Followed literally. The preflight already reads
+  the share's `displayName`, so storing the friendly name later is a one-line change.
+- **G3 — Non-printable files.** Handled: the file's content type is checked against the share's
+  `capabilities.contentTypes` **before** the job is created, with a clear `Print_Message` instead
+  of an opaque upload error.
+- **G4 — Nothing sets `PRINT_READY`.** Out of scope by design; an upstream process owns it.
+- **G5 — Reporting.** The requirement defines no way to see aggregate state. Addressed in §13.
+
+---
+
+## 3. Responsibility split — Power Automate vs Function App
+
+**Power Automate decides *when* and *how often*. The Function App decides *what happens*.**
+Any drift across this line is a bug.
+
+| Concern | Owner |
+|---|---|
+| Schedule / recurrence | **Power Automate** |
+| Looping until the queue drains | **Power Automate** (on `remainingReady`) |
+| Supplying library, folder, printer share id | **Power Automate** |
+| Operational alerting and the weekly digest | **Power Automate** |
+| Microsoft Graph calls (SharePoint *and* Universal Print) | **Function App** |
+| Token acquisition, caching, refresh-token rotation | **Function App** |
+| Deciding any `Print_Status` value | **Function App** |
+| Writing any of the four columns | **Function App** — *exclusively* |
+| Claiming / idempotency / double-print prevention | **Function App** |
+| Retry, throttling, `Retry-After` | **Function App** |
+| Date windows, 72-hour rule, oldest-first ordering | **Function App** |
+| Batch sizing and the wall-clock budget | **Function App** |
+
+> **Single-writer rule (§P-2.4).** The flow must **never** patch the four columns itself, even for
+> a quick fix. Two writers to one field is a race debugged at 2 a.m. If the flow needs a state
+> changed, it calls an endpoint.
+
+### The Power Automate flows
+
+**Flow A — Print Submit** (every 15 min)
+```
+Recurrence
+└─ Do Until  (remainingReady == 0)  OR  (iterations >= 10)      ← loop guard, never unbounded
+   └─ HTTP POST {funcUrl}/api/print/submit?code={key}
+            {"library":"Documents","folder":"/Invoices/ToPrint",
+             "printerShareId":"<guid>","batchSize":5}
+   └─ Parse JSON → remainingReady, submitted, failed
+└─ Condition: failed > 0 OR status != 200 OR printerAvailable == false  →  notify
+   (the last term is load-bearing: an offline printer is a 200 with failed = 0)
+```
+
+**Flow B — Print Status Poll** (every 10 min)
+```
+Recurrence → HTTP POST /api/print/status {"library","folder"}
+          → Condition: status != 200 → notify
+```
+Cadence is load-bearing: Poll must run more often than Universal Print discards finished jobs, or
+a completed job disappears before Poll sees it and Resubmit reprints it (UC-9). Measure that
+retention window during rollout (§4 open items) and set the cadence from the measurement.
+
+**Flow C — Print Resubmit** (daily, 02:00)
+```
+Recurrence → HTTP POST /api/print/resubmit {"library","folder","printerShareId"}
+          → Condition: status != 200 → notify
+```
+
+**Flow D — Weekly digest** (Mondays 07:00) — see §13.7.
+
+---
+
+## 4. Verified against the source
+
+Read from Microsoft's documentation, not recalled.
+
+### Universal Print
+
+| Fact | Source |
+|---|---|
+| Creating a print job is **delegated-only** — `Application: Not supported` on both routes. The sole reason for the Key Vault refresh-token design. | [share: create job](https://learn.microsoft.com/en-us/graph/api/printershare-post-jobs?view=graph-rest-1.0), [printer: create job](https://learn.microsoft.com/en-us/graph/api/printer-post-jobs?view=graph-rest-1.0) |
+| `printJob: start` documented **only** for the share route; `Application: Not supported`. | [printJob: start](https://learn.microsoft.com/en-us/graph/api/printjob-start?view=graph-rest-1.0) |
+| `createUploadSession` on a share is "supported with **delegated permissions only**". | [createUploadSession](https://learn.microsoft.com/en-us/graph/api/printdocument-createuploadsession?view=graph-rest-1.0) |
+| **`printJob: cancel` is `POST /print/printers/{printerId}/jobs/{printJobId}/cancel` → `204`.** Documented **only on the printers path** — it needs a *printer* id, not a share id. Delegated-only. "For an app… to cancel **other users'** jobs, the signed-in user must be a member of the Printer Administrator role" — our service account cancels its **own** jobs, so no admin role. | [printJob: cancel](https://learn.microsoft.com/en-us/graph/api/printjob-cancel?view=graph-rest-1.0) |
+| Reading a job **does** support app-only (`PrintJob.ReadBasic.All`). | [Get printJob](https://learn.microsoft.com/en-us/graph/api/printjob-get?view=graph-rest-1.0) |
+| States: `unknown, pending, processing, paused, stopped, completed, canceled, aborted`. Terminal: **completed, canceled, aborted**. **`stopped` = "an issue with the printer needs to be addressed before the job can continue" — i.e. it can still resume.** A new job is `paused` / `uploadPending`. | [printJobStatus](https://learn.microsoft.com/en-us/graph/api/resources/printjobstatus?view=graph-rest-1.0) |
+| **The upload `PUT` must NOT carry `Authorization`** — "might result in an `HTTP 401`". `uploadUrl` is opaque and carries its own `tempauthtoken`. | [Upload documents](https://learn.microsoft.com/en-us/graph/upload-data-to-upload-session) |
+| **< 10 MB** per `PUT`; ranges a multiple of 200 KB; `202` + `nextExpectedRanges` while more remain, **`201` on the last**; `416` if already received; `DELETE` cancels. Log `X-MSEdge-Ref`, `request-id`. | same |
+| `contentType` must be supported by the printer — check `capabilities.contentTypes`. | [createUploadSession](https://learn.microsoft.com/en-us/graph/api/printdocument-createuploadsession?view=graph-rest-1.0) |
+| `printerShare` exposes `capabilities`, `isAcceptingJobs`, `status` as properties **and a `printer` relationship** — one preflight call yields everything, including the printer id needed for cancel. | [printerShare](https://learn.microsoft.com/en-us/graph/api/resources/printershare?view=graph-rest-1.0) |
+
+### SharePoint / Graph
+
+| Fact | Source |
+|---|---|
+| **`if-match` is supported** on `PATCH .../items/{id}/fields`; a mismatch returns `412` **and the item is not updated** — the claim is genuinely atomic. | [Update listItem](https://learn.microsoft.com/en-us/graph/api/listitem-update?view=graph-rest-1.0) |
+| `listItem` inherits **`eTag`** and **`createdDateTime`**, and has a **`driveItem` relationship**. | [listItem](https://learn.microsoft.com/en-us/graph/api/resources/listitem?view=graph-rest-1.0) |
+| `$filter` on `fields/*` allows only `eq, ne, lt, gt, le, ge, startswith`, "one indexed field at a time"; `$filter` + `$expand=fields(select=…)` combine (the doc's Example 2). `$orderby` is **not** listed. | [List items](https://learn.microsoft.com/en-us/graph/api/listitem-list?view=graph-rest-1.0) |
+| **Non-indexed columns cannot be used in `$filter`/`$orderby`**; `Prefer: HonorNonIndexedQueriesWarningMayFailRandomly` permits it but "may fail randomly" → **`Print_Status` must be indexed**. | [Q&A: orderby](https://learn.microsoft.com/en-us/answers/questions/821510/microsoft-graph-sharepoint-lists-api-orderby-not-w) |
+| `GET /sites/{s}/lists/{list-title}` accepts a **title**; `?expand=columns(select=name,displayName)` returns column definitions in the same call. | [Get a list](https://learn.microsoft.com/en-us/graph/api/list-get?view=graph-rest-1.0) |
+| Content download returns **`302`** to a preauthenticated URL — "You don't need to include an `Authorization` header", and it "might expire within minutes". | [Download content](https://learn.microsoft.com/en-us/graph/api/driveitem-get-content?view=graph-rest-1.0) |
+| Internal names encode specials as `_xHHHH_` (documented: `_x0020_`, `_x003a_`), fixed at creation. | [Naming guidelines](https://pnp.github.io/community-docs/articles/sharepoint-naming-guidelines.html) |
+| `Sites.Manage.All` (application) is required if the list has **content approval** on. | [Get listItem](https://learn.microsoft.com/en-us/graph/api/listitem-get?view=graph-rest-1.0) |
+
+### Identity and platform
+
+| Fact | Source |
+|---|---|
+| Refresh token lifetime **90 days** (SPA / email-OTP: 24 h). | [Refresh tokens](https://learn.microsoft.com/en-us/entra/identity-platform/refresh-tokens) |
+| "Refresh tokens replace themselves… **the platform doesn't revoke old refresh tokens** when used to fetch new access tokens." | same |
+| Refresh tokens are **not tied to a resource** — one token covers print *and* Sites scopes. | same |
+| Revoked by password change, SSPR, admin reset, explicit revocation. Password *expiry* alone does not. | same |
+| `Key Vault Secrets User` = read only; **`Key Vault Secrets Officer`** = any secret action incl. `set` → Officer required, because rotation writes back. | [Key Vault RBAC](https://learn.microsoft.com/en-us/azure/key-vault/general/rbac-guide) |
+| **Application Insights tables keep data 90 days at no charge** (`AppTraces`, `AppRequests`, `AppExceptions`, …); extendable to 730 days at cost. 90 days ≈ 13 weeks of weekly reporting, free. | [Data retention](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/data-retention-configure) |
+
+### Corrections to statements I made earlier
+
+1. **Over-claimed on column naming.** I said `Print_Status` is "almost certainly"
+   `Print_x005f_Status` internally. Microsoft documents `_x0020_` and `_x003a_` but **not**
+   underscore encoding; only community sources report the `_x005f_` form. Plausible, unverified
+   for your tenant. The design resolves names at runtime, so it holds either way, and `--dry-run`
+   prints what it found.
+2. **Blob lease removed.** I proposed serialising refresh-token rotation with a blob lease. The
+   platform does not revoke old refresh tokens on rotation, so concurrent refreshes both succeed
+   and last-write-wins stores a valid token. One component deleted (§P-2 *Simplicity First*).
+3. **Resubmit had a double-print bug.** My earlier design resubmitted a `stopped` job without
+   cancelling it. `stopped` means the printer needs attention **and the job can continue** — so
+   when the printer is fixed, the old job *and* the new one both print. Fixed in §5.7: **cancel
+   the old job before creating a replacement.** This is a correctness fix, not a refinement.
+
+### Open items — verified at implementation, each with a fallback
+
+| Item | Fallback |
+|---|---|
+| Does `$expand=fields(...),driveItem(...)` work in one call? | `GET .../items/{id}/driveItem?$select=…` per item — documented; the batch is 5 |
+| Is `fields.FileDirRef` returned for folder scoping? | the driveItem's `parentReference.path` |
+| Does cancel also work on the `/print/shares/...` path? | Use the documented printers path with the printer id from the share's `printer` relationship |
+| Is `Print_Status` indexed? Is content approval on? | `--dry-run` checks both before the first real run |
+| ~~Does the printer accept `application/pdf`?~~ **CLOSED 2026-08-30, against the live API** | `live-printer-check.ps1` reads the capability list from Graph: `application/pdf` **and** `application/oxps`. PDFs go to the device as-is. Note the correction it forced: the fixture previously recorded `["application/pdf"]` alone, copied from the portal's *Properties > Printer defaults* page — which shows the **default** content type, not the capability list. Two different fields; the portal does not label which is which. |
+| ~~Are the share id and printer id really different?~~ **CLOSED 2026-08-30** | Confirmed live: share `a11f0263-…`, printer `ffa65a34-…`. F3's whole premise, now evidenced rather than reasoned. **Second lesson, 2026-08-31:** they also differ in *lifetime*. Deleting and re-creating the share in the portal mints a new share id — `5de37377-…` became `a11f0263-…` — while the printer id and its `registeredDateTime` were untouched. So the id the caller supplies on every request is the perishable one, and the id the app resolves for itself at preflight is the durable one. Every recorded copy of the share id (README, the docs, the fixture, `live-printer-check.ps1`'s default, and **the Flow bodies in Power Automate**) goes stale at that moment, with a 404 reading `does not match any registered printers`. In the app it surfaces from `get_share` — the preflight — so it is a per-run 500 with `RUN_SUMMARY … http_status=500` and **nothing claimed and nothing printed**, which is the right shape. It is not yet one of the two failures `_server_error` gives a named remedy; if it recurs, that is where the remedy line belongs. |
+| ~~What `status.state` does the share report?~~ **CLOSED 2026-08-30** | `idle`. The portal *displays* "Ready"; `printerProcessingState` is documented `unknown\|idle\|processing\|stopped` and has no `ready` member. The fixture and two tests had recorded the portal's display string as an API value. No code branches on it — it is reported, never compared — so nothing behaved wrongly, but the tests were pinning a fact that was false. |
+| ~~**Is a Universal Print connector required?**~~ **CLOSED 2026-08-30 — no** | The printer is **Universal Print ready and registered directly**. Settled by printing: `live-printer-check.ps1` submitted a job while the API reported 0 connectors on the printer and 0 tenant-wide, and a page came out — job `6`, `pending` → `processing` → `completed` in ~5 s. Two earlier answers were wrong: the Overview blade cannot decide it (a connector's heartbeat updates last-seen too), and neither can a connector count of 0 (that is what both cases look like). **Consequence: no Windows host in the path** — nothing to keep powered on, nothing to patch, no single point of failure. |
+| **How long does Universal Print keep a finished job readable?** STILL OPEN — but now cheap to measure | Sets Poll's cadence, and Poll's cadence is what prevents UC-9's double print. The 2026-08-30 run left a **completed job `6` on printer `ffa65a34-…`**, so the measurement is one call repeated until it 404s — no need to print anything again: <br>`Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/print/printers/ffa65a34-615c-493b-9eff-d227133293ac/jobs/6"` <br>Run it daily. The **last day it still returns 200** is the retention window; set Poll's interval well inside it. <br>**The 2026-08-31 re-share voided the run in progress**, and the call above is the printer route for that reason: job `6` was created through the retired share `5de37377-…`, so a 404 on the *share* route now proves only that the share is gone. Treat a 404 here as no evidence and restart the count from the first job printed through the new share, rather than banking a retention window of one day that was never measured. Completion itself is fast — that job finished in ~5 s — so the risk is never "Poll ran too early", only "Poll ran after the record was purged". |
+
+---
+
+## 5. System design
+
+### 5.1 Components
+
+```
+┌──────────────────┐   4 scheduled flows,   ┌───────────────────────────────────────────┐
+│  Power Automate  │   function-key auth    │        Function App  (Python v2)          │
+│  A Submit        │ ─────────────────────► │  function_app.py    3 routes, thin        │
+│  B Poll          │                        │        ├── print_policy.py   PURE rules   │
+│  C Resubmit      │ ◄───────────────────── │        │      stdlib only, no I/O         │
+│  D Weekly digest │   counts for looping   │        ├── sharepoint.py      adapter     │
+└──────────────────┘                        │        ├── universal_print.py adapter     │
+         │                                  │        └── graph_client.py / graph_auth.py│
+         │ SharePoint connector             └───────┬──────────────┬──────────────┬─────┘
+         │ (read-only, counts)                      │              │              │
+         ▼                          ┌───────────────┘              │              │
+┌──────────────────┐                ▼                              ▼              ▼
+│   SharePoint     │◄──┐  ┌────────────────────────┐  ┌──────────────────┐ ┌─────────────┐
+│  library = the   │   └──┤  Microsoft Graph       │  │  Azure Key Vault │ │ Application │
+│  queue + audit   │      │  • list items + fields │  │  refresh token   │ │  Insights   │
+│  (source of      │      │  • driveItem content   │  │  read + rotate   │ │ RUN_SUMMARY │
+│   truth for NOW) │      │  • Universal Print     │  └──────────────────┘ │ PRINT_EVENT │
+└──────────────────┘      └───────────┬────────────┘   ▲ managed identity  │ (truth for  │
+                                      │                │ Secrets Officer   │  OVER TIME) │
+                                      ▼                                    └─────────────┘
+                            ┌────────────────────┐                                ▲
+                            │ Physical printer   │                                │
+                            │ via UP connector   │            Workbook / Dashboard ┘
+                            └────────────────────┘                   (§13)
+```
+
+### 5.2 Layering (§P-2.2)
+
+| Module | Knows about | Must not know about |
+|---|---|---|
+| `graph_auth.py` / `graph_client.py` | MSAL, Key Vault, HTTP, retries, paging, unauthenticated requests | SharePoint or print semantics |
+| `sharepoint.py` | Graph site/list/item/driveItem URLs, column-name resolution | what a print status means |
+| `universal_print.py` | Graph print URLs, upload-session mechanics, cancel | SharePoint |
+| `print_policy.py` | statuses, windows, selection, transitions, message text | HTTP, Graph, any cloud SDK |
+| `function_app.py` | the sequence only | any status branching whatsoever |
+
+`print_policy.py` is **standard library only** — the constraint that keeps the unit suite offline
+and sub-second, as `field_policy.py` does in the sibling project. Single source of truth:
+
+```python
+COLUMN_STATUS  = "Print_Status"     # display names; internal names resolved at runtime
+COLUMN_JOB_ID  = "Print_JobId"
+COLUMN_MESSAGE = "Print_Message"
+COLUMN_PRINTER = "Printer_Name"
+
+READY = "PRINT_READY"; PENDING = "PRINT_PENDING"
+FAILED = "PRINT_FAILED"; COMPLETED = "PRINT_COMPLETED"
+
+DEFAULT_BATCH_SIZE = 5;  MAX_BATCH_SIZE = 15
+DEFAULT_WINDOW_DAYS = 20; DEFAULT_MIN_AGE_HOURS = 72
+BUSINESS_TZ = "America/Vancouver"; MESSAGE_MAX_CHARS = 255
+JOB_CONFIGURATION = {"copies": 1}   # printer defaults decide duplex/colour/paper
+POLICY_VERSION = "1.0"
+```
+
+**Time discipline:** every window comparison (20 days, 72 hours) is done in **UTC** against
+`createdDateTime`. `America/Vancouver` is used for **display only**, in the `printed on …`
+message. Mixing the two is how DST bugs get in; a test asserts both behaviours.
+
+### 5.3 State machine
+
+```
+        (upstream process sets PRINT_READY — not this app, see G4)
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │   PRINT_READY   │
+                   └────────┬────────┘
+                            │  Submit: claim, If-Match on eTag
+                            │  writes STATUS=PENDING, PRINTER=shareId, clears JOBID+MESSAGE
+                            ▼
+              ┌──────────────────────────────┐
+       ┌─────►│        PRINT_PENDING         │
+       │      │  jobId set   = submitted OK  │
+       │      │  jobId empty = crashed after │
+       │      │      claim (Resubmit's job)  │
+       │      └───┬───────────┬──────────┬───┘
+       │          │           │          │
+       │  Submit  │    Poll   │   Poll   │
+       │  failed  │ completed │ canceled │
+       │  5.2–5.6 │           │ aborted  │
+       │          ▼           ▼          │
+       │  ┌───────────────┐ ┌────────────▼──┐
+       │  │ PRINT_FAILED  │ │PRINT_COMPLETED│
+       │  └───────┬───────┘ │  (terminal)   │
+       │          │         └───────────────┘
+       └──────────┴──  Resubmit: createdDateTime inside 20 days
+                       AND older than 72 h → cancel old job, re-claim
+```
+
+**Why the claim precedes submission (deviation at R5).** A crash after the claim leaves
+`PRINT_PENDING` with an empty `Print_JobId` — recovered by Resubmit after 72 h. A crash after
+submitting but before writing the status would print the document **twice** on the next run.
+*A recoverable lost print beats a silent double print.* The consequence the whole design must
+respect: **Poll must tolerate `PRINT_PENDING` rows with no job id and never treat them as errors.**
+
+**Job ids are not globally unique.** Universal Print job ids are short per-printer values
+— the first job this tenant's Brother ever received came back as **`"6"`**, a single digit,
+measured 2026-08-30, and the next run of the same script got **`"9"`**. They are neither
+globally unique nor contiguous, so `Print_JobId` can only ever be read alongside `Printer_Name`. `Print_JobId` is only meaningful together with `Printer_Name`; every lookup
+uses the pair, and so does every log correlation (§13.3).
+
+### 5.4 Column write matrix — the complete contract
+
+`—` means the column is not touched.
+
+| Event | `Print_Status` | `Printer_Name` | `Print_JobId` | `Print_Message` |
+|---|---|---|---|---|
+| Submit — claim | `PRINT_PENDING` | share id | cleared | cleared |
+| Submit — job started | — | — | job id | — |
+| Submit — failed (download/create/upload/start) | `PRINT_FAILED` | share id | — (stays empty) | error text, truncated |
+| Submit — claim lost (412) | — | — | — | — |
+| Poll — `completed` | `PRINT_COMPLETED` | — | — | `printed on YYYY-MM-DD HH:MM:SS` |
+| Poll — `canceled` / `aborted` | `PRINT_FAILED` | — | — | job `description` + `details` |
+| Poll — in-flight state or 404 | — | — | — | — |
+| Resubmit — re-claim | `PRINT_PENDING` | share id | cleared | cleared |
+| Resubmit — job already `completed` | `PRINT_COMPLETED` | — | — | `printed on …` |
+| Resubmit — job in flight | — | — | — | — |
+
+This table **is** the Tier C test suite: one assertion per row.
+
+### 5.5 Submit — sequence
+
+```
+POST /api/print/submit {library, folder, printerShareId, batchSize}
+ ├─ 1 validate                              → 400 on any problem, ZERO writes (§P-2.4)
+ ├─ 2 resolve site → list (title|id) + the 4 column internal names   [cached per list]
+ ├─ 3 PREFLIGHT  GET /print/shares/{id}?$select=id,displayName,isAcceptingJobs,
+ │                 capabilities,status&$expand=printer($select=id)
+ │      reject early: share missing · not accepting jobs · contentTypes lacks the file type
+ │      cache the PRINTER id from the expand — Resubmit needs it to cancel (§5.7)
+ ├─ 4 GET items  $filter=fields/<status> eq 'PRINT_READY'  $expand=fields
+ │               Prefer: HonorNonIndexedQueriesWarningMayFailRandomly
+ │               follow @odata.nextLink to a page cap
+ │      then IN PYTHON: scope to folder → sort by createdDateTime asc → take batchSize
+ │      (client-side: $orderby on fields/* is unreliable, and only one indexed
+ │       field may be filtered at a time)
+ └─ 5 per file, sequentially. THE BUDGET IS CHECKED BEFORE STARTING A FILE, NEVER MID-FILE,
+      so the 90 s cap can never strand a claimed row:
+      5.1 PATCH items/{id}/fields  If-Match: <eTag>          → CLAIM
+          412 ⇒ another run won it ⇒ skipped, next file
+      5.2 GET items/{id}/driveItem?$select=id,name,size,@microsoft.graph.downloadUrl
+          GET <downloadUrl>          ← NO Authorization header (preauthenticated)
+      5.3 POST /print/shares/{s}/jobs {"configuration":{"copies":1}} → jobId, documentId
+      5.4 POST …/documents/{d}/createUploadSession {documentName, contentType, size}
+      5.5 PUT <uploadUrl>            ← NO Authorization header
+          Content-Range: bytes {s}-{e}/{total} · Content-Length
+          one range if < 4 MB; else sequential 200 KB multiples under 10 MB
+          (20 x 200 KB). 202 per range, 201 on the last, which is asserted --
+          a silent 202 on the final range means the document is incomplete.
+          on abandonment → DELETE <uploadUrl>
+      5.6 POST …/jobs/{jobId}/start
+      5.7 PATCH fields {Print_JobId: jobId}   ← GUARDED: see below
+      ──  any failure in 5.2–5.6 → PATCH {PRINT_FAILED, printer, message}
+
+ ◄─ 200 {candidatesFound, remainingReady, submitted, failed, skipped,
+         printerAvailable, budgetExhausted,
+         items:[{itemId, fileName, result, jobId, message, warning?}]}
+```
+
+> **Step 5.7 must not be allowed to raise (S1).** By the time it runs the job is created *and*
+> started — paper is on its way. An unguarded failure there did two things: it killed the batch with
+> a 500, discarding the record of every file that had already printed, and it left the row at
+> `PRINT_PENDING` with an **empty** `Print_JobId` — which §5.3 defines as "a crashed submission
+> Resubmit owns". Resubmit would then print the document a second time. That is the silent double
+> print the claim-first ordering exists to prevent, reintroduced one line from the end. The write
+> cannot be recovered, so instead the batch continues, the per-item record carries a `warning`, and
+> an `ERROR` line names the coming duplicate — the only warning anyone will ever get. `PRINT_EVENT`
+> still carries the job id, so the correlation survives even though the column does not.
+
+> **`printerAvailable` is on every Submit response (S3).** When the share is not accepting jobs the
+> run is a healthy `200` with `failed = 0`, matching no error condition, and `remainingReady` is
+> `0` so Flow A's `Do Until` ends rather than spinning to its iteration cap. Without an explicit
+> flag an offline printer would be completely silent, so Flow A's notify condition tests it.
+
+### 5.6 Poll — sequence
+
+> **Revised after review (F1).** Poll originally took a batch, capped at 15. That
+> violated the requirement ("query ... for **all** files") and starved: taking the
+> oldest N meant a handful of long-running jobs held every slot run after run, so
+> a newer job that HAD completed was never marked and eventually aged past the
+> 20-day window into limbo. Poll now checks **every** job in the window, bounded
+> only by the wall-clock budget, and reports `uncheckedCount` if the budget trips.
+
+```
+POST /api/print/status {library, folder, windowDays?=20}
+ ├─ validate → resolve list + columns
+ ├─ GET items $filter=fields/<status> eq 'PRINT_PENDING'
+ │     in Python: keep createdDateTime inside windowDays (UTC)
+ │                SKIP items whose Print_JobId is empty   ← Resubmit owns those (§5.3)
+ │                SKIP items whose Printer_Name is empty  ← defensive; report as malformed
+ └─ per item: GET /print/shares/{Printer_Name}/jobs/{Print_JobId}
+      completed           → PRINT_COMPLETED + "printed on <now, America/Vancouver>"
+      canceled | aborted  → PRINT_FAILED + description/details
+      pending|processing|paused|stopped|unknown → write NOTHING
+      HTTP 404            → write NOTHING, report it; Resubmit handles it after 72 h
+ ◄─ 200 {checked, completed, failed, stillRunning, notFound, malformed,
+         pendingInWindow, awaitingResubmit, uncheckedCount,
+         staleCount, staleItems, budgetExhausted, items:[…]}
+
+      Three of those account for every row in the window exactly once:
+          checked + awaitingResubmit + uncheckedCount == pendingInWindow
+      `awaitingResubmit` counts the PRINT_PENDING-with-no-job-id rows -- the
+      normal crashed-submission state of §5.3. They used to be counted nowhere,
+      so the one state the design tells you to expect was the one the response
+      could not show, and a growing pile of them stayed invisible until Resubmit
+      picked them up 72 h later (S5).
+```
+
+### 5.7 Resubmit — sequence
+
+```
+POST /api/print/resubmit {library, folder, printerShareId?, windowDays?=20,
+                          minAgeHours?=72, batchSize?}
+ ├─ validate → resolve list + columns → preflight printer (captures the PRINTER id)
+ ├─ TWO queries, unioned: fields/<status> eq 'PRINT_PENDING'
+ │                        fields/<status> eq 'PRINT_FAILED'
+ │    (not `ne PRINT_COMPLETED`: only one indexed field may be filtered, `ne` on text
+ │     is weakly supported, and the union matches R13)
+ ├─ in Python: inside windowDays AND older than minAgeHours (UTC, from createdDateTime)
+ │             sort LEAST RECENTLY ATTEMPTED first (lastModifiedDateTime), take batchSize
+ │             (F2: createdDateTime never changes, so ordering a RETRY queue by it
+ │              means a file that fails every time is chosen every time and nothing
+ │              newer is ever reached. Eligibility still uses createdDateTime — R16
+ │              says the print request time IS the file creation time.)
+ └─ per candidate:
+      has Print_JobId? → GET the job first
+           completed             → PRINT_COMPLETED + message; DO NOT reprint
+           pending | processing  → leave untouched, count stillRunning
+           paused|stopped|unknown → ***CANCEL FIRST***, then resubmit
+                POST /print/printers/{printerId}/jobs/{jobId}/cancel → 204
+                the printerId is the ORIGINAL printer's, resolved from the item's
+                Printer_Name -- NOT the request's override. Aiming at the new
+                printer 404s, and a 404 reads as "already gone", so it would
+                report a clean cancel while the original stayed alive (F3).
+                best-effort: on failure, log and still resubmit
+           canceled | aborted    → already terminal, no cancel needed → resubmit
+           HTTP 404              → nothing to cancel → resubmit
+      no Print_JobId (claim-crash row) → resubmit directly
+      resubmit == the SAME per-file routine Submit uses (§5.5 steps 5.1–5.7)
+      printer = request printerShareId, else the item's Printer_Name,
+                else fail that item with a clear message
+ ◄─ 200 {candidatesFound, resubmitted, completedInstead, stillRunning,
+         cancelled, failed, items:[…]}
+```
+
+> **Why cancel first.** `stopped` means "an issue with the printer needs to be addressed **before
+> the job can continue**" — the job is alive. Resubmitting without cancelling means that when the
+> printer is fixed, the original *and* the replacement both print. Cancel is best-effort: if it
+> fails we still resubmit, because a stuck document is the worse outcome — but we log it, and the
+> log line is what tells you a duplicate is possible.
+
+---
+
+## 6. Cross-cutting design
+
+**6.1 Column-name resolution.** `GET /sites/{s}/lists/{list}?expand=columns(select=name,displayName)`
+→ `displayName → name`, cached per list. This is what makes an encoded internal name a non-issue.
+An unresolvable column is a **500 naming it** — silently skipping would leave statuses unwritten forever.
+
+**6.2 Retry and throttling.** Retry `429/503/504` honouring `Retry-After`; max 3; exponential
+backoff with jitter. Never other 4xx. **The create-job `POST` is attempted once** — a retry risks a
+duplicate job. Log `X-MSEdge-Ref` and `request-id` from print responses.
+
+**6.3 Timeouts (§P-2.6).** 30 s per Graph call (`GRAPH_TIMEOUT_SECONDS`, resolved per call in
+`graph_client.resolve_timeout_seconds`); a 90 s whole-invocation budget undercutting Power
+Automate's ~120 s connector budget, checked **before starting each file** so the endpoint stops
+cleanly with `budgetExhausted: true` rather than being killed mid-write.
+
+The budget is anchored at the moment the **request arrives**, not at the moment the file loop
+begins. Site resolution, the printer preflight and the status query all run first and can be slow;
+timing only the loop made that work free, so a run could still overshoot the connector budget — and
+a connector that has already given up never receives `remainingReady`, so the flow neither loops nor
+notifies. Pinned by `test_the_budget_covers_the_whole_invocation_not_just_the_file_loop`.
+
+**6.4 Auth.** In-process access-token cache, refreshed within 5 min of expiry; the rotated refresh
+token written back to Key Vault every time. No lease (§4 correction 2). A revoked token surfaces
+as a 500 naming `scripts/bootstrap_token.py`.
+
+**6.5 Configuration (§P-2.7).** Values that **name an environment** get no default and raise when
+missing: `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `KEY_VAULT_URI`, `SHAREPOINT_HOSTNAME`,
+`SHAREPOINT_SITE_PATH`. **Tunables** get a constant default + env override + **range validation**:
+`PRINT_BATCH_SIZE`, `PRINT_STATUS_WINDOW_DAYS`, `PRINT_RESUBMIT_MIN_AGE_HOURS`,
+`PRINT_BUSINESS_TZ`, `GRAPH_TIMEOUT_SECONDS`. Out-of-range **request** → 400; out-of-range **env**
+→ warn and fall back, because server misconfiguration must not fail every request.
+
+`GRAPH_TIMEOUT_SECONDS` [1, 300] lives in `graph_client`, not `print_policy`: a socket timeout is
+transport configuration, not a business rule, and `graph_client` must keep importing no domain
+(§5.2). It is read **per call** rather than captured at import, so a settings change takes effect
+on the next invocation instead of the next cold start — and it applies to the unauthenticated
+download and upload paths too, which would otherwise have been a half-setting. It shipped in the
+template and in the deploy runbook for a while while **no code read it at all**, which is the worst
+kind of configuration: setting it appeared to work and did nothing (S4).
+
+**6.6 Prerequisites.**
+- **Index the `Print_Status` column** — non-indexed columns cannot be used in `$filter` at all.
+- Confirm whether content approval is enabled on the library.
+- Entra app: public client flows enabled; delegated `PrintJob.ReadWriteBasic`, `Printer.Read.All`,
+  `PrinterShare.ReadBasic.All`, `Sites.ReadWrite.All`, `offline_access`; admin consent.
+  (`PrintJob.ReadWriteBasic` covers cancel as well as create/start.)
+- Function App managed identity → **Key Vault Secrets Officer**.
+
+---
+
+## 7. Use cases
+
+| ID | Scenario | Expected behaviour |
+|---|---|---|
+| **UC-1** | 12 files `PRINT_READY`. Flow A runs. | Call 1 submits 5, `remainingReady: 7`. Calls 2–3 submit 5 and 2. Call 4 returns 0 and the loop ends. |
+| **UC-2** | Printer share offline / not accepting jobs. | Preflight fails **before any claim**. 200, `submitted: 0`, clear message, **no column touched**. Files stay `PRINT_READY`. |
+| **UC-3** | Unsupported file type. | Caught at preflight against `capabilities.contentTypes`; that file gets `PRINT_FAILED` + explicit message, not an opaque upload error. |
+| **UC-4** | Job prints normally. Flow B runs. | `PRINT_COMPLETED`, `Print_Message = "printed on 2026-08-30 14:23:23"` (Vancouver). Terminal. |
+| **UC-5** | Someone cancels at the printer. | Poll sees `canceled` → `PRINT_FAILED` + description. Flow C reprints 72 h later. |
+| **UC-6** | Crash between claim and job creation. | `PRINT_PENDING`, **empty** `Print_JobId`. Poll skips it. Flow C resubmits after 72 h. No double print, no lost file. |
+| **UC-7** | Flow A schedules overlap; two runs start together. | Both pick the same files; `If-Match` means exactly one wins per file, the loser records `skipped`. **No file printed twice.** |
+| **UC-8** | Printer unplugged; job sits `stopped` for 4 days. | Poll writes nothing. Flow C at 72 h **cancels the stopped job**, then resubmits. When the printer is fixed the old job is gone, so only the replacement prints. |
+| **UC-9** | Job completes but Universal Print purges it before Poll runs. | Poll gets 404 and writes nothing. Flow C resubmits after 72 h → **prints twice.** Mitigated by keeping Poll's cadence inside the measured retention window (§3). |
+| **UC-10** | `PRINT_PENDING`, 25 days old. | Excluded by both Poll and Resubmit — permanently stuck (**G1**). `--stale` and the §13.6 workbook tile report it. |
+| **UC-11** | Malformed request. | 400 with a specific message and **zero** SharePoint writes, so the corrected retry is not locked out. |
+| **UC-12** | Refresh token revoked (service account password reset). | Every endpoint 500s with an unambiguous "re-run `scripts/bootstrap_token.py`"; no partial writes; Flow C's notification fires. |
+| **UC-13** | "How many printed last week?" | §13.5 query 2, or the workbook's weekly chart. |
+
+---
+
+## 8. Repo layout (§P-2.1)
+
+```
+noble-print/
+├─ functionapp/                     # the ONLY thing that ships
+│  ├─ function_app.py               # 3 routes; thin orchestration, no status branching
+│  ├─ print_policy.py               # PURE rules — stdlib only (§5.2)
+│  ├─ graph_auth.py  graph_client.py
+│  ├─ sharepoint.py  universal_print.py
+│  ├─ host.json                     # SAMPLING DISABLED — see §13.4
+│  ├─ requirements.txt  .funcignore
+│  └─ local.settings.json.template  # TRACKED, secrets blank; real file gitignored
+├─ scripts/                         # NOT deployed
+│  ├─ bootstrap_token.py            # one-time device-code sign-in → seeds the KV secret
+│  ├─ test.py                       # ONE harness; --base-url defaults to localhost (§P-6.5)
+│  ├─ start-local.ps1  localshim/sitecustomize.py
+├─ tests/  conftest.py  fake_graph.py  fixtures/*.json  test_*.py
+├─ docs/design.md  docs/monitoring.md  docs/ai/
+└─ CLAUDE.md  README.md  pytest.ini  .gitignore
+```
+
+---
+
+## 9. Designed for reuse (requirement scalability, not traffic)
+
+Reuse comes from **where things live**, so a new requirement is a small edit in one known place.
+
+| A future change | What it costs |
+|---|---|
+| A new status value, or renaming one | One constant in `print_policy.py` + its row in the transition table |
+| Different column display names | Four constants. Internal names resolve at runtime, so nothing else changes |
+| Different windows or batch size | Already request parameters with env defaults |
+| Duplex / colour / copies | One dict, `JOB_CONFIGURATION`, passed straight through |
+| A fourth endpoint (e.g. Cancel) | A new route + one policy function. Adapters unchanged |
+| Print from somewhere other than SharePoint | Replace `sharepoint.py`. Policy and print adapter untouched |
+| Print to something other than Universal Print | Replace `universal_print.py`. Nothing else moves |
+| A second workflow with its own vocabulary | Import the adapters directly — they know nothing about print statuses — and write its own policy module |
+
+Two structural rules keep this true, **both enforced by tests**:
+- `print_policy.py` imports nothing but the standard library.
+- `function_app.py` contains no status branching.
+
+Deliberately **not** built: profile/config system, per-file print settings, multi-library fan-out,
+extra filter predicates. Each is cheap to add given the layering; building them now would be
+configurability nobody requested (§P-2).
+
+---
+
+## 10. Testing
+
+**Tier A — pure rules, `tests/test_print_policy.py`** (stdlib only, no network, sub-second)
+- 20-day and 72-hour boundaries: exactly 72 h, 71:59, 72:01; a window edge across a Vancouver DST
+  transition — **asserting the window is computed in UTC while the message renders local**
+- oldest-first selection ascending, deterministic on ties; exactly `batchSize` taken
+- all **8** job states map to the right action, including `unknown` and the cancel-first set
+- `"printed on YYYY-MM-DD HH:MM:SS"` formatting, incl. a UTC instant crossing a local day
+- message truncation; a failure message is never empty
+- config parsing: request out-of-range → error; env out-of-range → warn and fall back
+- **structural:** `print_policy` imports only the standard library (guards §9)
+
+**Tier B — adapters against `tests/fake_graph.py`.** A `FakeGraph` implementing the exact URL
+surface, recording every request **including headers**, programmable to fail a chosen call — the
+analogue of `FakeTable` in the sibling repo, so **the real adapter code runs against it**.
+- column resolution handles an encoded internal name; a missing column raises
+- the emitted `$filter` and `Prefer` header are exact; `@odata.nextLink` paging is followed
+- **the download GET and the upload PUT carry no `Authorization` header** — a direct regression
+  test for the documented 401
+- chunking: 1 KB → one `PUT` ending `201`; 9 MB → 200 KB-multiple ranges under 10 MB driven by
+  `nextExpectedRanges`, `202`…`202`, `201`
+- preflight rejects a share not accepting jobs, or lacking the file's content type, **and captures
+  the printer id from the `printer` expand**
+- cancel targets the **printers** path with that printer id and accepts `204`
+- `429` + `Retry-After` retried; `403` not; the create-job POST never retried
+
+**Tier C — route tests, one per endpoint.** Handlers invoked offline via the v2 model
+(`function_app.submit_print_jobs.build().get_user_function()`), with `FakeGraph` and a stubbed
+token provider. **The §5.4 write matrix is the specification: one test per row.**
+- Submit writes claim-then-jobId, and the **call order is asserted**
+- a failure at each of download / create / upload / start → `PRINT_FAILED` + printer + non-empty
+  message, and **no** `Print_JobId`
+- `412` on claim → `skipped`, **no print job created** (UC-7)
+- bad request → 400 with **zero** SharePoint writes (UC-11)
+- budget exhaustion stops **between** files, never leaving a claimed-but-unsubmitted row
+- Poll: `completed` → exact regex; `canceled`/`aborted` → `PRINT_FAILED`; **in-flight and 404 write
+  nothing**; outside 20 days excluded; empty `Print_JobId` and empty `Printer_Name` skipped (UC-6)
+- Resubmit: only the two statuses (**never `PRINT_READY` or blank** — guards the R17 decision);
+  only inside 20 days and older than 72 h; a `completed` job marked completed and **not reprinted**;
+  an in-flight job left alone; **a `stopped` job is cancelled before the replacement is created**
+  (UC-8) and a failed cancel still resubmits but is logged; a claim-crash row resubmitted
+- auth: live token reused; near-expiry triggers exactly one refresh; rotated token written back;
+  a revoked token surfaces the bootstrap message (UC-12)
+- **logging:** every terminal per-file outcome emits exactly one `PRINT_EVENT` with the documented
+  field order, and every invocation emits exactly one `RUN_SUMMARY` — the reporting in §13 is only
+  as good as this, so it is asserted, not assumed
+
+### 13.11 Two additions made during implementation
+
+- **`"dryRun": true` on Submit.** Resolves the site, library, the four internal
+  column names, and the printer's capabilities and printer id, lists what a real
+  run would take, and writes nothing. Deliberately a mode of the ENDPOINT rather
+  than logic in the harness: it therefore exercises the same auth, resolution and
+  queries the real run uses, so a green dry run is evidence about the deployed
+  app rather than about a script.
+- **`staleCount` / `staleItems` on Poll.** The files past the 20-day window (G1),
+  which both Poll and Resubmit exclude and nothing will ever touch again.
+  Reporting them costs no extra API call — they are already in the result set —
+  and it is the only automatic signal that a document is stranded. Poll reports
+  them and never writes to them: deciding what to do is a human's call.
+
+**Tier D — one live harness, `scripts/test.py`** (stdlib only; `pytest.ini` sets `testpaths = tests`).
+`--base-url` defaults to `http://localhost:7071`, `--key` for the deployed app (§P-6.5).
+Subcommands `submit` / `status` / `resubmit`, plus `--dry-run` (resolve site, list, **the four
+internal column names**, index and content-approval state, printer capabilities and printer id —
+print them, print nothing on paper), `--stale` (rows past the 20-day window, UC-10/G1), and
+`--bad-payload` (must 400 with no writes).
+
+**Tier E — deploy smoke sequence** (§P-7.6): bad payload → 400 · `--dry-run` → resolved names ·
+one real file → a job id · **then read the four SharePoint columns back** · **then run §13.5 query
+1 and confirm the `PRINT_EVENT` row is in App Insights.** The last two are the steps people skip.
+
+---
+
+## 11. Verification
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r functionapp\requirements.txt
+.\.venv\Scripts\python.exe -m pytest                       # Tiers A-C, offline, no cloud account
+
+.\.venv\Scripts\python.exe scripts\bootstrap_token.py      # one-time device-code sign-in
+.\scripts\start-local.ps1                                  # venv + TLS shim + func start
+.\.venv\Scripts\python.exe scripts\test.py --dry-run --library "Documents" --folder "/Invoices/ToPrint"
+.\.venv\Scripts\python.exe scripts\test.py submit --library "Documents" --folder "/Invoices/ToPrint" --printer-share-id "<guid>" --batch-size 1
+```
+
+Then open the library and confirm the four columns match §5.4.
+
+## 12. Deploy order (§P-7.1)
+
+> The executable version of this list — every command, in order, with the failure
+> modes — is **[deploy-to-azure.md](deploy-to-azure.md)**. This section is the
+> summary; that document is what you actually follow. Keep them in step, or
+> delete this one rather than let two copies drift.
+
+1. Entra app registration + admin consent
+2. **Index `Print_Status`** in the SharePoint library
+3. Key Vault, `Secrets Officer` for the app identity, `bootstrap_token.py` to seed the secret
+4. Application settings — then **read them back** (a code default is not the live value, §P-7.2)
+5. Function code (`--build remote`) — **with sampling disabled in `host.json`** (§13.4)
+6. Power Automate flows A–D; Poll's cadence from the measured retention window (§3)
+7. App Insights workbook + alerts (§13)
+
+---
+
+## 12a. Findings from the post-implementation review
+
+Six defects were found by reviewing the finished code against the requirement.
+Each has a regression test in `tests/test_review_findings.py` that failed before
+the fix. Recorded here because the reasoning is worth more than the diff.
+
+| # | Defect | Why it mattered |
+|---|---|---|
+| **F1** | Poll capped at 15 jobs and took the oldest first | Requirement violation ("all files"), **and** starvation: long-running jobs held every slot, so newer completed jobs were never marked and aged into the 20-day dead zone |
+| **F2** | Resubmit ordered by `createdDateTime` | That value never changes, so a chronically failing file was re-picked every run and everything newer waited behind it forever |
+| **F3** | Resubmit cancelled on the **wrong printer** when the request overrode the printer | The cancel 404'd, a 404 reads as "already gone", so it reported success while the original job stayed alive — the exact double-print the cancel exists to prevent |
+| **F4** | `FakeGraph` dropped `$filter` from its `@odata.nextLink` | A flaw in the *test harness*: real Graph carries the query forward, so no paging test could have caught a real filter-loss bug |
+| **F5** | Poll stamped every completion with the request's start time | With the cap removed a run can span 90 s, so forty jobs would share one timestamp up to a minute and a half stale |
+| **F6** | Resubmit could process one file twice | Its two status queries run at different instants; a file whose status changes between them appeared in both result sets |
+
+**Requirements conformance** is now asserted directly, clause by clause, in
+`tests/test_requirements.py` (31 tests) — including the four places the
+implementation deliberately departs from the literal text (R3, R5, R6, R17).
+
+## 13. Reporting and observability
+
+> Answers "how many were submitted / retried / pending / failed / completed each week", and
+> "what can I use in the Azure portal".
+
+### 13.1 The key distinction — two different questions, two different stores
+
+| Question | Answered by | Why |
+|---|---|---|
+| **"What is the state *right now*?"** — how many files are pending / failed / completed today | **SharePoint** (the library itself) | The four columns *are* the state. Exact, live, zero code |
+| **"What *happened* over time?"** — how many were submitted, retried, or completed each week | **Application Insights** | The columns hold only the **latest** state. A file retried three times looks identical to one retried once. Only an event log can count activity |
+
+This is why both halves are needed. Reporting weekly counts off SharePoint alone is impossible;
+reporting current state off logs alone is unreliable (a log gap becomes a wrong total).
+
+### 13.2 Telemetry map
+
+| Store | Holds | Questions it answers |
+|---|---|---|
+| **SharePoint library** | the four columns per file | "What is the business state of file X?" — the source of truth |
+| **Application Insights** | `RUN_SUMMARY` (per invocation), `PRINT_EVENT` (per file transition), `requests`, `exceptions` | "How many, how often, how long, what failed" |
+| **Power Automate run history** | each flow run and its retries (28 days) | "Did the schedule actually fire?" |
+| **Universal Print / printer** | job queue and printer status | "Is the printer itself healthy?" |
+
+### 13.3 The two log lines
+
+Fields are embedded in the message text because the Python worker does not map `extra=` into
+`customDimensions` (§P-2.8). **Free-text fields go last** so KQL `parse` delimiters stay unambiguous.
+
+```
+RUN_SUMMARY  ep=submit lib=Documents printer=<shareId> found=23 ok=4 failed=1
+             skipped=0 remaining=18 httpStatus=200 ms=8421 folder=/Invoices/ToPrint
+
+PRINT_EVENT  ep=submit item=42 from=PRINT_READY to=PRINT_PENDING job=1825
+             printer=<shareId> result=submitted ms=1420 file=Invoice 2026-08 Acme.pdf
+```
+
+`result` vocabulary — a closed set, so the counts are exhaustive:
+`submitted · resubmitted · failed · skipped · completed · completed_late · failed_terminal ·
+not_found · cancelled`
+
+Nine values, and every one of them is emitted somewhere — checked by grep, not assumed. Note what
+is **absent**: `still_running`. A job still in flight is not an outcome, it is the absence of one,
+and emitting a line every ten minutes for every unfinished job would swamp the very table the
+weekly counts are computed from. It appears in the Poll *response* (`stillRunning`), which is where
+a caller wants it, and nowhere in the log.
+
+One `PRINT_EVENT` per file per terminal outcome, from every endpoint. `item` + (`printer`,`job`)
+are the correlation keys — remember job ids are only unique per printer (§5.3).
+
+### 13.4 host.json — sampling **must** be disabled
+
+```json
+{ "version": "2.0",
+  "logging": { "applicationInsights": { "samplingSettings": { "isEnabled": false } } } }
+```
+Adaptive sampling silently drops `traces` rows — which would make every count in §13.5 quietly
+wrong, with no error anywhere. At this volume it saves nothing. The sibling project learned this
+the same way.
+
+### 13.5 KQL query pack — App Insights → **Logs**
+
+> Table name: `traces` when querying from the Application Insights resource's Logs blade;
+> `AppTraces` from the Log Analytics workspace. Same data.
+
+**Query 1 — per-file event feed (the workhorse)**
+```kusto
+traces
+| where timestamp > ago(7d) and message startswith "PRINT_EVENT"
+| parse message with "PRINT_EVENT ep=" ep " item=" item " from=" fromStatus " to=" toStatus
+                    " job=" job " printer=" printer " result=" result " ms=" ms:long " file=" file
+| project timestamp, ep, item, fromStatus, toStatus, job, result, ms, file
+| order by timestamp desc
+```
+
+**Query 2 — the weekly report you asked for**
+```kusto
+traces
+| where timestamp > ago(90d) and message startswith "PRINT_EVENT"
+| parse message with "PRINT_EVENT ep=" ep " item=" item " from=" fromStatus " to=" toStatus
+                    " job=" job " printer=" printer " result=" result " ms=" ms:long " file=" file
+| summarize
+    submitted = countif(ep == "submit"   and result == "submitted"),
+    retried   = countif(ep == "resubmit" and result == "resubmitted"),
+    completed = countif(result == "completed" or result == "completed_late"),
+    failed    = countif(result == "failed"    or result == "failed_terminal"),
+    cancelled = countif(result == "cancelled"),
+    filesTouched = dcount(item)
+  by week = startofweek(timestamp)
+| order by week desc
+```
+
+**Query 3 — same, as a chart for the workbook**
+```kusto
+traces
+| where timestamp > ago(90d) and message startswith "PRINT_EVENT"
+| parse message with "PRINT_EVENT ep=" ep " item=" item " from=" fromStatus " to=" toStatus
+                    " job=" job " printer=" printer " result=" result " ms=" ms:long " file=" file
+| summarize count() by week = startofweek(timestamp), result
+| render columnchart
+```
+
+**Query 4 — files retried more than once (chronic failures)**
+```kusto
+traces
+| where timestamp > ago(30d) and message startswith "PRINT_EVENT"
+| parse message with "PRINT_EVENT ep=" ep " item=" item " from=" fromStatus " to=" toStatus
+                    " job=" job " printer=" printer " result=" result " ms=" ms:long " file=" file
+| where ep == "resubmit" and result == "resubmitted"
+| summarize retries = count(), lastTry = max(timestamp), any(file) by item
+| where retries > 1
+| order by retries desc
+```
+A file appearing here repeatedly is not a transient failure — it is a document the printer cannot
+handle, and no amount of retrying will fix it.
+
+**Query 5 — invocation health**
+```kusto
+traces
+| where timestamp > ago(7d) and message startswith "RUN_SUMMARY"
+| parse message with "RUN_SUMMARY ep=" ep " lib=" lib " printer=" printer " found=" found:int
+                    " ok=" ok:int " failed=" failed:int " skipped=" skipped:int
+                    " remaining=" remaining:int " httpStatus=" httpStatus:int " ms=" ms:long " folder=" folder
+| summarize runs = count(), errors = countif(httpStatus >= 500),
+            p95ms = percentile(ms, 95) by ep, bin(timestamp, 1d)
+| order by timestamp desc
+```
+
+**Query 6 — did the schedule stop?** (the most dangerous failure is silence)
+```kusto
+traces
+| where timestamp > ago(2h) and message startswith "RUN_SUMMARY"
+| summarize lastRun = max(timestamp) by ep = extract("ep=(\\w+)", 1, message)
+```
+
+Save each with **Save → Save as query** so they are one click next time.
+
+### 13.6 The Azure Portal answer — an Application Insights **Workbook**
+
+This is the thing to leverage. Workbooks combine several KQL queries, charts and parameters into
+one saved, shareable page, and pin to an Azure dashboard.
+
+1. Function App → **Application Insights** → **Workbooks** → **+ New**
+2. **Add → Add query**, Data source *Logs*, Resource type *Application Insights* → paste Query 3 →
+   Visualization **Bar chart** → *Run*. Title it "Print activity by week".
+3. **Add → Add query** with Query 2 → Visualization **Grid** — the numeric weekly table.
+4. **Add → Add query** with Query 4 → Grid — "Chronic failures".
+5. **Add → Add parameter** → a *Time range* parameter, so the whole page re-scopes at once.
+6. **Save** as `Print pipeline — weekly`, then **Pin to dashboard** for one-click access.
+
+Also worth pinning, from Function App → **Metrics**: `Requests` (Sum), `Http 5xx` (Sum),
+`Response Time` (Avg). These come from the platform and exist even if App Insights is off.
+
+### 13.7 Current state — SharePoint, with no code at all
+
+For "how many are pending / failed / completed **right now**", the library answers directly and
+exactly:
+
+- **In SharePoint:** create a view grouped by `Print_Status`. Group headers show live counts. Add
+  a second view filtered to `Print_Status = PRINT_PENDING` **and** `Created < today-20` to surface
+  the G1/UC-10 stuck files.
+- **Flow D — Weekly digest** (Mondays 07:00): SharePoint **Get items** with
+  `$filter=Print_Status eq 'PRINT_PENDING'` (repeat per status), take `length()` of each, and email
+  the four counts plus a link to the workbook. Pure Power Automate — **no function code**.
+
+> **Why no `/api/print/report` endpoint.** It would only re-expose what SharePoint already answers
+> exactly, and what Power Automate can already read with a connector action. Adding an endpoint
+> would create a second way to ask the same question, with its own bugs and tests. Skipped on
+> purpose (§P-2 *Simplicity First*); the layering in §9 makes it trivial to add later if a caller
+> genuinely needs one call.
+
+### 13.8 Alerts — the failure worth catching is silence
+
+| Name | Scope | Condition | Sev | Catches |
+|---|---|---|---|---|
+| `alert-print-5xx` | Function App | `Http Server Errors` ≥ 3 in 1 h | 2 | Graph/auth/printer breakage |
+| `alert-print-silent` | App Insights | Query 6 returns no `submit` row in 2 h (log-search alert) | 2 | Flow off, connection expired, token revoked — **the failure mode with no other trace** |
+| `alert-print-failed-batch` | App Insights | `PRINT_EVENT … result=failed` ≥ 5 in 1 h | 3 | A bad printer or a run of bad documents |
+| `budget-print` | Resource group | 80 % actual / 100 % forecast | — | Cost guardrail |
+
+Create one action group first (Monitor → Alerts → Action groups) with an email target, and point
+all rules at it. Metric rules ~$0.10/month each; log-search rules ~$0.50/month.
+
+### 13.9 Retention and cost
+
+Application Insights tables keep **90 days free** — about 13 weeks of weekly history, which suits
+a weekly report. Extendable to 730 days at cost via the workspace or per-table retention setting.
+At this volume, telemetry stays inside the free ingestion grant; expect roughly **$1–2/month**
+total, dominated by the alert rules.
+
+If you ever need history beyond 90 days, the cheapest option is to keep the workbook's weekly
+grid and paste it into a spreadsheet each quarter — far less than paying for extended retention on
+a low-volume pipeline.

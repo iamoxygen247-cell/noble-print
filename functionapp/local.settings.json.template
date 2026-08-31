@@ -1,0 +1,26 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+
+    "GRAPH_TENANT_ID": "",
+    "GRAPH_CLIENT_ID": "",
+
+    "KEY_VAULT_URI": "https://YOUR-KEYVAULT.vault.azure.net/",
+    "PRINT_REFRESH_TOKEN_SECRET": "up-print-refresh-token",
+    "PRINT_REFRESH_TOKEN": "",
+
+    "SHAREPOINT_HOSTNAME": "YOURTENANT.sharepoint.com",
+    "SHAREPOINT_SITE_PATH": "/sites/YOURSITE",
+
+    "PRINT_BATCH_SIZE": "5",
+    "PRINT_STATUS_WINDOW_DAYS": "20",
+    "PRINT_RESUBMIT_MIN_AGE_HOURS": "72",
+    "PRINT_BUSINESS_TZ": "America/Vancouver",
+    "PRINT_BUDGET_SECONDS": "90",
+    "GRAPH_TIMEOUT_SECONDS": "30",
+
+    "AZURE_CLIENT_ID": ""
+  }
+}

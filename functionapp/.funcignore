@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.python_packages/
+local.settings.json
+local.settings.json.template
+README.md
+.funcignore
+.vscode/
+tests/

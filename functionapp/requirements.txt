@@ -1,0 +1,21 @@
+# Azure Functions Python v2 worker
+azure-functions>=1.20.0
+
+# Microsoft Graph REST transport (SharePoint + Universal Print). No Graph SDK:
+# the surface used here is a dozen documented URLs, and the SDK's generated
+# models would hide the exact headers this pipeline depends on (no Authorization
+# on the upload PUT, If-Match on the claim).
+requests>=2.32.0
+
+# Delegated token acquisition. Universal Print refuses app-only tokens, so the
+# service account's refresh token is redeemed here. Same library the bootstrap
+# script uses, so scopes and client config cannot drift between them.
+msal>=1.31.0
+
+# Managed identity for Key Vault, where the refresh token lives.
+azure-identity>=1.17.0
+azure-keyvault-secrets>=4.8.0
+
+# IANA time-zone data for zoneinfo (print_policy.BUSINESS_TZ). Required on hosts
+# with no system tz database -- without it "printed on ..." silently renders UTC.
+tzdata>=2024.1
