@@ -146,13 +146,21 @@ be a managed identity: creating, starting and cancelling a print job are all
 documented `Application: Not supported`.
 
 1. **Entra ID → App registrations → New registration**
-   - Name: `noble-print`
+   - Name: `Noble Universal Print`
    - Accounts: *Single tenant*
    - Redirect URI: **leave blank**
    - → **Register**
 
-2. **Authentication → Advanced settings → Allow public client flows → Yes → Save.**
-   Without this the device-code sign-in in step 5 cannot start.
+2. **Authentication → Allow public client flows → Enabled.**
+   On the classic blade this is under *Advanced settings* as a Yes/No radio; on
+   **Authentication (Preview)** it is a toggle on the **Settings** tab. Both have
+   **Save / Discard** at the foot of the blade — **greyed out means saved**, so if
+   Save is still active you have not committed it, and you will not find that out
+   until step 5.
+
+   The app is a public client with no secret, so Entra refuses the device-code
+   grant outright without this. Leave **Redirect URI** blank: device code flow does
+   not use one.
 
 3. **API permissions → Add a permission → Microsoft Graph → Delegated**, add:
 
@@ -162,21 +170,37 @@ documented `Application: Not supported`.
    | `PrintJob.ReadWriteBasic` | create, start **and cancel** print jobs |
    | `Printer.Read.All` | resolve the printer behind a share |
    | `PrinterShare.ReadBasic.All` | the preflight |
-   | `offline_access` | issue a refresh token at all |
+   | `offline_access` | issue a refresh token at all — **see the note** |
 
    → **Grant admin consent for &lt;tenant&gt;** and confirm every row reads
    *Granted*.
 
+   > **`offline_access` may not be listed, and that is not a blocker.** It is an
+   > OpenID Connect scope, so it lives under the **OpenId permissions** group, not
+   > with the Graph resource groups — and some portal builds omit it from the
+   > picker entirely. Add it if the search box finds it; otherwise carry on.
+   > `graph_auth.SCOPES` deliberately **excludes** it (MSAL injects
+   > `offline_access` / `openid` / `profile` itself and rejects them if passed —
+   > pinned by `test_the_scopes_exclude_the_reserved_ones`), and it is
+   > user-consentable rather than declared. Step 5 is the real check: if no refresh
+   > token comes back, `bootstrap_token.py` says so in as many words.
+
    > Do **not** add `PrintConnector.Read.All`. Only the diagnostic script wants
    > it; the app deliberately does not.
 
-4. Copy the **Application (client) ID** from **Overview**. The tenant id is
-   already known, so only one value is new here:
+4. Copy the **Application (client) ID** from **Overview**:
 
 ```powershell
 $TENANT_ID = "ce21d3c3-2ce8-4fa8-bb57-69da9b3e7c91"   # confirmed, step 0
-$CLIENT_ID = "<Application (client) ID>"              # from this registration
+$CLIENT_ID = "bb707828-6e0e-4c2a-9f4d-329aa10c66a5"   # "Noble Universal Print"
 ```
+
+Neither is a secret — a client id and a tenant id are public identifiers. The
+secret is the refresh token, and it never leaves Key Vault.
+
+**Registration completed 2026-08-31**, verified from Overview: supported account
+types *My organization only*, state *Activated*, all five delegated permissions
+granted tenant-wide, public client flows enabled.
 
 ### The service account
 
