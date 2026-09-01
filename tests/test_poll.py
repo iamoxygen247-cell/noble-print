@@ -24,7 +24,8 @@ import re
 import pytest
 
 import print_policy
-from helpers import POLL, as_json, iso, post, print_events, result_for
+from helpers import (POLL, as_json, iso, post, print_events, result_for,
+                     run_summaries)
 
 BODY = {"library": "Documents", "folder": "/Invoices/ToPrint"}
 
@@ -336,9 +337,11 @@ def test_the_cancel_uses_the_printer_named_on_the_row(graph, frozen_now):
     printer, 404'd, read as "already gone", and the original stayed alive to
     print beside its replacement.
 
-    Poll takes no printer argument at all, so the two can never diverge -- but
-    with more than one share registered, the cancel must still demonstrably
-    follow the row rather than whichever share happens to be first.
+    Poll can be GIVEN a printer again (see the printerShareId section below), so
+    the two can diverge once more -- but only when one is supplied. This test
+    sends none, which is the default every existing flow uses, and pins that with
+    more than one share registered the cancel still follows the ROW rather than
+    whichever share happens to be first.
     """
     other = graph.add_share("other-share", printer_id="other-printer")
     stalled(graph, printer=other["id"])
@@ -736,3 +739,186 @@ def test_the_response_echoes_the_settings_in_force(graph, frozen_now):
     assert payload["stallMinutes"] == 7
     assert payload["giveUpDays"] == 3
     assert payload["maxRetries"] == 4
+
+
+# --- printerShareId: the request-level printer override -----------------------
+#
+# Poll deliberately took NO printer for most of its life. That was the structural
+# fix for defect F3: Resubmit accepted a printerShareId that could override the
+# file's own Printer_Name, so a cancel went to the wrong printer, 404'd, read as
+# "already gone", and the original job stayed alive to print beside its
+# replacement.
+#
+# The parameter is back, by explicit decision, as a HARD OVERRIDE -- and with it
+# F3's precondition. The tests below pin what that means, including the exposure,
+# because a reintroduced hazard that nothing describes is how it gets forgotten.
+#
+# WHAT THESE TESTS CANNOT SHOW. Job ids are per-printer in the real service, so
+# looking up a job on the wrong printer 404s. FakeGraph keys jobs GLOBALLY, so it
+# cannot reproduce that 404 and therefore cannot demonstrate the double print
+# itself. What is pinned here is everything upstream of it: which printer each
+# call is addressed to, and that a divergence is counted and logged.
+
+
+def test_without_an_override_each_row_follows_its_own_printer(graph, frozen_now):
+    """The default, and the behaviour every existing flow depends on."""
+    other = graph.add_share("other-share", printer_id="other-printer")
+    stalled(graph, printer=other["id"])
+
+    payload = as_json(post(POLL, body()))
+
+    assert payload["printerShareId"] is None
+    assert payload["printerOverridden"] == 0
+    assert "other-printer" in graph.calls_to("/cancel", method="POST")[0].url
+
+
+def test_an_override_redirects_the_job_lookup(graph, frozen_now):
+    """Hard override: the row says one share, the request says another, and the
+    request wins. This is the behaviour that was asked for."""
+    graph.add_share("other-share", printer_id="other-printer")
+    stalled(graph, printer="other-share")
+
+    payload = as_json(post(POLL, body(printerShareId=graph.SHARE_ID)))
+
+    assert payload["printerShareId"] == graph.SHARE_ID
+    lookup = graph.calls_to("/jobs/1825", method="GET")[0]
+    assert "/print/shares/{}/jobs/1825".format(graph.SHARE_ID) in lookup.url
+
+
+def test_an_override_redirects_the_cancel(graph, frozen_now):
+    """And the cancel with it -- the two must not disagree, or Poll would read a
+    job on one printer and cancel it on another."""
+    graph.add_share("other-share", printer_id="other-printer")
+    stalled(graph, printer="other-share")
+
+    payload = as_json(post(POLL, body(printerShareId=graph.SHARE_ID)))
+
+    assert payload["requeued"] == 1
+    cancel = graph.calls_to("/cancel", method="POST")[0]
+    assert "/print/printers/{}/jobs/1825/cancel".format(graph.PRINTER_ID) in cancel.url
+
+
+def test_a_divergent_row_is_counted_and_warned_about(graph, frozen_now, caplog):
+    """THE EXPOSURE, MADE VISIBLE. A row naming a different printer from the
+    override is the one shape that can print twice. It is not refused -- the
+    override was asked for -- but it is counted and logged, because in the real
+    service that job cannot be cancelled from the overriding printer."""
+    graph.add_share("other-share", printer_id="other-printer")
+    stalled(graph, printer="other-share")
+
+    with caplog.at_level(logging.WARNING):
+        payload = as_json(post(POLL, body(printerShareId=graph.SHARE_ID)))
+
+    assert payload["printerOverridden"] == 1
+    warnings = [r.getMessage() for r in caplog.records
+                if "printerShareId override" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "F3" in warnings[0], "the warning must name the defect it re-opens"
+
+
+def test_an_override_matching_the_row_is_not_a_divergence(graph, frozen_now):
+    """The single-printer deployment, which is the intended use. The override
+    equals Printer_Name on every row, nothing diverges, and the exposure counter
+    stays at zero -- which is what makes it worth reading."""
+    stalled(graph, "1")
+    stalled(graph, "2", job_id="1826")
+
+    payload = as_json(post(POLL, body(printerShareId=graph.SHARE_ID)))
+
+    assert payload["requeued"] == 2
+    assert payload["printerOverridden"] == 0
+
+
+def test_an_override_rescues_a_row_with_no_printer_name(graph, frozen_now):
+    """Defect G3: a row carrying a Print_JobId but an empty Printer_Name could be
+    neither read nor cancelled, so it was reported `malformed` on every run and
+    never reached a terminal status. An override supplies the missing printer and
+    the row rejoins the schedule."""
+    graph.add_item("1", status=print_policy.PENDING, job_id="1825", printer="",
+                   created=iso(days=1), modified=iso(days=1))
+    graph.add_job("1825", state="stopped", created=iso(days=1))
+
+    payload = as_json(post(POLL, body(printerShareId=graph.SHARE_ID)))
+
+    assert payload["malformed"] == 0, "the override should have supplied the printer"
+    assert payload["requeued"] == 1
+    assert graph.status_of("1") == print_policy.READY
+    # Not a divergence: the row named nothing to disagree with.
+    assert payload["printerOverridden"] == 0
+
+
+def test_without_an_override_a_row_with_no_printer_name_is_still_malformed(graph,
+                                                                          frozen_now):
+    """G3 unchanged when no override is sent -- the rescue is opt-in, not a
+    silent behaviour change for existing flows."""
+    graph.add_item("1", status=print_policy.PENDING, job_id="1825", printer="",
+                   created=iso(days=1), modified=iso(days=1))
+
+    payload = as_json(post(POLL, body()))
+
+    assert payload["malformed"] == 1
+    assert graph.status_of("1") == print_policy.PENDING
+
+
+@pytest.mark.parametrize("supplied", [123, [], {}])
+def test_a_non_string_printer_share_id_is_400(graph, frozen_now, supplied):
+    stalled(graph)
+
+    response = post(POLL, body(printerShareId=supplied))
+
+    assert response.status_code == 400
+    assert graph.cancelled == []
+
+
+@pytest.mark.parametrize("supplied", [None, "", "   "])
+def test_an_absent_or_blank_override_leaves_the_row_in_charge(graph, frozen_now,
+                                                              supplied):
+    other = graph.add_share("other-share", printer_id="other-printer")
+    stalled(graph, printer=other["id"])
+
+    payload = as_json(post(POLL, body(printerShareId=supplied)))
+
+    assert payload["printerShareId"] is None
+    assert "other-printer" in graph.calls_to("/cancel", method="POST")[0].url
+
+
+def test_the_override_is_reported_on_the_run_summary(graph, frozen_now, caplog):
+    """RUN_SUMMARY carries printer= for Submit; Poll left it "-" because it had
+    no printer. With an override there is one, and the weekly report should be
+    able to tell the two kinds of run apart."""
+    stalled(graph)
+
+    with caplog.at_level(logging.INFO):
+        post(POLL, body(printerShareId=graph.SHARE_ID))
+
+    summary = [s for s in run_summaries(caplog) if s["ep"] == "poll"][0]
+    assert summary["printer"] == graph.SHARE_ID
+
+
+def test_a_divergent_row_with_no_job_is_counted_but_not_called_a_duplicate_risk(
+        graph, frozen_now, caplog):
+    """The count is CONFIGURATION divergence; the F3 warning is DUPLICATE risk.
+
+    A crashed submission -- PRINT_PENDING with no Print_JobId -- on a row naming
+    another printer still means the flow and the library disagree, so it counts.
+    But there is no outstanding job, so nothing can print twice, and telling
+    somebody it might would be false. A warning that cries wolf is one nobody
+    reads by the time it matters.
+    """
+    graph.add_share("other-share", printer_id="other-printer")
+    graph.add_item("1", status=print_policy.PENDING, job_id="",
+                   printer="other-share", created=iso(days=1), modified=iso(days=1))
+
+    with caplog.at_level(logging.WARNING):
+        payload = as_json(post(POLL, body(printerShareId=graph.SHARE_ID)))
+
+    assert payload["printerOverridden"] == 1, "the disagreement must still count"
+
+    warnings = [r.getMessage() for r in caplog.records
+                if "printerShareId override" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "F3" not in warnings[0], "no job means no duplicate to warn about"
+    assert "nothing can print twice" in warnings[0]
+    # It is still recovered, exactly as it would be with no override at all.
+    assert payload["requeued"] == 1
+    assert graph.cancelled == [], "there was no job to cancel"

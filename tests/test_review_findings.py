@@ -16,11 +16,15 @@ belong to Poll.
   F6  Resubmit's two status queries ran at different instants, so a file whose
       status changed between them was processed twice in one run.
 
-F2, F3 and F6 were all properties of Resubmit's SHAPE, and Resubmit is gone. Each
-is now structurally impossible rather than merely fixed; the sections below say
-why, and name the Poll tests that carry whatever part of the guard still applies.
-Their original assertions could not survive the endpoint they exercised, but
-deleting a regression test without recording the reason is how a fixed defect
+F2 and F6 were properties of Resubmit's SHAPE, and Resubmit is gone: both are now
+structurally impossible rather than merely fixed. F3 WAS in that category and no
+longer is -- Poll has since been given an optional `printerShareId` that overrides
+the row's own printer, which reinstates the precondition. The section below says
+what that costs and what contains it.
+
+The sections name the Poll tests that carry whatever part of each guard still
+applies. Their original assertions could not survive the endpoint they exercised,
+but deleting a regression test without recording the reason is how a fixed defect
 comes back.
 """
 
@@ -124,11 +128,10 @@ def test_poll_skips_job_less_rows_without_consuming_the_run(graph, frozen_now):
     assert graph.status_of("real") == print_policy.COMPLETED
 
 
-# --- F2 and F3: retired with the Resubmit endpoint ---------------------------
+# --- F2 (retired) and F3 (deliberately reopened) -----------------------------
 #
-# Both defects were properties of Resubmit's shape, and both are now structurally
-# impossible rather than merely fixed. Recorded here because deleting a regression
-# test needs a reason, not a shrug.
+# Recorded here because deleting a regression test needs a reason, not a shrug --
+# and because a defect that comes BACK by decision needs the reason even more.
 #
 # F2 -- "Resubmit re-picked the same failing files forever". It took the oldest N
 # per run, so five chronic failures filled every slot and nothing newer was ever
@@ -142,13 +145,36 @@ def test_poll_skips_job_less_rows_without_consuming_the_run(graph, frozen_now):
 # F3 -- "cancel targeted the new printer, not the one the job lives on". Resubmit
 # accepted a `printerShareId` that could override the file's own Printer_Name, so
 # the cancel 404'd on the wrong printer, read as "already gone", and the original
-# stayed alive to print beside its replacement. POLL ACCEPTS NO PRINTER. It always
-# resolves the row's own Printer_Name, so the two can never diverge. The surviving
-# half of this guard -- that the cancel uses the PRINTER id behind that share, not
-# the share id -- lives in
+# stayed alive to print beside its replacement.
+#
+# THIS IS NO LONGER STRUCTURALLY IMPOSSIBLE, AND THAT IS A DELIBERATE DECISION.
+# Between 2026-09-01 and the change below, Poll took no printer at all and the
+# two could not diverge. Poll now accepts an OPTIONAL `printerShareId` that is a
+# HARD OVERRIDE when supplied, which reinstates exactly the precondition F3
+# described: the row's job may live on a printer the override does not name.
+#
+# What that costs, stated plainly, because a reintroduced hazard nobody wrote
+# down is one nobody remembers: job ids are per-printer, so the lookup and the
+# cancel both 404 against the wrong printer, a 404 reads as "already gone", the
+# row is requeued anyway, and the original job prints beside its replacement.
+#
+# What contains it:
+#   * the override is OPT-IN. Omit it and the pre-existing behaviour is exact --
+#     test_poll.py::test_without_an_override_each_row_follows_its_own_printer.
+#   * a divergent row is COUNTED (`printerOverridden`) and logged with a warning
+#     naming F3 -- test_poll.py::test_a_divergent_row_is_counted_and_warned_about.
+#     In a single-printer deployment, the intended one, that counter is 0 and the
+#     hazard is not merely unlikely but absent.
+#
+# The half of the guard that still holds unconditionally -- that the cancel uses
+# the PRINTER id behind the share, not the share id -- lives in
 # test_poll.py::test_the_cancel_uses_the_printer_id_not_the_share_id, and the
-# multi-printer case in
+# row-follows-its-own-printer case in
 # test_poll.py::test_the_cancel_uses_the_printer_named_on_the_row.
+#
+# NOT PINNED BY ANY TEST: the double print itself. FakeGraph keys jobs globally
+# rather than per printer, so it cannot produce the cross-printer 404 the defect
+# turns on. Making the fake faithful there is the outstanding work.
 
 
 # --- F4: paging must not lose the filter -------------------------------------

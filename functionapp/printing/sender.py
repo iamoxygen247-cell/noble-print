@@ -5,7 +5,7 @@ Deliberately thin. Every Graph call still goes through universal_print.py, which
 owns the four-step submit protocol and the two rules that must not be re-derived
 here: the upload PUT carries no Authorization header, and cancel addresses the
 printer id rather than the share id. Re-implementing any of that would give the
-repo two versions of a sequence that 336 tests currently pin to one.
+repo two versions of a sequence that 435 tests currently pin to one.
 
 What this module adds is the part that is per-printer: convert with the profile,
 then submit with the profile's job configuration.

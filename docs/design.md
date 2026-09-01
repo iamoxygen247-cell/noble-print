@@ -150,6 +150,8 @@ Recurrence
    └─ HTTP POST {funcUrl}/api/print/submit?code={key}
             {"library":"Documents","folder":"/Invoices/ToPrint",
              "printerShareId":"<guid>","batchSize":5}
+   (printFormat is optional and omitted here on purpose: the live printer takes
+    image/pwg-raster ONLY, so naming application/pdf would 400 every run)
    └─ Parse JSON → remainingReady, submitted, failed
 └─ Condition: failed > 0 OR status != 200 OR printerAvailable == false  →  notify
    (the last term is load-bearing: an offline printer is a 200 with failed = 0)
@@ -157,8 +159,11 @@ Recurrence
 
 **Flow B — Print Status Poll** (every 10 min)
 ```
-Recurrence → HTTP POST /api/print/status {"library","folder"}
+Recurrence → HTTP POST /api/print/status
+            {"library","folder","printerShareId":"<guid>",
+             "giveUpDays":10,"stallMinutes":5,"maxRetries":10}
           → Condition: status != 200 → notify
+          → Condition: printerOverridden > 0 → notify  (see F3-R, docs/ai/open-defects.md)
 ```
 Cadence is load-bearing: Poll must run more often than Universal Print discards finished jobs, or
 a completed job disappears before Poll sees it and Poll requeues it (UC-9). Measure that
@@ -396,12 +401,14 @@ trail is not lost.
 ### 5.5 Submit — sequence
 
 ```
-POST /api/print/submit {library, folder, printerShareId, batchSize}
+POST /api/print/submit {library, folder, printerShareId,
+                        batchSize?=5, printFormat?, dryRun?}
  ├─ 1 validate                              → 400 on any problem, ZERO writes (§P-2.4)
  ├─ 2 resolve site → list (title|id) + the 4 column internal names   [cached per list]
  ├─ 3 PREFLIGHT  GET /print/shares/{id}?$select=id,displayName,isAcceptingJobs,
  │                 capabilities,status&$expand=printer($select=id)
  │      reject early: share missing · not accepting jobs · contentTypes lacks the file type
+ │      ALSO: a printFormat the share does not report → 400, nothing claimed
  │      cache the PRINTER id from the expand — Poll needs it to cancel (§5.7)
  ├─ 4 GET items  $filter=fields/<status> eq 'PRINT_READY'  $expand=fields
  │               Prefer: HonorNonIndexedQueriesWarningMayFailRandomly
@@ -415,7 +422,9 @@ POST /api/print/submit {library, folder, printerShareId, batchSize}
           412 ⇒ another run won it ⇒ skipped, next file
       5.2 GET items/{id}/driveItem?$select=id,name,size,@microsoft.graph.downloadUrl
           GET <downloadUrl>          ← NO Authorization header (preauthenticated)
-      5.3 POST /print/shares/{s}/jobs {"configuration":{"copies":1}} → jobId, documentId
+      5.3 select the PROFILE: by printFormat when given, else by capabilities
+          POST /print/shares/{s}/jobs {"configuration": <profile's>} → jobId, documentId
+          a format this DOCUMENT cannot produce → this file fails, batch continues
       5.4 POST …/documents/{d}/createUploadSession {documentName, contentType, size}
       5.5 PUT <uploadUrl>            ← NO Authorization header
           Content-Range: bytes {s}-{e}/{total} · Content-Length
@@ -428,8 +437,11 @@ POST /api/print/submit {library, folder, printerShareId, batchSize}
       ──  any failure in 5.2–5.6 → PATCH {PRINT_FAILED, printer, message}
 
  ◄─ 200 {candidatesFound, remainingReady, submitted, failed, skipped,
-         printerAvailable, budgetExhausted,
+         printerAvailable, budgetExhausted, batchSize, printFormat,
          items:[{itemId, fileName, result, jobId, message, warning?}]}
+
+      printFormat is null when the caller named none and the printer's
+      capabilities chose the profile -- the pre-parameter behaviour.
 ```
 
 > **Step 5.7 must not be allowed to raise (S1).** By the time it runs the job is created *and*
@@ -456,16 +468,20 @@ POST /api/print/submit {library, folder, printerShareId, batchSize}
 > `PRINT_PENDING` row.
 
 ```
-POST /api/print/status {library, folder,
+POST /api/print/status {library, folder, printerShareId?,
                         giveUpDays?=10, stallMinutes?=5, maxRetries?=10}
  ├─ validate → resolve list + columns
  ├─ GET items $filter=fields/<status> eq 'PRINT_PENDING'
  │     NO window pre-filter. Every pending row reaches the loop -- an old one is
  │     now FAILED explicitly rather than dropped out of scope (this is what
  │     closes G1). No batch cap either; only the wall-clock budget bounds it.
- │     SKIP items with a Print_JobId but no Printer_Name → report as malformed
+ │     SKIP items with a Print_JobId and no printer at all → malformed (G3).
+ │     An override SUPPLIES that printer, so it rescues those rows.
  └─ per item:
-      job = Print_JobId ? GET /print/shares/{Printer_Name}/jobs/{id} : none
+      printer = printerShareId OR Printer_Name    ← HARD override when supplied
+                a row disagreeing with the override is counted as
+                printerOverridden and logged WARNING (F3-R)
+      job = Print_JobId ? GET /print/shares/{printer}/jobs/{id} : none
             404 → counted as notFound, then treated as "no job"
 
       poll_decision(state, file age, job age, attempt age) → in ORDER:
@@ -485,7 +501,14 @@ POST /api/print/status {library, folder,
 
  ◄─ 200 {checked, completed, failed, requeued, gaveUp, stillRunning, notFound,
          malformed, pendingFound, uncheckedCount, budgetExhausted,
-         giveUpDays, stallMinutes, maxRetries, items:[…]}
+         giveUpDays, stallMinutes, maxRetries, printerShareId,
+         printerOverridden, items:[…]}
+
+      printerOverridden is NOT an error count. It counts CONFIGURATION
+      divergence: every row whose Printer_Name disagreed with the override,
+      whether or not it has a job. Only the rows that DO have an outstanding job
+      carry the F3-R double-print risk, and only those get the F3 warning in the
+      log. It is 0 in a single-printer deployment.
 
       Two of those account for every row exactly once:
           checked + uncheckedCount == pendingFound
@@ -601,8 +624,20 @@ as a 500 naming `scripts/bootstrap_token.py`.
 missing: `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `KEY_VAULT_URI`, `SHAREPOINT_HOSTNAME`,
 `SHAREPOINT_SITE_PATH`. **Tunables** get a constant default + env override + **range validation**:
 `PRINT_BATCH_SIZE`, `PRINT_GIVE_UP_DAYS`, `PRINT_STALL_MINUTES`, `PRINT_MAX_RETRIES`,
-`PRINT_BUSINESS_TZ`, `GRAPH_TIMEOUT_SECONDS`. Out-of-range **request** → 400; out-of-range **env**
+`PRINT_BUSINESS_TZ`, `GRAPH_TIMEOUT_SECONDS`, `PRINT_RASTER_DPI`,
+`PRINT_RASTER_MAX_BYTES`. Out-of-range **request** → 400; out-of-range **env**
 → warn and fall back, because server misconfiguration must not fail every request.
+
+**Two request-only inputs have no env fallback**, because neither is a threshold
+that could sensibly have a server-wide value:
+
+| Input | Endpoint | Absent means |
+|---|---|---|
+| `printFormat` | Submit | choose the profile from the printer's capabilities — the pre-parameter behaviour |
+| `printerShareId` | Poll | each row follows its own `Printer_Name` — the pre-parameter behaviour |
+
+Both are **opt-in**: a flow that omits them gets exactly what it got before they
+existed, which is what let them ship without touching Flow A or Flow B.
 
 `GRAPH_TIMEOUT_SECONDS` [1, 300] lives in `graph_client`, not `print_policy`: a socket timeout is
 transport configuration, not a business rule, and `graph_client` must keep importing no domain
@@ -812,13 +847,23 @@ Six defects were found by reviewing the finished code against the requirement.
 Each had a regression test in `tests/test_review_findings.py` that failed before
 the fix. Recorded here because the reasoning is worth more than the diff.
 
-> **F2, F3 and F6 are history, not live behaviour.** All three were properties of
-> the Resubmit endpoint's shape, and all three became *structurally impossible*
-> when it was retired: Poll has no batch cap (F2), takes no printer override (F3),
-> and runs one query (F6). Their tests went with the endpoint; the reasons are
-> kept at the head of `test_review_findings.py` so a deleted regression cannot
-> quietly come back. **D1 — cancel before replace — did NOT go away**, and its
-> tests were ported into `test_poll.py` before `test_resubmit.py` was deleted.
+> **F2 and F6 are history, not live behaviour.** Both were properties of the
+> Resubmit endpoint's shape, and both became *structurally impossible* when it was
+> retired: Poll has no batch cap (F2) and runs one query (F6). Their tests went
+> with the endpoint; the reasons are kept at the head of
+> `test_review_findings.py` so a deleted regression cannot quietly come back.
+> **D1 — cancel before replace — did NOT go away**, and its tests were ported into
+> `test_poll.py` before `test_resubmit.py` was deleted.
+>
+> **F3 is live again, by decision.** It was structurally impossible for exactly as
+> long as Poll took no printer. Poll now accepts an optional `printerShareId` that
+> hard-overrides each row's `Printer_Name`, which is the precondition F3 turns on:
+> job ids are per-printer, so an override naming the wrong share cannot cancel the
+> row's job, and the original prints beside its replacement. The exposure is zero
+> while one printer is registered — the override then equals `Printer_Name` on
+> every row — and is counted as `printerOverridden` plus a WARNING when it is not.
+> Recorded as **F3-R** in `docs/ai/open-defects.md` with the two fix shapes that
+> were available.
 
 | # | Defect | Why it mattered |
 |---|---|---|

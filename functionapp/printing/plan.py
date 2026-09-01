@@ -2,6 +2,7 @@
 plan.py — say what would be sent to a printer, without sending it.
 
     python -m printing.plan --capabilities caps.json [--source application/pdf]
+                            [--print-format image/pwg-raster]
 
 Reads a printerShare's `capabilities` object exactly as Microsoft Graph returns
 it and prints the decision the pipeline would make: which profile runs, what
@@ -29,7 +30,7 @@ from typing import Any, Dict
 
 import universal_print
 
-from . import select_profile
+from . import SUPPORTED_PRINT_FORMATS, profile_for
 
 
 def share_from_capabilities(capabilities: Dict[str, Any],
@@ -63,18 +64,37 @@ def share_from_capabilities(capabilities: Dict[str, Any],
 
 
 def build_plan(capabilities: Dict[str, Any], source_content_type: str,
-               **share_fields: str) -> Dict[str, Any]:
+               print_format: str = "", **share_fields: str) -> Dict[str, Any]:
+    """What the app would do with this document on this printer.
+
+    `print_format` mirrors Submit's `printFormat`: name one and the profile that
+    PRODUCES it is chosen, ignoring what the capabilities imply; leave it empty
+    and the capabilities decide, as they always did.
+
+    Routed through `profile_for` -- the same function the route uses -- because
+    this module exists so a bench test borrows the APP'S answer instead of
+    inventing its own. Calling `select_profile` directly here would have made
+    that false the moment a flow started sending `printFormat`: on a printer that
+    reports both formats the app would rasterize while this reported
+    `passthrough`, which is precisely the drift this file was written to prevent.
+    """
     share = share_from_capabilities(capabilities, **share_fields)
-    profile = select_profile(share, source_content_type)
+    profile = profile_for(share, source_content_type, print_format)
 
     if profile is None:
+        if print_format:
+            reason = "cannot produce {} from a {} document".format(
+                print_format, source_content_type)
+        else:
+            reason = "printer {} does not accept {} (supports: {})".format(
+                share.display_name or share.share_id or "share",
+                source_content_type,
+                ", ".join(share.content_types) or "unknown")
         return {
             "supported": False,
             "sourceContentType": source_content_type,
-            "reason": "printer {} does not accept {} (supports: {})".format(
-                share.display_name or share.share_id or "share",
-                source_content_type,
-                ", ".join(share.content_types) or "unknown"),
+            "requestedFormat": print_format or None,
+            "reason": reason,
         }
 
     configuration = profile.job_configuration(share)
@@ -82,6 +102,7 @@ def build_plan(capabilities: Dict[str, Any], source_content_type: str,
         "supported": True,
         "profile": profile.name,
         "sourceContentType": source_content_type,
+        "requestedFormat": print_format or None,
         "uploadContentType": profile.target_content_type(source_content_type),
         # The converter MUST render at this resolution: the job declares it and
         # the page header must agree, or the sheet comes out scaled.
@@ -99,6 +120,11 @@ def main(argv=None) -> int:
                              "object, or - to read stdin")
     parser.add_argument("--source", default=universal_print.DEFAULT_CONTENT_TYPE,
                         help="the document's content type (default: %(default)s)")
+    parser.add_argument("--print-format", default="",
+                        choices=("",) + tuple(SUPPORTED_PRINT_FORMATS),
+                        help="the format to UPLOAD, matching Submit's "
+                             "printFormat. Omit to let the printer's "
+                             "capabilities choose.")
     parser.add_argument("--share-id", default="")
     parser.add_argument("--printer-id", default="")
     parser.add_argument("--display-name", default="")
@@ -118,7 +144,7 @@ def main(argv=None) -> int:
         print("ERROR: capabilities must be a JSON object", file=sys.stderr)
         return 1
 
-    plan = build_plan(capabilities, args.source,
+    plan = build_plan(capabilities, args.source, args.print_format,
                       share_id=args.share_id, printer_id=args.printer_id,
                       display_name=args.display_name)
     print(json.dumps(plan, indent=2))

@@ -130,7 +130,13 @@ class FakeGraph:
                  created: str = "2026-08-01T10:00:00Z", name: str = "invoice.pdf",
                  folder: str = "/sites/Ops/Shared Documents/Invoices/ToPrint",
                  job_id: str = "", printer: str = "", message: str = "",
-                 size: int = 1024, modified: Optional[str] = None) -> Dict[str, Any]:
+                 size: int = 1024, modified: Optional[str] = None,
+                 mime_type: str = "application/pdf") -> Dict[str, Any]:
+        """`mime_type` is the drive item's file.mimeType, which is what
+        universal_print.guess_content_type PREFERS over the file extension. It
+        was hardcoded to PDF here, so no test could describe a library holding
+        anything else -- and a profile that refuses a non-PDF source had nothing
+        to refuse. Defaults to PDF, so every existing fixture is unchanged."""
         fields = {
             "FileLeafRef": name,
             "FileDirRef": folder,
@@ -148,6 +154,7 @@ class FakeGraph:
             "fields": fields,
             "size": size,
             "version": 1,
+            "mimeType": mime_type,
         }
         return self.items[item_id]
 
@@ -348,7 +355,7 @@ class FakeGraph:
             "id": "drive-" + item_id,
             "name": item["name"],
             "size": item["size"],
-            "file": {"mimeType": "application/pdf"},
+            "file": {"mimeType": item.get("mimeType") or "application/pdf"},
             "@microsoft.graph.downloadUrl": "{}/{}?token=abc".format(
                 DOWNLOAD_HOST, item_id),
         })

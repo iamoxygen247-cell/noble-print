@@ -82,6 +82,14 @@ at the media size and depends on `scaling: fit` plus the device margins to place
 it on the sheet. A script with hardcoded settings could print perfectly while the
 deployed app printed cropped.
 
+> The script exercises the **capability** path — it sends no `printFormat`, like
+> Flow A. On this printer that is the same answer an explicit
+> `printFormat: image/pwg-raster` would give, because the capabilities already
+> force the raster profile. If a printer that also accepted PDF were ever added,
+> and a flow started naming a format, add `--print-format` to the
+> `python -m printing.plan` call in `scripts/live-print-test.ps1` or this script
+> stops describing what the app does.
+
 Useful flags: `-PlanOnly` stops after conversion, `-KeepRaster` leaves the `.pwg`
 on disk so a bad page can be inspected, `-ShareId` targets a different printer.
 

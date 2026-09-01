@@ -88,7 +88,17 @@ row claiming it failed.
 
 Cancel is documented **only** on `/print/printers/{id}/jobs/{id}/cancel`, so it
 needs the printer id, not the share id. `_cancel_outstanding` resolves it from the
-share named in `Printer_Name`.
+share named in `Printer_Name` — **or from Poll's `printerShareId` when one was
+sent**, which hard-overrides the row.
+
+That override is defect **F3-R** and it is deliberate. Job ids are per-printer, so
+an override naming a share the row's job does not live on cannot cancel it, and
+the original prints beside its replacement. Exposure is **zero with one printer
+registered** — the override equals `Printer_Name` on every row — and is otherwise
+counted as `printerOverridden`, which counts configuration divergence: every
+disagreeing row, job or not. The WARNING is graded to match — only a row with an
+outstanding job can print twice, so only that one names F3. Do not "tidy" the
+override into silence; the counter is the containment.
 
 ### 2a. Recovery is Poll's, on an exponential schedule
 
@@ -112,6 +122,26 @@ All three knobs, plus `batchSize`, are read from the **Power Automate request
 body** first, then app settings, then defaults — so pacing is retuned without a
 deploy.
 
+### 2b. The upload format is chosen, not only inferred
+
+`printing/` is a registry, and there are **two ways to pick a profile**:
+
+| | asks | used when |
+|---|---|---|
+| `matches(share, source)` | can this profile serve this printer? | no `printFormat` — the original behaviour |
+| `produces(format, source)` | can this profile emit this format? | Submit was sent a `printFormat` |
+
+They disagree on purpose: `PwgRasterProfile.matches` stands aside when the printer
+also accepts PDF, because rasterizing what the device takes natively is wasted
+work. `printFormat` is how a caller overrules that. **Adding a format is a profile
+class, one entry in `PROFILES`, and its MIME type in `SUPPORTED_PRINT_FORMATS`** —
+no route change, which is the whole point of the registry.
+
+Two refusals, deliberately different: a format **the printer** does not report is a
+**400 at preflight** with nothing claimed; a format **this document** cannot
+produce is a per-file `PRINT_FAILED`. Do not collapse them — the first is a broken
+flow, the second is one bad file among good ones.
+
 ### 3. Two calls must NOT carry an Authorization header
 
 * the SharePoint pre-authenticated download URL
@@ -124,7 +154,7 @@ everywhere" will break both, one silently.
 
 ### 4. `print_policy.py` imports only the standard library
 
-That constraint is what keeps 389 tests offline and sub-second, and what makes the
+That constraint is what keeps 435 tests offline and sub-second, and what makes the
 utility reusable — another workflow keeps the adapters and replaces only the
 rules. `test_print_policy_imports_only_the_standard_library` enforces it.
 
@@ -136,7 +166,7 @@ in a route belongs in `print_policy`.
 ## Standard Commands
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest              # 389 tests, offline, ~0.6s
+.\.venv\Scripts\python.exe -m pytest              # 435 tests, offline, ~0.7s
 .\scripts\start-local.ps1                         # venv + TLS shim + func start
 .\.venv\Scripts\python.exe scripts\bootstrap_token.py
 .\.venv\Scripts\python.exe scripts\test.py dryrun --library "AI_DropBox_V2026" --folder "/Backup/Invoice" --printer-share-id <guid>
@@ -155,7 +185,9 @@ Five tiers, all but the last offline (design §10):
 |---|---|---|
 | A | `test_print_policy.py` | the rules — windows, state mapping, formatting |
 | B | `test_adapters.py` | the adapters against `FakeGraph` |
-| C | `test_submit/poll/auth.py` | the routes, end to end. **Poll carries the retry schedule, the cancel-first guard and the give-up path** |
+| C | `test_submit/poll/auth.py` | the routes, end to end. **Poll carries the retry schedule, the cancel-first guard, the give-up path and the `printerShareId` override (F3-R)** |
+| A+C | `test_printing.py` | the PWG encoder (byte-pinned), profile selection, and Submit against a raster-only printer |
+| A+C | `test_print_format.py` | `printFormat` — the `matches`/`produces` split, the two refusals, and that the requested format reaches the wire |
 | C | `test_requirements.py` | **conformance, one test per requirement clause** |
 | C | `test_review_findings.py` | the six defects the first review found; each failed first |
 | C | `test_second_review.py` | the five the second review found (S1–S5); each failed first |

@@ -98,3 +98,22 @@ def frozen_now(monkeypatch):
     """Pin print_policy.now_utc so window arithmetic is deterministic."""
     monkeypatch.setattr(print_policy, "now_utc", lambda: NOW)
     return NOW
+
+
+@pytest.fixture(scope="session")
+def letter_pdf() -> bytes:
+    """A real one-page US Letter PDF, built by scripts/make_test_pdf.py.
+
+    For any test that needs the raster converter to actually succeed. It is NOT
+    the pinned fixture: test_printing.py keeps its own, with the exact lines its
+    output hash was measured from, because that hash and the text that produced
+    it must not drift apart. Use this one when you need a valid PDF and do not
+    care what it says.
+    """
+    import importlib.util
+
+    script = _REPO / "scripts" / "make_test_pdf.py"
+    spec = importlib.util.spec_from_file_location("_letter_pdf_builder", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.build_pdf(["noble-print shared test document"])

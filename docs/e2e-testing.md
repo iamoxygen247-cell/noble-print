@@ -62,7 +62,7 @@ Paper in the tray, printer awake.
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-Expect **389 passed** in about half a second. Red here means stop — do not spend
+Expect **435 passed** in about half a second. Red here means stop — do not spend
 paper diagnosing something the suite already knows about.
 
 ## A2. Is the printer reachable and still the printer we think?
@@ -304,6 +304,117 @@ $PY scripts\test.py status --library $LIB --folder $FLD `
 
 The `settings` line must show what you sent, not the defaults. That line is how
 you confirm a Power Automate flow is actually sending what you think it is.
+
+## B5a. Choose the upload format explicitly (`printFormat`)
+
+Without this flag Submit picks a profile from what the **printer** reports. With
+it, **you** choose, and the printer's preference does not get a vote.
+
+> **Read this before running anything.** `$SHARE` above is the Brother
+> MFC-L5800DW, and it reports **`image/pwg-raster` and nothing else** — verified
+> against the live API on 2026-08-31 (README "Its capabilities and defaults").
+> On *this* printer `--print-format image/pwg-raster` and omitting the flag
+> select the **same** profile, because the capabilities already forced the raster
+> path. So the flag cannot change the outcome here — what you are testing is that
+> it is **honoured and echoed**, and that the wrong format is **refused**. On a
+> printer that also accepted PDF the flag would genuinely change the pipeline.
+
+```powershell
+# 1. What WOULD be uploaded. Prints nothing.
+$PY scripts\test.py dryrun --library $LIB --folder $FLD `
+    --printer-share-id $SHARE --print-format image/pwg-raster
+```
+
+Expect exactly this, on the real printer:
+
+```
+requested fmt: image/pwg-raster
+conversion   : pdf-to-pwg-raster  (application/pdf -> image/pwg-raster)
+  converts   : True
+```
+
+`requested fmt` is **echoed by the endpoint**, so it is the proof the flag arrived
+rather than that you typed it correctly. Run it once more with the flag omitted:
+everything stays the same except
+
+```
+requested fmt: (none -- the printer's capabilities choose)
+```
+
+**If `requested fmt` still says `(none ...)` when you passed the flag, it is not
+reaching the endpoint** — fix that before believing anything else here.
+
+```powershell
+# 2. Refusals. Both must 400 and claim nothing.
+
+# 2a. a format this app cannot produce at all
+$PY scripts\test.py dryrun --library $LIB --folder $FLD `
+    --printer-share-id $SHARE --print-format image/png
+#   -> 400  printFormat 'image/png' is not supported
+#           (expected one of: application/pdf, image/pwg-raster)
+
+# 2b. a supported format THIS PRINTER does not report. On the Brother that is
+#     application/pdf -- it takes raster only, so asking for PDF is refused.
+$PY scripts\test.py dryrun --library $LIB --folder $FLD `
+    --printer-share-id $SHARE --print-format application/pdf
+#   -> 400  printer <share display name> does not accept application/pdf
+#           (supports: image/pwg-raster)
+```
+
+The message names the **share's** display name, which is whatever the `printer :`
+line of a plain dry run (B2) shows — not necessarily the printer's own name.
+
+2b is the one worth pausing on: it is a **400 at preflight**, so no row was
+claimed and the queue is untouched. That is the difference between a
+misconfigured flow and a damaged queue.
+
+```powershell
+# 3. For real, one file, naming the format explicitly.
+$PY scripts\test.py submit --library $LIB --folder $FLD `
+    --printer-share-id $SHARE --batch-size 1 --print-format image/pwg-raster
+```
+
+**A page comes out.** On this printer that is the same page the run without the
+flag produces — the point is that naming the format did not break it.
+
+> **The host window will not show the content type.** Nothing in the app logs it:
+> `PRINT_EVENT` and `RUN_SUMMARY` carry no such field, and neither
+> `universal_print` nor `printing/` logs the upload. The two places the format is
+> actually visible are the **dry run's `conversion` block** (step 1) and the
+> **`printFormat` echoed on the submit response** — add `--json` to see it. Do not
+> go looking in the log for a line that was never written.
+
+If the sheet comes out cropped or scaled, the job configuration and the raster
+have been separated — see `printing/profiles.py`, whose module docstring explains
+why `scaling: fit` is load-bearing.
+
+## B5b. Point Poll at one printer (`printerShareId`)
+
+Optional on `status`, and a **hard override** when sent: every job lookup and
+every cancel addresses that share instead of each row's own `Printer_Name`.
+
+```powershell
+$PY scripts\test.py status --library $LIB --folder $FLD --printer-share-id $SHARE
+```
+
+Expect two lines:
+
+```
+printer override: 4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5
+printerOverridden: 0
+```
+
+Without the flag, the `printer override:` line is absent entirely.
+
+That zero is the one number to read. It counts rows whose `Printer_Name` disagrees
+with what you passed. With one printer registered it is always 0. If it is not:
+
+> **WARNING: N row(s) name a DIFFERENT printer from the --printer-share-id
+> override.**
+
+That is defect **F3-R** (`docs/ai/open-defects.md`), and it means those jobs cannot
+be cancelled from the overriding printer and **may print twice**. Either drop the
+flag or pass the share those rows actually name.
 
 ## B6. Other flags
 

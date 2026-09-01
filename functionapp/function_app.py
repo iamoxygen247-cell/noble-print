@@ -2,8 +2,15 @@
 function_app.py — the two HTTP endpoints Power Automate calls.
 
     Submit  POST /api/print/submit   claim PRINT_READY files, create print jobs
+              {library, folder, printerShareId, batchSize?, printFormat?, dryRun?}
     Poll    POST /api/print/status   check PRINT_PENDING jobs; mark the finished,
                                      requeue the stalled, fail the hopeless
+              {library, folder, giveUpDays?, stallMinutes?, maxRetries?,
+               printerShareId?}
+
+Everything marked `?` is optional and, where it is a threshold, resolves
+request > app setting > default -- so the retry pacing, the batch size and the
+upload format are all retuned by editing a Power Automate flow, with no deploy.
 
 This module is a THIN ORCHESTRATOR. It sequences calls and shapes responses. It
 contains no rules: every threshold, status string, window and message format
@@ -142,6 +149,43 @@ def _required_folder(body: dict) -> str:
     return print_policy.normalize_folder(body.get("folder"))
 
 
+def _print_format(body: dict) -> str:
+    """The upload format the caller is asking for, normalised, or "".
+
+    "" means "decide from the printer's capabilities" -- the behaviour this
+    pipeline had before the parameter existed, and still the default, so a flow
+    that does not send `printFormat` is unaffected.
+
+    An unknown format is a 400 rather than a fallback. The whole reason to name a
+    format is to stop the app guessing, so silently guessing after a typo would
+    defeat the parameter in exactly the case it was added for.
+    """
+    raw = body.get("printFormat")
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise BadRequest("printFormat must be a string")
+    if not raw.strip():
+        return ""
+
+    wanted = printing.normalize_format(raw)
+    if wanted not in printing.SUPPORTED_PRINT_FORMATS:
+        raise BadRequest(
+            "printFormat {!r} is not supported (expected one of: {})".format(
+                raw, ", ".join(printing.SUPPORTED_PRINT_FORMATS)))
+    return wanted
+
+
+def _optional_share_id(body: dict, key: str) -> str:
+    """An optional printer share id. Absent or "" means "not supplied"."""
+    value = body.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise BadRequest(f"{key} must be a string")
+    return value.strip()
+
+
 def _tunable(resolver, value):
     """Resolve a tunable, turning an out-of-range REQUEST value into a 400.
 
@@ -189,8 +233,13 @@ def _share_for(client: GraphClient, cache: Dict[str, Any], share_id: str):
 
 
 def _cancel_outstanding(client: GraphClient, cache: Dict[str, Any],
-                        item: PrintFile, endpoint: str = EP_POLL) -> bool:
+                        item: PrintFile, endpoint: str = EP_POLL,
+                        printer: str = "") -> bool:
     """Kill the job behind a row before its status is rewritten. Best-effort.
+
+    `printer` is the share to cancel against, defaulting to the row's own
+    Printer_Name. Poll passes its request-level printerShareId here when one was
+    supplied -- see the override warning in the route, and defect F3.
 
     Both callers rewrite the row immediately afterwards -- one to PRINT_READY, one
     to PRINT_FAILED -- and in both cases leaving the job alive is a correctness
@@ -208,9 +257,10 @@ def _cancel_outstanding(client: GraphClient, cache: Dict[str, Any],
     than a possible duplicate -- but `cancel_job` logs it, and that log line is
     the only warning a duplicate may appear.
     """
-    if not item.job_id or not item.printer:
+    share_id = printer or item.printer
+    if not item.job_id or not share_id:
         return False
-    origin = _share_for(client, cache, item.printer)
+    origin = _share_for(client, cache, share_id)
     printer_id = origin.printer_id if origin else ""
     cancelled = universal_print.cancel_job(client, printer_id, item.job_id)
     if cancelled:
@@ -218,8 +268,11 @@ def _cancel_outstanding(client: GraphClient, cache: Dict[str, Any],
         # ONLY record that a particular job was killed -- Print_JobId is cleared
         # on the requeue that follows. `cancelled` is part of the closed result
         # vocabulary the weekly report counts (design.md §13).
+        # The share the cancel was actually SENT to, which is not always the one
+        # on the row -- an override makes them differ, and when a duplicate turns
+        # up this line is what says which printer was addressed.
         _print_event(endpoint, item.item_id, from_status=item.status,
-                     job=item.job_id, printer=item.printer,
+                     job=item.job_id, printer=share_id,
                      result="cancelled", file_name=item.file_name)
     return cancelled
 
@@ -246,22 +299,32 @@ class Budget:
         return (time.monotonic() - self._started) >= self._limit
 
 
-def _dry_run_conversion(share: universal_print.ShareInfo) -> Dict[str, Any]:
+def _dry_run_conversion(share: universal_print.ShareInfo,
+                        print_format: str = "") -> Dict[str, Any]:
     """What would happen to a PDF on this printer, without submitting one.
 
     Reported by dryRun so a printer that needs rasterizing announces itself
-    before anyone queues a file, rather than after every file has failed.
+    before anyone queues a file, rather than after every file has failed. When
+    the caller named a `printFormat` this reports the profile THAT would run, not
+    the one the capabilities imply -- otherwise the dry run would describe a
+    different pipeline from the real one, which is the one thing it exists to
+    rule out.
     """
     source = universal_print.DEFAULT_CONTENT_TYPE
-    profile = printing.select_profile(share, source)
+    profile = printing.profile_for(share, source, print_format)
     if profile is None:
-        return {"supported": False, "profile": None, "sourceContentType": source}
+        return {"supported": False, "profile": None, "sourceContentType": source,
+                "requestedFormat": print_format or None}
 
     report: Dict[str, Any] = {
         "supported": True,
         "profile": profile.name,
         "sourceContentType": source,
         "uploadContentType": profile.target_content_type(source),
+        # None means "the printer's capabilities chose"; a string means the
+        # caller did.
+        "requestedFormat": print_format or None,
+        "conversionRequired": profile.name != "passthrough",
     }
     try:
         report["jobConfiguration"] = profile.job_configuration(share)
@@ -280,8 +343,14 @@ RESULT_SKIPPED = "skipped"
 
 
 def _submit_one(client: GraphClient, context: ListContext, share: universal_print.ShareInfo,
-                item: PrintFile, endpoint: str) -> Dict[str, Any]:
+                item: PrintFile, endpoint: str,
+                print_format: str = "") -> Dict[str, Any]:
     """Claim one file and put it on the printer.
+
+    `print_format` is the caller's requested upload format, or "" to let the
+    printer's capabilities decide. It reaches this function already validated
+    against the share, so the only way it can fail here is per-DOCUMENT -- a file
+    the chosen format cannot be produced from.
 
     Submit is now the only caller. It used to be shared verbatim with Resubmit,
     which is why a retry is indistinguishable from a first attempt here: Poll
@@ -338,10 +407,22 @@ def _submit_one(client: GraphClient, context: ListContext, share: universal_prin
             file_name, drive_item.get("content_type", ""))
 
         # A profile either sends the document as-is or converts it to something
-        # this printer accepts. None means neither is possible -- which is the
-        # same refusal the pipeline has always reported.
-        profile = printing.select_profile(share, content_type)
+        # this printer accepts. None means neither is possible -- and the two
+        # ways of getting there need different messages, because they send
+        # whoever reads Print_Message to different places:
+        #
+        #   no printFormat   the PRINTER cannot take this document at all
+        #   printFormat      the printer is fine; THIS FILE cannot be turned into
+        #                    the requested format (a .docx when pwg-raster was
+        #                    asked for, say). The request was already checked
+        #                    against the share at preflight, so the file is what
+        #                    is wrong here, not the flow's configuration.
+        profile = printing.profile_for(share, content_type, print_format)
         if profile is None:
+            if print_format:
+                raise universal_print.PrintStageError(
+                    "content_type",
+                    f"cannot produce {print_format} from a {content_type} document")
             raise universal_print.PrintStageError(
                 "content_type",
                 f"printer {share.display_name or share.share_id} does not accept "
@@ -438,6 +519,9 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
         folder = _required_folder(body)
         printer_share_id = _required_str(body, "printerShareId")
         batch_size = _tunable(print_policy.resolve_batch_size, body.get("batchSize"))
+        # "" means "let the printer's capabilities decide", which is what every
+        # caller did before this parameter existed.
+        print_format = _print_format(body)
 
         client = _client()
         context = _resolve_list(client, library)
@@ -446,6 +530,22 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
         # unsupported document type must be discovered while the queue is
         # untouched, not after five files have been marked PRINT_PENDING.
         share = universal_print.get_share(client, printer_share_id)
+
+        # A requested format the device does not report is a CALLER error, and
+        # this is the last moment it can be reported as one for free -- the share
+        # is already in hand and not a single row has been claimed. Checked ahead
+        # of the accepting-jobs branch because a misconfigured flow will not fix
+        # itself when the printer comes back, and answering "printer offline"
+        # would hide it until it did.
+        #
+        # `supports` gives a printer that reports NO content types the benefit of
+        # the doubt, so an under-reporting device is not blocked by this.
+        if print_format and not share.supports(print_format):
+            raise BadRequest(
+                "printer {} does not accept {} (supports: {})".format(
+                    share.display_name or printer_share_id, print_format,
+                    ", ".join(share.content_types) or "unknown"))
+
         if not share.accepting_jobs:
             _run_summary(EP_SUBMIT, library=library, folder=folder,
                          printer=printer_share_id, found=0, ok=0, failed=0,
@@ -457,6 +557,7 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
                 # never satisfy it -- so an offline printer spun the loop to its
                 # iteration cap on every recurrence. Nothing is submittable this
                 # cycle, which is what 0 means to the flow: stop looping.
+                "printFormat": print_format or None,
                 "candidatesFound": 0, "remainingReady": 0, "submitted": 0,
                 "failed": 0, "skipped": 0, "budgetExhausted": False,
                 # ...and the flow needs SOMETHING to notify on. This run is a 200
@@ -494,9 +595,12 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
                     "contentTypes": share.content_types,
                     "dpis": share.dpis,
                 },
+                "printFormat": print_format or None,
                 # Which profile would run, and what it would upload. This is how
-                # you find out a printer needs conversion WITHOUT printing.
-                "conversion": _dry_run_conversion(share),
+                # you find out a printer needs conversion WITHOUT printing -- and,
+                # with printFormat set, how you confirm the format you asked for
+                # is the one that would actually be sent.
+                "conversion": _dry_run_conversion(share, print_format),
                 "candidatesFound": len(candidates),
                 "wouldSubmit": [{"itemId": f.item_id, "fileName": f.file_name,
                                  "created": f.created} for f in selected],
@@ -509,7 +613,8 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
                 logging.info("stopping after %s of %s files: wall-clock budget spent",
                              len(items), len(selected))
                 break
-            items.append(_submit_one(client, context, share, item, EP_SUBMIT))
+            items.append(_submit_one(client, context, share, item, EP_SUBMIT,
+                                     print_format))
 
         submitted = sum(1 for i in items if i["result"] == RESULT_SUBMITTED)
         failed = sum(1 for i in items if i["result"] == RESULT_FAILED)
@@ -525,6 +630,10 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
                      started=started)
         return _json_response(200, {
             "library": library, "folder": folder, "printerShareId": printer_share_id,
+            # Echoed so the App Insights trace records which format actually ran,
+            # not whichever one the flow was believed to be sending. null means
+            # the printer's capabilities chose.
+            "printFormat": print_format or None,
             "batchSize": batch_size, "candidatesFound": len(candidates),
             "remainingReady": remaining, "submitted": submitted, "failed": failed,
             "skipped": skipped, "budgetExhausted": budget.exhausted,
@@ -561,6 +670,19 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                                  body.get("stallMinutes"))
         max_retries = _tunable(print_policy.resolve_max_retries,
                                body.get("maxRetries"))
+        # OPTIONAL, and a HARD OVERRIDE when supplied: every job lookup and every
+        # cancel in this run addresses this share instead of the one named on the
+        # row. Omit it and Poll behaves exactly as before, following each row's
+        # own Printer_Name.
+        #
+        # THIS IS DEFECT F3's PRECONDITION, DELIBERATELY REINTRODUCED. Job ids are
+        # per-printer, so if this share is not the one a row's job actually lives
+        # on, the lookup 404s, the cancel 404s, a 404 reads as "already gone", and
+        # the original job stays alive to print beside its replacement. That is
+        # harmless while every flow names one printer -- the override then equals
+        # Printer_Name and changes nothing -- and it is why the divergence is
+        # counted and logged below rather than left silent.
+        printer_override = _optional_share_id(body, "printerShareId")
 
         client = _client()
         context = _resolve_list(client, library)
@@ -587,6 +709,7 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
         items: List[Dict[str, Any]] = []
         completed = failed = still_running = not_found = malformed = 0
         requeued = gave_up = 0
+        overridden = 0
         visited = 0
         shares: Dict[str, Any] = {}
 
@@ -597,6 +720,39 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                 break
             visited += 1
 
+            # Which share this row's job is addressed on. The override wins
+            # outright when it was supplied; otherwise the row's own column.
+            printer = printer_override or item.printer
+
+            # A row naming a DIFFERENT printer from the override is counted and
+            # logged rather than absorbed. It cannot happen at all while the
+            # flows name a single share.
+            #
+            # The COUNT is of configuration divergence -- every disagreeing row,
+            # job or no job -- because that is the stable signal that the flow
+            # and the library disagree, and it does not flicker as jobs come and
+            # go. The WARNING is graded: only a row with an outstanding job can
+            # actually print twice, so only that row gets told about F3. Saying
+            # "may print alongside its replacement" about a row with no job at
+            # all would be false, and a warning that cries wolf is one nobody
+            # reads by the time it matters.
+            if printer_override and item.printer and item.printer != printer_override:
+                overridden += 1
+                if item.job_id:
+                    logging.warning(
+                        "printerShareId override: item %s names printer %s but this "
+                        "run addresses %s. Job ids are per-printer, so job %s may not "
+                        "exist on the override, in which case it cannot be cancelled "
+                        "and may print alongside its replacement (defect F3).",
+                        item.item_id, item.printer, printer_override, item.job_id)
+                else:
+                    logging.warning(
+                        "printerShareId override: item %s names printer %s but this "
+                        "run addresses %s. No outstanding job on this row, so nothing "
+                        "can print twice -- but the flow and the library disagree "
+                        "about the printer, which is worth fixing.",
+                        item.item_id, item.printer, printer_override)
+
             # A PRINT_PENDING row with no job id is a crashed submission, not an
             # error: Submit claimed it and died before creating the job (rule 1,
             # the deliberate cost of claiming first). Poll now OWNS this case --
@@ -606,21 +762,21 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
             job = None
             state = ""
             if item.job_id:
-                if not item.printer:
+                if not printer:
                     malformed += 1
                     items.append({"itemId": item.item_id, "fileName": item.file_name,
                                   "result": "malformed",
                                   "message": "Print_JobId is set but Printer_Name is empty"})
                     continue
 
-                job = universal_print.get_job(client, item.printer, item.job_id)
+                job = universal_print.get_job(client, printer, item.job_id)
                 if job is None:
                     # Universal Print no longer has it. Counted for visibility,
                     # then treated like any other dead attempt: unrecoverable, so
                     # the schedule decides whether to try again.
                     not_found += 1
                     _print_event(EP_POLL, item.item_id, from_status=item.status,
-                                 job=item.job_id, printer=item.printer,
+                                 job=item.job_id, printer=printer,
                                  result="not_found", file_name=item.file_name)
                 else:
                     state = universal_print.job_state(job)
@@ -666,7 +822,7 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                               "message": message})
                 _print_event(EP_POLL, item.item_id, from_status=item.status,
                              to_status=print_policy.COMPLETED, job=item.job_id,
-                             printer=item.printer, result="completed",
+                             printer=printer, result="completed",
                              file_name=item.file_name)
 
             elif action == print_policy.POLL_FAIL:
@@ -682,7 +838,7 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                               "message": message})
                 _print_event(EP_POLL, item.item_id, from_status=item.status,
                              to_status=print_policy.FAILED, job=item.job_id,
-                             printer=item.printer, result="failed_terminal",
+                             printer=printer, result="failed_terminal",
                              file_name=item.file_name)
 
             elif action == print_policy.POLL_REQUEUE:
@@ -697,7 +853,7 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                 #
                 # Cancel is documented only on the PRINTER route, so it needs the
                 # printer id behind the share -- not the share id in Printer_Name.
-                _cancel_outstanding(client, shares, item)
+                _cancel_outstanding(client, shares, item, printer=printer)
 
                 message = print_policy.append_message(
                     item.message,
@@ -722,7 +878,7 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                               "message": message})
                 _print_event(EP_POLL, item.item_id, from_status=item.status,
                              to_status=print_policy.READY, job=item.job_id,
-                             printer=item.printer, result="requeued",
+                             printer=printer, result="requeued",
                              file_name=item.file_name)
 
             elif action == print_policy.POLL_GIVE_UP:
@@ -730,7 +886,7 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                 # abandoned job could print days later against a row that reads
                 # PRINT_FAILED -- the column would be lying about paper that came
                 # out of the tray.
-                _cancel_outstanding(client, shares, item)
+                _cancel_outstanding(client, shares, item, printer=printer)
 
                 message = print_policy.append_message(
                     item.message,
@@ -745,7 +901,7 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                               "message": message})
                 _print_event(EP_POLL, item.item_id, from_status=item.status,
                              to_status=print_policy.FAILED, job=item.job_id,
-                             printer=item.printer, result="gave_up",
+                             printer=printer, result="gave_up",
                              file_name=item.file_name)
 
             else:
@@ -760,7 +916,8 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                               "result": "still_running", "jobId": item.job_id,
                               "message": state or "no job"})
 
-        _run_summary(EP_POLL, library=library, folder=folder, found=len(ordered),
+        _run_summary(EP_POLL, library=library, folder=folder,
+                     printer=printer_override or "-", found=len(ordered),
                      ok=completed, failed=failed + gave_up, skipped=still_running,
                      remaining=-1, http_status=200, started=started)
         return _json_response(200, {
@@ -769,10 +926,17 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
             # the App Insights trace, not just in whatever the flow meant to send.
             "giveUpDays": give_up_days, "stallMinutes": stall_minutes,
             "maxRetries": max_retries,
+            # null means no override was sent and each row followed its own
+            # Printer_Name.
+            "printerShareId": printer_override or None,
             "checked": len(items), "completed": completed, "failed": failed,
             "requeued": requeued, "gaveUp": gave_up,
             "stillRunning": still_running, "notFound": not_found,
             "malformed": malformed, "budgetExhausted": budget.exhausted,
+            # Rows whose Printer_Name disagreed with the override. NOT an error
+            # count -- it is the double-print exposure this run carried, and it
+            # should be 0 in a single-printer deployment. See defect F3.
+            "printerOverridden": overridden,
             # These account for every pending row, exactly once (defect S5 -- a
             # crashed submission used to appear in no counter at all):
             #   checked + uncheckedCount == pendingFound

@@ -25,7 +25,17 @@ real endpoint exercises the real auth, resolution and queries.
 The retry knobs -- --stall-minutes, --give-up-days, --max-retries -- go into the
 request body exactly as Power Automate sends them, which is how the pacing is
 retuned without a deploy. Use them here to prove a change before putting it in a
-flow.
+flow. The same is true of --batch-size, --print-format and, on `status`,
+--printer-share-id.
+
+    # upload a raster instead of the PDF, without touching the printer's config
+    ... submit --printer-share-id <guid> --print-format image/pwg-raster
+
+    # poll every row against ONE printer, whatever its Printer_Name says
+    ... status --printer-share-id <guid>
+
+--print-format and --printer-share-id are both OPT-IN: omit them and you get
+exactly the behaviour that existed before they did.
 """
 
 from __future__ import annotations
@@ -104,9 +114,22 @@ def summarise(command: str, status: int, payload: dict) -> None:
         # failed at preflight.
         conversion = payload.get("conversion") or {}
         if conversion:
+            # Echoed by the endpoint. Printed on its own line because it is the
+            # ONLY way to see that --print-format actually reached the endpoint:
+            # ask for application/pdf on a printer that takes PDF and every other
+            # line looks exactly like a run with no flag at all.
+            requested = conversion.get("requestedFormat")
+            print("requested fmt: {}".format(
+                requested or "(none -- the printer's capabilities choose)"))
+
             if not conversion.get("supported"):
-                print("conversion   : NONE -- this printer accepts nothing we can "
-                      "produce. Every file would fail.")
+                if requested:
+                    print("conversion   : NONE -- {} cannot be produced from a {} "
+                          "document. Every file would fail.".format(
+                              requested, conversion.get("sourceContentType")))
+                else:
+                    print("conversion   : NONE -- this printer accepts nothing we "
+                          "can produce. Every file would fail.")
             else:
                 print("conversion   : {}{}".format(
                     conversion.get("profile"),
@@ -114,6 +137,8 @@ def summarise(command: str, status: int, payload: dict) -> None:
                           conversion.get("sourceContentType")
                     else "  ({} -> {})".format(conversion.get("sourceContentType"),
                                                conversion.get("uploadContentType"))))
+                print("  converts   : {}".format(
+                    conversion.get("conversionRequired")))
                 job = conversion.get("jobConfiguration") or {}
                 if job:
                     print("  job config : {}".format(
@@ -135,13 +160,18 @@ def summarise(command: str, status: int, payload: dict) -> None:
         print("settings        : stall={}min giveUp={}d maxRetries={}".format(
             payload.get("stallMinutes"), payload.get("giveUpDays"),
             payload.get("maxRetries")))
+        if payload.get("printerShareId"):
+            print("printer override: {}".format(payload["printerShareId"]))
 
     for key in ("candidatesFound", "remainingReady", "submitted", "failed",
                 "skipped", "checked", "completed", "requeued", "gaveUp",
                 "stillRunning", "notFound", "malformed", "pendingFound",
-                "uncheckedCount", "printerAvailable", "budgetExhausted"):
+                "uncheckedCount", "printerOverridden", "printerAvailable",
+                "budgetExhausted"):
         if key in payload:
-            print("{:<16}: {}".format(key, payload[key]))
+            # 17, not 16: "printerOverridden" is exactly that long and would
+            # otherwise be the one line whose colon does not line up.
+            print("{:<17}: {}".format(key, payload[key]))
 
     for item in payload.get("items") or []:
         print("  {:<8} {:<10} {}".format(
@@ -158,6 +188,14 @@ def summarise(command: str, status: int, payload: dict) -> None:
         print("\nWARNING: the printer is not accepting jobs, so nothing was "
               "submitted. This is a 200 with failed=0 -- Flow A only notices it "
               "because it tests printerAvailable.")
+    if payload.get("printerOverridden"):
+        # Not an error -- but it is the exposure the override carried, and the
+        # only place anyone would notice it before a duplicate lands in the tray.
+        print("\nWARNING: {} row(s) name a DIFFERENT printer from the "
+              "--printer-share-id override. Job ids are per-printer, so those "
+              "jobs cannot be cancelled from the overriding printer and may "
+              "print alongside their replacements (defect F3-R). Expect 0 with "
+              "one printer registered.".format(payload["printerOverridden"]))
     if payload.get("budgetExhausted"):
         print("\nNOTE: the wall-clock budget was spent before the batch finished. "
               "Anything left is reported above and picked up on the next run.")
@@ -187,6 +225,12 @@ def main() -> int:
                         help="status: a job idle this long counts as stalled")
     parser.add_argument("--max-retries", type=int,
                         help="status: most requeues one file may receive")
+    parser.add_argument("--print-format",
+                        help="submit/dryrun: the format to UPLOAD, e.g. "
+                             "application/pdf (no conversion -- the invoice "
+                             "already is one) or image/pwg-raster (runs the "
+                             "converter). Omit to let the printer's capabilities "
+                             "choose, which is what happens without this flag.")
     parser.add_argument("--json", action="store_true", help="print the raw response")
     args = parser.parse_args()
 
@@ -204,7 +248,10 @@ def main() -> int:
         return 0
 
     body = {"library": args.library, "folder": args.folder}
-    if args.command in ("submit", "dryrun") and args.printer_share_id:
+    # Sent for status as well, where it is an OPTIONAL HARD OVERRIDE: every
+    # lookup and cancel in the run addresses this share instead of each row's
+    # own Printer_Name. Omit it and every row follows its own column.
+    if args.printer_share_id:
         body["printerShareId"] = args.printer_share_id
     if args.command == "dryrun":
         body["dryRun"] = True
@@ -216,6 +263,8 @@ def main() -> int:
         body["stallMinutes"] = args.stall_minutes
     if args.max_retries is not None:
         body["maxRetries"] = args.max_retries
+    if args.print_format:
+        body["printFormat"] = args.print_format
 
     if args.command in ("submit", "dryrun") and not args.printer_share_id:
         parser.error("--printer-share-id is required for {}".format(args.command))

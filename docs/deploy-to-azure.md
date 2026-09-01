@@ -556,7 +556,7 @@ az functionapp config appsettings list --resource-group $RG --name $APP `
 ## 7. Deploy the code
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest        # 357 tests must be green FIRST
+.\.venv\Scripts\python.exe -m pytest        # 435 tests must be green FIRST
 
 # func shells out to the RAW az.cmd for an ARM token and cannot refresh it over
 # the network through the inspecting proxy. Pre-warm the cache through the
@@ -739,6 +739,33 @@ or you get a race you will debug at 2 a.m.
 > in the same cycle instead of up to 15 minutes later. They are separate flows on
 > separate timers here, which is fine — this only matters if you merge them.
 
+### `printFormat` in Flow A's body
+
+Optional, and **the table above deliberately omits it.** Leave it out and Submit
+picks a profile from what the printer reports, which is what happened before the
+key existed — so an existing flow needs no edit.
+
+| Value | Effect |
+|---|---|
+| `application/pdf` | Upload the invoice untouched. **No conversion** — it already is a PDF |
+| `image/pwg-raster` | Run the PWG converter first, for a printer that takes raster only |
+| *(omitted)* | Choose from the printer's `contentTypes` |
+
+> **Do not put `"printFormat":"application/pdf"` in Flow A for the current
+> printer.** The Brother MFC-L5800DW reports **`image/pwg-raster` and nothing
+> else** (verified against the live API 2026-08-31). Asking it for PDF is a **400
+> on every recurrence** — the flow would fail continuously and print nothing.
+>
+> On this printer the only valid explicit value is `"image/pwg-raster"`, and that
+> selects the *same* profile the capabilities already select, so it buys nothing
+> but an entry in the run history. **Omitting the key is the right default here.**
+
+Set it when you want the choice to be **yours rather than the device's** — which
+only changes an outcome on a printer that reports **both** formats, where the app
+would otherwise always pick passthrough. A value the printer does not report is a
+**400 at preflight** naming what it does support, and **nothing is claimed**, so a
+wrong value cannot strand files — it just means nothing prints until you fix it.
+
 ### The three numbers in Flow B's body
 
 They are the whole reason the retry pacing lives in the flow rather than in app
@@ -758,6 +785,35 @@ the document.
 An out-of-range value is a **400** — the response names the key and its range.
 The response also echoes all three back, so what was actually in force is visible
 in the run history rather than inferred from what you meant to send.
+
+### `printerShareId` in Flow B's body — optional, and read this first
+
+Poll accepts it, and when present it is a **hard override**: every job lookup and
+every cancel in the run addresses that share instead of the `Printer_Name` on each
+row.
+
+**With one printer registered it changes nothing** — the override equals what every
+row already says. It also rescues a row whose `Printer_Name` is empty but whose
+`Print_JobId` is set (defect G3), which otherwise needs a human.
+
+> **Leave it out unless you want that rescue.** Job ids are per-printer. If the
+> override ever names a share a row's job does **not** live on, the lookup and the
+> cancel both 404, the 404 reads as "already gone", the row is requeued anyway, and
+> the original prints **beside its replacement**. This is defect **F3-R** in
+> `docs/ai/open-defects.md`, reopened deliberately.
+
+The guard is in the response: **`printerOverridden` must be 0.** Anything higher is
+the number of rows that disagreed with the override, and each one also logs a
+WARNING. The warning is graded, so read which you got: a disagreeing row **with**
+an outstanding job names **F3** and can genuinely print twice; one **without** a
+job says so and is only a configuration mismatch. Add a Flow B condition on it:
+
+```
+Condition: printerOverridden > 0  ->  notify
+```
+
+If you register a second printer, either drop the key from Flow B or split into one
+flow per printer.
 
 Flow A must loop, because the batch is 5:
 
@@ -860,14 +916,19 @@ cause and verified the fix.
 [ ]  5  bootstrap_token.py run as the SERVICE ACCOUNT; secret exists in the vault
 [ ]  6  App settings set incl. PRINT_RASTER_*; PRINT_REFRESH_TOKEN absent;
         APPLICATIONINSIGHTS_CONNECTION_STRING present (from 3.4); sampling off
-[ ]  7  pytest green (389); token pre-warmed; publish --build remote; TWO functions
+[ ]  7  pytest green (435); token pre-warmed; publish --build remote; TWO functions
         listed -- submit_print_jobs, poll_print_status (a third means an old build)
 [ ]  8  Settings read BACK; defaultHostName captured; key captured
 [ ]  9  badpayload 400 · dryrun shows conversion=pdf-to-pwg-raster · one real file ·
         READ THE COLUMNS · READ THE PAPER · PRINT_EVENT in AI
 [ ]  9  e2e-testing.md Part C: printer off -> status shows requeued=1 and the host
         logs `cancelled` THEN `requeued`; printer on -> exactly ONE sheet
+[ ]  9  e2e-testing.md B5a: dryrun --print-format image/pwg-raster echoes
+        `requested fmt: image/pwg-raster`; --print-format application/pdf is a
+        400 on THIS printer (raster only). Flow A carries NO printFormat
 [ ] 10  Flows A, B, D created -- there is NO Flow C; A loops on remainingReady
         with an iteration cap; B carries stallMinutes/maxRetries/giveUpDays
+[ ] 10  If Flow B sends printerShareId: printerOverridden == 0 on a real run,
+        and a Flow B condition notifies when it is not (F3-R)
 [ ] 11  Silence alert created
 ```

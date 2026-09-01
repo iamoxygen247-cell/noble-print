@@ -166,9 +166,15 @@ They are different GUIDs and are **not** interchangeable. Jobs live at
 `/print/shares/{shareId}/jobs`, but cancel is documented only at
 `/print/printers/{printerId}/jobs/{jobId}/cancel`. Sending the share id to the
 cancel route returns 404, which reads as "already gone" — so the original job
-survives and prints alongside its replacement. That was a real defect (F3). It is
-now structurally impossible — Poll takes no printer argument and always resolves
-the row's own `Printer_Name` — and the surviving half of the guard lives in
+survives and prints alongside its replacement. That was a real defect (F3), and
+the share-id-vs-printer-id half of it is fixed for good:
+`tests/test_poll.py::test_the_cancel_uses_the_printer_id_not_the_share_id`.
+
+The **wrong-printer** half is live again by choice. Poll accepts an optional
+`printerShareId` that hard-overrides each row's `Printer_Name`, so the two can
+disagree once more. Exposure is zero while one printer is registered, and a
+disagreement is counted as `printerOverridden` with a WARNING. Tracked as **F3-R**
+in `docs/ai/open-defects.md`; the row-follows-its-own-printer default is pinned by
 `tests/test_poll.py::test_the_cancel_uses_the_printer_named_on_the_row`.
 
 ### Its capabilities and defaults (content types verified against the live API, 2026-08-31)

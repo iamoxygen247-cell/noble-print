@@ -37,6 +37,17 @@ from . import pwg_converter
 PDF = "application/pdf"
 PWG_RASTER = "image/pwg-raster"
 
+
+def normalize_format(content_type: Any) -> str:
+    """A MIME type reduced to a comparable form: no parameters, lower case.
+
+    "application/pdf; charset=binary" and "Application/PDF" are the same format,
+    and every capability list, request body and drive-item content type in this
+    pipeline is compared through here so that stays true in one place rather
+    than in six copies of `.split(";")[0].strip().lower()`.
+    """
+    return str(content_type or "").split(";")[0].strip().lower()
+
 # --- raster tunables ----------------------------------------------------------
 DEFAULT_RASTER_DPI = 300
 MIN_RASTER_DPI = 72
@@ -99,6 +110,15 @@ class PassthroughProfile:
     def matches(self, share: Any, source_content_type: str) -> bool:
         return bool(share.supports(source_content_type))
 
+    def produces(self, print_format: str, source_content_type: str) -> bool:
+        """Passthrough uploads the bytes untouched, so the ONLY format it can
+        produce is the one the document already is. A caller asking for
+        `application/pdf` gets this profile because the invoices are PDFs -- ask
+        for it with a .docx in the folder and this correctly declines, which is
+        what turns that row into a per-file failure naming the mismatch instead
+        of a silent upload of the wrong bytes."""
+        return normalize_format(print_format) == normalize_format(source_content_type)
+
     def target_content_type(self, source_content_type: str) -> str:
         return source_content_type
 
@@ -124,10 +144,22 @@ class PwgRasterProfile:
     def matches(self, share: Any, source_content_type: str) -> bool:
         if share.supports(source_content_type):
             return False        # passthrough is cheaper; let it win
-        if (source_content_type or "").split(";")[0].strip().lower() != PDF:
+        if normalize_format(source_content_type) != PDF:
             return False
-        return PWG_RASTER in [str(t).split(";")[0].strip().lower()
+        return PWG_RASTER in [normalize_format(t)
                               for t in (share.content_types or [])]
+
+    def produces(self, print_format: str, source_content_type: str) -> bool:
+        """Selected by NAME, not by capability. `matches` deliberately stands
+        aside when the printer also accepts PDF, because rasterizing something
+        the device could take directly is wasted work -- but a caller who names
+        `image/pwg-raster` has decided, and this profile is what honours that.
+
+        The source must still be a PDF: pwg_converter renders PDF pages and
+        nothing else.
+        """
+        return (normalize_format(print_format) == PWG_RASTER
+                and normalize_format(source_content_type) == PDF)
 
     def target_content_type(self, source_content_type: str) -> str:
         return PWG_RASTER
