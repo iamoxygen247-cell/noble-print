@@ -171,7 +171,7 @@ would lock files out until its own retry.
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\test.py dryrun --base-url $BASE --key $KEY `
-    --library "Documents" --folder "/Invoices/ToPrint" `
+    --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
     --printer-share-id 4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5
 ```
 
@@ -180,7 +180,7 @@ This is the highest-value call in Part B. Expected shape:
 ```
 HTTP 200
 library      : Documents
-folder       : /Invoices/ToPrint
+folder       : /Backup/Invoice
 columns      :
     Print_Status   -> Print_x005f_Status  (encoded)
     ...
@@ -208,7 +208,7 @@ Check four things:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\test.py submit --base-url $BASE --key $KEY `
-    --library "Documents" --folder "/Invoices/ToPrint" `
+    --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
     --printer-share-id 4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5 --batch-size 1
 ```
 
@@ -229,7 +229,7 @@ step people skip, and it is the one that catches a silent write failure:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\test.py status --base-url $BASE --key $KEY `
-    --library "Documents" --folder "/Invoices/ToPrint"
+    --library "AI_DropBox_V2026" --folder "/Backup/Invoice"
 ```
 
 Then read the columns again: `Print_Status` = `PRINT_COMPLETED` and
@@ -241,12 +241,12 @@ audit trail.
 ```powershell
 # What Resubmit would rescue (PENDING/FAILED older than the min age)
 .\.venv\Scripts\python.exe scripts\test.py resubmit --base-url $BASE --key $KEY `
-    --library "Documents" --folder "/Invoices/ToPrint" `
+    --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
     --printer-share-id 4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5
 
 # Files past the status window that nothing will touch again
 .\.venv\Scripts\python.exe scripts\test.py stale --base-url $BASE --key $KEY `
-    --library "Documents" --folder "/Invoices/ToPrint"
+    --library "AI_DropBox_V2026" --folder "/Backup/Invoice"
 
 # Raw JSON instead of the summary
 ... --json
@@ -273,8 +273,8 @@ registration, and a bootstrapped refresh token:
 
 ```powershell
 .\scripts\start-local.ps1          # separate window; Ctrl+C stops it
-.\.venv\Scripts\python.exe scripts\test.py dryrun --library "Documents" `
-    --folder "/Invoices/ToPrint" --printer-share-id 4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5
+.\.venv\Scripts\python.exe scripts\test.py dryrun --library "AI_DropBox_V2026" `
+    --folder "/Backup/Invoice" --printer-share-id 4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5
 ```
 
 If local Graph calls fail with `CERTIFICATE_VERIFY_FAILED`, install `truststore`

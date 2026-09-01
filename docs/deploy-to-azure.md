@@ -232,11 +232,27 @@ list `{6B19AB5B-2823-4073-8B8F-33C3DB52F3E6}` in site
 `https://noblehomes.sharepoint.com/sites/PM` ("Noble - Properties"). Those two
 values are `SHAREPOINT_HOSTNAME` and `SHAREPOINT_SITE_PATH` in step 6.
 
-> **Still to confirm: the library's display name.** The examples in step 9 and in
-> `docs/e2e-testing.md` pass `--library "Documents" --folder "/Invoices/ToPrint"`,
-> which are placeholders, not observed values. `--library` must match the library
-> holding the four columns exactly, or the smoke test fails at list resolution with
-> a confusing error. Read it from the breadcrumb on the library's own page.
+**The queue — confirmed 2026-08-31** from the library's own URL, and used verbatim
+by every `test.py` command below and by the Power Automate flows in step 10:
+
+| | |
+|---|---|
+| `--library` | **`AI_DropBox_V2026`** |
+| `--folder` | **`/Backup/Invoice`** |
+
+`folder` is matched as a contiguous run of path segments anywhere in the item's
+path (`print_policy.folder_matches`), so `/Backup/Invoice` matches
+`/sites/PM/AI_DropBox_V2026/Backup/Invoice` and everything beneath it. The site and
+library prefix is neither needed nor wanted, and renaming either will not break the
+match.
+
+All four columns confirmed present on this library.
+
+> **`NO_PRINT` is in live use as a `Print_Status` value** and appears nowhere in
+> this codebase — something upstream writes it. That is harmless, and arguably
+> useful: no route queries that value, so those files are inert and can never be
+> picked up. Do not "add support" for it. The four statuses this app owns are
+> `PRINT_READY`, `PRINT_PENDING`, `PRINT_FAILED`, `PRINT_COMPLETED`.
 
 ### Library versioning — checked 2026-08-31, nothing to do
 
@@ -656,17 +672,17 @@ Same harness as local, just pointed at the deployed app.
 #    printer's real capabilities, and WHICH CONVERSION PROFILE would run.
 #    Prints nothing on paper.
 .\.venv\Scripts\python.exe scripts\test.py dryrun --base-url $BASE --key $KEY `
-    --library "Documents" --folder "/Invoices/ToPrint" `
+    --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
     --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
 
 # 3. Exactly one real file.
 .\.venv\Scripts\python.exe scripts\test.py submit --base-url $BASE --key $KEY `
-    --library "Documents" --folder "/Invoices/ToPrint" `
+    --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
     --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5" --batch-size 1
 
 # 4. Once the page is out, mark it complete.
 .\.venv\Scripts\python.exe scripts\test.py status --base-url $BASE --key $KEY `
-    --library "Documents" --folder "/Invoices/ToPrint"
+    --library "AI_DropBox_V2026" --folder "/Backup/Invoice"
 ```
 
 In step 2's output, `conversion` must read **`pdf-to-pwg-raster`** for this
@@ -703,9 +719,9 @@ or you get a race you will debug at 2 a.m.
 
 | Flow | Recurrence | Body |
 |---|---|---|
-| **A — Submit** | 15 min | `{"library":"Documents","folder":"/Invoices/ToPrint","printerShareId":"4429bf4e-…","batchSize":5}` |
-| **B — Poll** | 10 min | `{"library":"Documents","folder":"/Invoices/ToPrint"}` |
-| **C — Resubmit** | daily 02:00 | `{"library":"Documents","folder":"/Invoices/ToPrint","printerShareId":"4429bf4e-…"}` |
+| **A — Submit** | 15 min | `{"library":"AI_DropBox_V2026","folder":"/Backup/Invoice","printerShareId":"4429bf4e-…","batchSize":5}` |
+| **B — Poll** | 10 min | `{"library":"AI_DropBox_V2026","folder":"/Backup/Invoice"}` |
+| **C — Resubmit** | daily 02:00 | `{"library":"AI_DropBox_V2026","folder":"/Backup/Invoice","printerShareId":"4429bf4e-…"}` |
 | **D — Digest** | Mon 07:00 | SharePoint *Get items* per status; email the counts |
 
 Flow A must loop, because the batch is 5:

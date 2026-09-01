@@ -240,18 +240,18 @@ cd "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"
 #    tells you the REAL internal column names, which is the one thing I could
 #    not determine without your tenant.
 .\.venv\Scripts\python.exe scripts\test.py dryrun `
-    --library "Documents" --folder "/Invoices/ToPrint" `
+    --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
     --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
 
 # 5. One real file.
 .\.venv\Scripts\python.exe scripts\test.py submit `
-    --library "Documents" --folder "/Invoices/ToPrint" `
+    --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
     --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5" `
     --batch-size 1
 
 # 6. Mark it complete once the page is out.
 .\.venv\Scripts\python.exe scripts\test.py status `
-    --library "Documents" --folder "/Invoices/ToPrint"
+    --library "AI_DropBox_V2026" --folder "/Backup/Invoice"
 ```
 
 ### What "passing" looks like
