@@ -6,14 +6,23 @@ registration.
       Printer Id  ffa65a34-615c-493b-9eff-d227133293ac   stable
       Share Id    a11f0263-68b7-45f4-b042-f1b4b30b60a3   re-shared 2026-08-31
 
-The share id is the volatile half. Deleting and re-creating the share in the
-portal mints a NEW one -- it happened on 2026-08-31, and every place the old id
-was written down (this file, the fixture, README, docs, the live-check script's
-default, the Flow bodies in Power Automate) started 404ing with "does not match
-any registered printers". The printer id survives that; it changes only if the
-device is unregistered. Re-read both from Universal Print > Printers > the
-printer > Overview, or from scripts/live-printer-check.ps1, and update the
-fixture -- not the assertions below, which exist to make the swap loud.
+RETIRED DEVICE, DELIBERATELY KEPT. On 2026-08-31 this printer was replaced by the
+Brother MFC-L5800DW series [3c2af401eecf] (share 4429bf4e-..., printer
+cf8d9fa1-...), because the DCP-L2540DW is not Universal Print ready.
+
+This file is NOT stale. It is kept as the **PDF-passthrough** arm of the content
+type mapping: a printer that reports application/pdf must be sent the document
+untouched. The MFC reports image/pwg-raster only and takes the converting arm, so
+between the two fixtures both branches stay covered by a real registration rather
+than an invented one. Do not "update" these ids to the current printer -- that
+would delete the passthrough case.
+
+Both ids here also record how fast this pair moves. The share id is the volatile
+half: deleting and re-creating the share mints a new one, which happened earlier
+the same day (5de37377 -> a11f0263) and 404'd every place it was written down.
+The printer id survives a re-share -- but not a device swap, which is what
+happened hours later. The durable identifier is neither GUID; it is the display
+name, which is why every recorded id needs the printer named beside it.
 
 Everywhere else the suite uses invented ids ("share-guid", "printer-guid"). Those
 are fine for logic, but they are lookalikes: swap one for the other and a failure

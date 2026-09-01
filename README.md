@@ -48,12 +48,12 @@ cd "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"
 #    the printer's real capabilities. Claims nothing, prints nothing.
 .\.venv\Scripts\python.exe scripts\test.py dryrun `
     --library "Documents" --folder "/Invoices/ToPrint" `
-    --printer-share-id "a11f0263-68b7-45f4-b042-f1b4b30b60a3"
+    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
 
 # 6. One real file, then mark it complete once the page is out.
 .\.venv\Scripts\python.exe scripts\test.py submit `
     --library "Documents" --folder "/Invoices/ToPrint" `
-    --printer-share-id "a11f0263-68b7-45f4-b042-f1b4b30b60a3" --batch-size 1
+    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5" --batch-size 1
 .\.venv\Scripts\python.exe scripts\test.py status `
     --library "Documents" --folder "/Invoices/ToPrint"
 ```
@@ -130,16 +130,29 @@ Copy-Item functionapp\local.settings.json.template functionapp\local.settings.js
 .\scripts\start-local.ps1
 .\.venv\Scripts\python.exe scripts\test.py dryrun --library "Documents" `
     --folder "/Invoices/ToPrint" `
-    --printer-share-id "a11f0263-68b7-45f4-b042-f1b4b30b60a3"
+    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
 ```
 
 ## This tenant's printer
 
 | | |
 |---|---|
-| Printer | Brother DCP-L2540DW series |
-| **Share Id** | `a11f0263-68b7-45f4-b042-f1b4b30b60a3` — pass this as `printerShareId`; it addresses jobs |
-| **Printer Id** | `ffa65a34-615c-493b-9eff-d227133293ac` — used only to cancel a job; the app resolves it itself |
+| Printer | **Brother MFC-L5800DW series [3c2af401eecf]** (registered 2026-08-31) |
+| **Share Id** | `4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5` — pass this as `printerShareId`; it addresses jobs |
+| **Printer Id** | `cf8d9fa1-0502-4b0d-b28e-22a52cdde8a1` — used only to cancel a job; the app resolves it itself |
+
+> ## ⚠️ This printer cannot print PDFs yet
+>
+> It reports **`image/pwg-raster` and nothing else** (verified against the live API,
+> 2026-08-31). Every command in this README that submits a PDF will fail at
+> preflight with *"does not accept application/pdf"* until the PDF → PWG-raster
+> conversion is built. Universal Print will not convert for us: it only converts
+> **OXPS → PDF**, and only for printers that already accept PDF.
+>
+> The predecessor, the Brother DCP-L2540DW (share `a11f0263-…`, printer
+> `ffa65a34-…`), accepted `application/pdf` and `application/oxps` and worked
+> end to end. It was retired because it is not a Universal Print ready device.
+> Its fixture is kept in `tests/` as the PDF-passthrough test case.
 
 They are different GUIDs and are **not** interchangeable. Jobs live at
 `/print/shares/{shareId}/jobs`, but cancel is documented only at
@@ -148,28 +161,46 @@ cancel route returns 404, which reads as "already gone" — so the original job
 survives and prints alongside its replacement. That was a real defect (F3); the
 regression lives in `tests/test_real_printer.py`.
 
-### Its capabilities and defaults (verified against the live API, 2026-08-30)
+### Its capabilities and defaults (content types verified against the live API, 2026-08-31)
 
 | Setting | Value | Why it matters here |
 |---|---|---|
-| **Content types (capability)** | `application/pdf`, `application/oxps` | Read from the API, not the portal. PDFs pulled from SharePoint go straight to the device — no OXPS conversion needed |
-| Content type (default) | `application/pdf` | A *different* field from the list above. The portal's Properties page shows only this one, which is what made an earlier version of this table wrong |
+| **Content types (capability)** | **`image/pwg-raster` — only** | Read from the API, not the portal. The document must be rasterized before upload; see the warning above |
+| Colour mode (default) | Grayscale | Device is mono |
+| DPI | default 600; **300 also supported** | 300 is the conversion target: ~8.4 MB/page raw at Letter versus ~33.7 MB at 600 |
 | Copies per job | 1 | Matches the only setting we send, so they can never disagree |
-| Colour mode | Grayscale | Device is mono-only (`isColorPrintingSupported: false`) |
 | Duplex mode | **None** | Single-sided: a 40-page batch is 40 sheets. A printer-side setting, not a code change |
-| Fit PDF to page / Multipage layout | *greyed out* | Unsupported. `JOB_CONFIGURATION` must never send them — a test enforces that |
+| Fit PDF to page / Multipage layout / Pages per impression | *greyed out* | Unsupported. `JOB_CONFIGURATION` must never send them — a test enforces that |
+
+> The rows above other than content types come from the portal's **Printer
+> defaults** page, which shows defaults rather than the capability list. Those two
+> are different fields, and confusing them is what made an earlier version of this
+> table wrong for the previous printer. Read capabilities from the API.
+>
+> **`dpi` is deliberately not sent in `printJobConfiguration`.** For a
+> pre-rasterized document the resolution that matters is the one written into the
+> PWG page header; a job-level value that disagrees invites the printer to rescale
+> a bitmap that is already correct.
 
 The app sends **only** `{"copies": 1}` and lets these device defaults decide the
 rest. That is why changing duplex or colour is a printer setting, not a release.
 
-### No connector — settled, and correct
+### No connector — settled for the old printer, not yet for this one
 
-**This printer is Universal Print ready and registered directly.** Confirmed
-2026-08-30 by measurement, not inference: `live-printer-check.ps1` submitted a
-real job while the API reported **0 connectors on this printer and 0 across the
-whole tenant**, and a page came out of the tray — job `6`, `pending` →
-`processing` → `completed` in about five seconds. Nothing could have been
-bridging it, so the service is talking to the device itself.
+**Not yet proven for the MFC-L5800DW.** The 2026-08-31 check reported **0
+connectors on the printer and 0 across the tenant**, with the device `idle` and
+accepting jobs — but that is exactly the evidence this section goes on to explain
+is *insufficient on its own*. Nothing has been printed on it. The question stays
+open until a page comes out, which cannot happen before the raster conversion
+exists.
+
+**It was settled for the retired DCP-L2540DW**, and the reasoning is kept because
+it is what makes the result mean anything. Confirmed 2026-08-30 by measurement,
+not inference: `live-printer-check.ps1` submitted a real job while the API
+reported **0 connectors on that printer and 0 across the whole tenant**, and a
+page came out of the tray — job `6`, `pending` → `processing` → `completed` in
+about five seconds. Nothing could have been bridging it, so the service was
+talking to the device itself.
 
 **What that buys you operationally:** there is no Windows host in this path.
 Nothing to keep powered on, nothing to patch, and no single point of failure

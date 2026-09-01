@@ -8,12 +8,24 @@ Azure portal left ambiguous. Do it first; if it fails, nothing in stage 2 can wo
 
 ## Stage 1 — does this printer actually print?
 
-> **Already run, 2026-08-30 — and it printed.** This printer is **Universal Print
-> ready and registered directly**: 0 connectors on the printer and 0 tenant-wide,
-> job `6` went `pending` → `processing` → `completed` in about five seconds, and a
-> page came out. There is no Windows host in the path. Re-run this stage when the
-> printer, the share or the tenant changes; the reasoning below is kept because it
-> is what makes the result mean something.
+> ## ⚠️ The printer changed on 2026-08-31 — this stage must be re-run
+>
+> Everything in Stage 1 below was measured on the **Brother DCP-L2540DW**, which
+> has since been retired: it is not a Universal Print ready device. The current
+> printer is the **Brother MFC-L5800DW series [3c2af401eecf]**
+> (share `4429bf4e-…`, printer `cf8d9fa1-…`).
+>
+> **Stage 1 cannot be re-run as written.** The MFC reports `image/pwg-raster` and
+> nothing else, and this script uploads a PDF, so it will fail at the upload. The
+> `-DiagnoseOnly` half works and has been run — 0 connectors on the printer and 0
+> tenant-wide, `idle`, accepting jobs — but nothing has been printed, so the
+> registration question is **open again** for this device.
+
+> **Already run on the retired DCP-L2540DW, 2026-08-30 — and it printed.** That
+> printer was **Universal Print ready and registered directly**: 0 connectors on
+> the printer and 0 tenant-wide, job `6` went `pending` → `processing` →
+> `completed` in about five seconds, and a page came out. The reasoning below is
+> kept because it is what makes such a result mean something.
 
 ### What it settles
 
@@ -85,8 +97,13 @@ artifacts — so anything kept there stays local to your machine.
 
 The script also prints the **content types the printer reports to the API**,
 which is a fuller answer than the portal's Properties tab — that shows only the
-default. If `application/pdf` is absent, every submission fails at preflight and
-no code change can help: PDF cannot be converted to OXPS.
+default. If `application/pdf` is absent, every submission fails at preflight with
+*"does not accept application/pdf"*.
+
+**That is the current situation.** The MFC-L5800DW reports `image/pwg-raster`
+only. Universal Print will not convert for us — it performs **OXPS → PDF** alone,
+and only for printers that already accept PDF — so the fix is client-side: the
+document must be rasterized before upload.
 
 > **One scope note.** `live-printer-check.ps1` asks for `PrintConnector.Read.All`
 > so it can answer the registration question. It may need admin consent. **The
@@ -118,14 +135,16 @@ interval well inside it. Completion itself is fast — job `6` finished in about
 five seconds — so the danger is never polling too early, only polling after the
 record is gone.
 
-> **The 2026-08-31 re-share voided the measurement in progress.** The printer
-> share was deleted and re-created, minting share id
-> `a11f0263-68b7-45f4-b042-f1b4b30b60a3` in place of `5de37377-…`. Job `6` was
-> created through the old share, so a 404 now says only "that share is gone" —
-> it says nothing about retention, and reading it as an answer would set Flow B's
-> cadence from a false measurement. If the printer-route call above also 404s,
-> the run is not evidence: restart the count from the next job printed through
-> the new share. This is also why the call was changed off the share route.
+> **This measurement is dead, twice over.** First the 2026-08-31 re-share minted
+> share id `a11f0263-…` in place of `5de37377-…`, voiding the share-route call.
+> Then the printer itself was retired for the MFC-L5800DW. Job `6` lived on
+> printer `ffa65a34-…`, which is no longer the printer we use, so **no 404 here
+> tells us anything about retention** — and reading one as an answer would set
+> Flow B's cadence from a measurement that was never taken.
+>
+> **Restart the count from the first job printed on the MFC-L5800DW**, which
+> cannot happen until the PDF → PWG-raster conversion exists. Until then Flow B's
+> ten-minute cadence remains a guess.
 
 **Log what you find here:**
 
@@ -209,12 +228,12 @@ cd "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"
 #    not determine without your tenant.
 .\.venv\Scripts\python.exe scripts\test.py dryrun `
     --library "Documents" --folder "/Invoices/ToPrint" `
-    --printer-share-id "a11f0263-68b7-45f4-b042-f1b4b30b60a3"
+    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
 
 # 5. One real file.
 .\.venv\Scripts\python.exe scripts\test.py submit `
     --library "Documents" --folder "/Invoices/ToPrint" `
-    --printer-share-id "a11f0263-68b7-45f4-b042-f1b4b30b60a3" `
+    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5" `
     --batch-size 1
 
 # 6. Mark it complete once the page is out.
@@ -234,7 +253,7 @@ After step 5, open the library. The file should read:
 | Column | Value |
 |---|---|
 | `Print_Status` | `PRINT_PENDING` |
-| `Printer_Name` | `a11f0263-68b7-45f4-b042-f1b4b30b60a3` |
+| `Printer_Name` | `4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5` |
 | `Print_JobId` | a short number — they start at 1 per printer, so expect something like `6`, not a GUID |
 | `Print_Message` | *(empty)* |
 

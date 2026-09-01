@@ -19,7 +19,12 @@
     the sibling project's docs/gitignore/printer_MFCL5800DW.txt.
 
 .PARAMETER ShareId
-    The printer share id. Defaults to Noble's Brother DCP-L2540DW.
+    The printer share id. Defaults to Noble's Brother MFC-L5800DW, registered
+    2026-08-31. It replaced the DCP-L2540DW, which was not Universal Print ready.
+
+    NOTE: the MFC-L5800DW reports image/pwg-raster ONLY, so running this script
+    WITHOUT -DiagnoseOnly will fail: it uploads a PDF. Printing to this device
+    needs the PDF -> PWG-raster conversion.
 
     Expect this default to go stale. Deleting and re-creating a printer share in
     the portal mints a NEW share id -- it happened on 2026-08-31 -- while the
@@ -41,7 +46,7 @@
 
 [CmdletBinding()]
 param(
-    [string] $ShareId = "a11f0263-68b7-45f4-b042-f1b4b30b60a3",
+    [string] $ShareId = "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5",
     [switch] $DiagnoseOnly,
     [string] $PdfPath,
     [int]    $PollSeconds = 120
@@ -180,8 +185,16 @@ if ($contentTypes -contains "application/pdf") {
     Write-Host "  => application/pdf is supported: the pipeline can submit SharePoint PDFs as-is." -ForegroundColor Green
 } else {
     Write-Host "  => application/pdf is NOT in the list. Submit will fail every file at" -ForegroundColor Red
-    Write-Host "     preflight with 'does not accept application/pdf'. PDF cannot be" -ForegroundColor Red
-    Write-Host "     converted to OXPS, so this needs a printer-side fix." -ForegroundColor Red
+    Write-Host "     preflight with 'does not accept application/pdf'." -ForegroundColor Red
+    if ($contentTypes -contains "image/pwg-raster") {
+        Write-Host "     This printer takes image/pwg-raster, so the fix is CLIENT-SIDE:" -ForegroundColor Yellow
+        Write-Host "     rasterize the PDF before upload. Universal Print will not do it --" -ForegroundColor Yellow
+        Write-Host "     the only conversion it performs is OXPS -> PDF, and only for" -ForegroundColor Yellow
+        Write-Host "     printers that already accept PDF." -ForegroundColor Yellow
+    } else {
+        Write-Host "     No conversion path is known for this capability list, so this" -ForegroundColor Red
+        Write-Host "     needs a printer-side fix." -ForegroundColor Red
+    }
 }
 
 # --- 2. the printer -----------------------------------------------------------

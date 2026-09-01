@@ -379,12 +379,12 @@ Same harness as local, just pointed at the deployed app.
 #    printer's real capabilities. Prints nothing on paper.
 .\.venv\Scripts\python.exe scripts\test.py dryrun --base-url $BASE --key $KEY `
     --library "Documents" --folder "/Invoices/ToPrint" `
-    --printer-share-id "a11f0263-68b7-45f4-b042-f1b4b30b60a3"
+    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
 
 # 3. Exactly one real file.
 .\.venv\Scripts\python.exe scripts\test.py submit --base-url $BASE --key $KEY `
     --library "Documents" --folder "/Invoices/ToPrint" `
-    --printer-share-id "a11f0263-68b7-45f4-b042-f1b4b30b60a3" --batch-size 1
+    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5" --batch-size 1
 
 # 4. Once the page is out, mark it complete.
 .\.venv\Scripts\python.exe scripts\test.py status --base-url $BASE --key $KEY `
@@ -420,9 +420,9 @@ or you get a race you will debug at 2 a.m.
 
 | Flow | Recurrence | Body |
 |---|---|---|
-| **A — Submit** | 15 min | `{"library":"Documents","folder":"/Invoices/ToPrint","printerShareId":"a11f0263-…","batchSize":5}` |
+| **A — Submit** | 15 min | `{"library":"Documents","folder":"/Invoices/ToPrint","printerShareId":"4429bf4e-…","batchSize":5}` |
 | **B — Poll** | 10 min | `{"library":"Documents","folder":"/Invoices/ToPrint"}` |
-| **C — Resubmit** | daily 02:00 | `{"library":"Documents","folder":"/Invoices/ToPrint","printerShareId":"a11f0263-…"}` |
+| **C — Resubmit** | daily 02:00 | `{"library":"Documents","folder":"/Invoices/ToPrint","printerShareId":"4429bf4e-…"}` |
 | **D — Digest** | Mon 07:00 | SharePoint *Get items* per status; email the counts |
 
 Flow A must loop, because the batch is 5:
