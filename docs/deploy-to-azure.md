@@ -227,6 +227,17 @@ query fails.
 While you are there, confirm the four columns exist with these **exact** display
 names — `Print_Status`, `Print_JobId`, `Print_Message`, `Printer_Name`.
 
+**Index confirmed 2026-08-31** — `Print_Status`, 1 of a maximum 20 indices, on
+list `{6B19AB5B-2823-4073-8B8F-33C3DB52F3E6}` in site
+`https://noblehomes.sharepoint.com/sites/PM` ("Noble - Properties"). Those two
+values are `SHAREPOINT_HOSTNAME` and `SHAREPOINT_SITE_PATH` in step 6.
+
+> **Still to confirm: the library's display name.** The examples in step 9 and in
+> `docs/e2e-testing.md` pass `--library "Documents" --folder "/Invoices/ToPrint"`,
+> which are placeholders, not observed values. `--library` must match the library
+> holding the four columns exactly, or the smoke test fails at list resolution with
+> a confusing error. Read it from the breadcrumb on the library's own page.
+
 ### Library versioning — checked 2026-08-31, nothing to do
 
 Read from *Library settings → Versioning settings*:
@@ -235,6 +246,7 @@ Read from *Library settings → Versioning settings*:
 |---|---|---|
 | **Require content approval** | **No** ✅ | Graph returns every item; no `_ModerationStatus` filtering, no extra permission, no risk of a write hiding an item from the next query |
 | Versioning | **major versions only** | Each field write makes a major version. Submit writes twice and Poll once, so expect ~3 versions per printed file |
+| Version time limit | **No time limit** | Versions are pruned by count only, never by age |
 | Keep major versions | 500 | Ample — a file would have to print ~160 times to reach it |
 | Draft Item Security | *(inactive)* | Greyed out because approval and minor versions are both off |
 | **Require check out** | **No** ✅ | Load-bearing. If check-out were required, the app's field writes could fail or strand files checked out |
@@ -243,6 +255,12 @@ Read from *Library settings → Versioning settings*:
 moderation handling. Re-check if anyone changes versioning settings later: turning
 content approval on would need a `_ModerationStatus`-aware query and the
 *Approve items* permission on the service account.
+
+> **Versions cost storage, not items.** The ~3 versions per printed file do **not**
+> count toward the list item count, so they have no bearing on the 5,000 list view
+> threshold or the 30M list limit. They do consume site storage quota, and with no
+> time limit they are pruned only when a file passes 500 versions — which for a
+> document printed a handful of times never happens.
 
 ---
 
@@ -476,8 +494,8 @@ az functionapp config appsettings set --resource-group $RG --name $APP --setting
     "GRAPH_CLIENT_ID=$CLIENT_ID" `
     "KEY_VAULT_URI=https://$VAULT.vault.azure.net/" `
     "PRINT_REFRESH_TOKEN_SECRET=$SECRET" `
-    "SHAREPOINT_HOSTNAME=<TENANT>.sharepoint.com" `
-    "SHAREPOINT_SITE_PATH=/sites/<SITE>" `
+    "SHAREPOINT_HOSTNAME=noblehomes.sharepoint.com" `
+    "SHAREPOINT_SITE_PATH=/sites/PM" `
     "PRINT_BATCH_SIZE=5" `
     "PRINT_STATUS_WINDOW_DAYS=20" `
     "PRINT_RESUBMIT_MIN_AGE_HOURS=72" `
