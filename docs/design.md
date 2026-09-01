@@ -660,7 +660,7 @@ noble-print/
 │  ├─ test.py                       # ONE harness; --base-url defaults to localhost (§P-6.5)
 │  ├─ start-local.ps1  localshim/sitecustomize.py
 ├─ tests/  conftest.py  fake_graph.py  fixtures/*.json  test_*.py
-├─ docs/design.md  docs/monitoring.md  docs/ai/
+├─ docs/design.md  docs/timing.md  docs/e2e-testing.md  docs/deploy-to-azure.md  docs/ai/
 └─ CLAUDE.md  README.md  pytest.ini  .gitignore
 ```
 

@@ -166,8 +166,10 @@ They are different GUIDs and are **not** interchangeable. Jobs live at
 `/print/shares/{shareId}/jobs`, but cancel is documented only at
 `/print/printers/{printerId}/jobs/{jobId}/cancel`. Sending the share id to the
 cancel route returns 404, which reads as "already gone" — so the original job
-survives and prints alongside its replacement. That was a real defect (F3); the
-regression lives in `tests/test_real_printer.py`.
+survives and prints alongside its replacement. That was a real defect (F3). It is
+now structurally impossible — Poll takes no printer argument and always resolves
+the row's own `Printer_Name` — and the surviving half of the guard lives in
+`tests/test_poll.py::test_the_cancel_uses_the_printer_named_on_the_row`.
 
 ### Its capabilities and defaults (content types verified against the live API, 2026-08-31)
 
