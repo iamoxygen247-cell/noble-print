@@ -19,3 +19,14 @@ azure-keyvault-secrets>=4.8.0
 # IANA time-zone data for zoneinfo (print_policy.BUSINESS_TZ). Required on hosts
 # with no system tz database -- without it "printed on ..." silently renders UTC.
 tzdata>=2024.1
+
+# PDF rendering for printers that accept only a raster format. The Brother
+# MFC-L5800DW reports image/pwg-raster and nothing else, and Universal Print
+# converts only OXPS->PDF, so the client must rasterize (printing/profiles.py).
+#
+# pypdfium2 rather than Ghostscript or PyMuPDF: it is BSD-3/Apache-2.0 rather
+# than AGPL, and it ships self-contained manylinux wheels, so nothing native has
+# to be installed on the host. That matters because Flex Consumption has no
+# custom-container path and binaries shipped in the package are unsupported
+# there. The PWG encoding itself is stdlib (printing/pwg_converter.py).
+pypdfium2>=5,<6

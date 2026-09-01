@@ -436,3 +436,23 @@ def test_resubmit_scope_excludes_ready_and_completed():
     assert policy.RESUBMIT_STATUSES == (policy.PENDING, policy.FAILED)
     assert policy.READY not in policy.RESUBMIT_STATUSES
     assert policy.COMPLETED not in policy.RESUBMIT_STATUSES
+
+
+def test_the_default_job_configuration_carries_only_copies():
+    """THE guard on JOB_CONFIGURATION, relocated here when the retired
+    printer's fixture was deleted.
+
+    This constant is the DEFAULT configuration -- the one used when a printer
+    accepts the document as-is and no profile overrides it. It must stay
+    minimal: every extra key is a setting the device might not support, and
+    letting the printer's own defaults decide colour, duplex and quality is
+    what makes those printer settings rather than a release.
+
+    A printer that needs more (the PWG-raster path sends a dozen settings)
+    carries its own configuration on its profile. It does not widen this one.
+    """
+    assert set(policy.JOB_CONFIGURATION) == {"copies"}, (
+        "JOB_CONFIGURATION grew beyond `copies`: {}. Per-printer settings "
+        "belong on a printer profile, not on the shared default.".format(
+            sorted(policy.JOB_CONFIGURATION)))
+    assert policy.JOB_CONFIGURATION["copies"] == 1

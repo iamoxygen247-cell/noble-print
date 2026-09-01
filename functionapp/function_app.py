@@ -44,6 +44,8 @@ import azure.functions as func
 import graph_auth
 import graph_client
 import print_policy
+import printing
+import printing.sender
 import sharepoint
 import universal_print
 from graph_client import GraphClient
@@ -203,6 +205,31 @@ class Budget:
         return (time.monotonic() - self._started) >= self._limit
 
 
+def _dry_run_conversion(share: universal_print.ShareInfo) -> Dict[str, Any]:
+    """What would happen to a PDF on this printer, without submitting one.
+
+    Reported by dryRun so a printer that needs rasterizing announces itself
+    before anyone queues a file, rather than after every file has failed.
+    """
+    source = universal_print.DEFAULT_CONTENT_TYPE
+    profile = printing.select_profile(share, source)
+    if profile is None:
+        return {"supported": False, "profile": None, "sourceContentType": source}
+
+    report: Dict[str, Any] = {
+        "supported": True,
+        "profile": profile.name,
+        "sourceContentType": source,
+        "uploadContentType": profile.target_content_type(source),
+    }
+    try:
+        report["jobConfiguration"] = profile.job_configuration(share)
+    except Exception as exc:                                   # pragma: no cover
+        report["jobConfiguration"] = None
+        report["configurationError"] = str(exc)
+    return report
+
+
 # --- the shared per-file submission -------------------------------------------
 
 
@@ -257,7 +284,11 @@ def _submit_one(client: GraphClient, context: ListContext, share: universal_prin
         content_type = universal_print.guess_content_type(
             file_name, drive_item.get("content_type", ""))
 
-        if not share.supports(content_type):
+        # A profile either sends the document as-is or converts it to something
+        # this printer accepts. None means neither is possible -- which is the
+        # same refusal the pipeline has always reported.
+        profile = printing.select_profile(share, content_type)
+        if profile is None:
             raise universal_print.PrintStageError(
                 "content_type",
                 f"printer {share.display_name or share.share_id} does not accept "
@@ -265,8 +296,8 @@ def _submit_one(client: GraphClient, context: ListContext, share: universal_prin
 
         data = sharepoint.download(drive_item["download_url"])
 
-        job_id = universal_print.submit_document(
-            client, share.share_id, data, file_name, content_type)
+        job_id = printing.sender.send(
+            client, share, profile, data, file_name, content_type)
 
     except Exception as exc:
         stage = getattr(exc, "stage", stage)
@@ -402,7 +433,11 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
                     "acceptingJobs": share.accepting_jobs,
                     "state": share.state,
                     "contentTypes": share.content_types,
+                    "dpis": share.dpis,
                 },
+                # Which profile would run, and what it would upload. This is how
+                # you find out a printer needs conversion WITHOUT printing.
+                "conversion": _dry_run_conversion(share),
                 "candidatesFound": len(candidates),
                 "wouldSubmit": [{"itemId": f.item_id, "fileName": f.file_name,
                                  "created": f.created} for f in selected],

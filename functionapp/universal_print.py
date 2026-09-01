@@ -55,13 +55,27 @@ DEFAULT_CONTENT_TYPE = "application/pdf"
 
 @dataclass
 class ShareInfo:
-    """The preflight result for a printer share."""
+    """The preflight result for a printer share.
+
+    Everything past `state` exists so a printer profile can build a job
+    configuration from what the device actually reports rather than from
+    hardcoded values. They all come out of the same `capabilities` object
+    get_share already fetches, so none of them costs a round trip.
+    """
     share_id: str
     printer_id: str
     display_name: str
     accepting_jobs: bool
     content_types: List[str] = dataclass_field(default_factory=list)
     state: str = ""
+    dpis: List[int] = dataclass_field(default_factory=list)
+    scalings: List[str] = dataclass_field(default_factory=list)
+    media_sizes: List[str] = dataclass_field(default_factory=list)
+    colour_supported: bool = False
+    top_margins: List[int] = dataclass_field(default_factory=list)
+    bottom_margins: List[int] = dataclass_field(default_factory=list)
+    left_margins: List[int] = dataclass_field(default_factory=list)
+    right_margins: List[int] = dataclass_field(default_factory=list)
 
     def supports(self, content_type: str) -> bool:
         """Whether the printer accepts this MIME type.
@@ -108,6 +122,10 @@ def get_share(client: GraphClient, share_id: str) -> ShareInfo:
     status = payload.get("status") or {}
     printer = payload.get("printer") or {}
 
+    def ints(name: str) -> List[int]:
+        return [int(v) for v in (capabilities.get(name) or [])
+                if isinstance(v, (int, float)) or str(v).lstrip("-").isdigit()]
+
     return ShareInfo(
         share_id=payload.get("id") or share_id,
         printer_id=printer.get("id") or "",
@@ -116,23 +134,39 @@ def get_share(client: GraphClient, share_id: str) -> ShareInfo:
         accepting_jobs=payload.get("isAcceptingJobs") is not False,
         content_types=list(capabilities.get("contentTypes") or []),
         state=(status.get("state") or ""),
+        dpis=ints("dpis"),
+        scalings=[str(v) for v in (capabilities.get("scalings") or [])],
+        media_sizes=[str(v) for v in (capabilities.get("mediaSizes") or [])],
+        colour_supported=bool(capabilities.get("isColorPrintingSupported")),
+        top_margins=ints("topMargins"),
+        bottom_margins=ints("bottomMargins"),
+        left_margins=ints("leftMargins"),
+        right_margins=ints("rightMargins"),
     )
 
 
 # --- submitting ---------------------------------------------------------------
 
 
-def create_job(client: GraphClient, share_id: str) -> Tuple[str, str]:
+def create_job(client: GraphClient, share_id: str,
+               configuration: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
     """Create a print job. Returns (job_id, document_id).
 
     retry=False is deliberate and important: this call is NOT idempotent. A retry
     after a response we failed to read would create a second job and print the
     document twice. A transient failure here costs one retry cycle; a duplicate
     costs paper and trust.
+
+    `configuration` lets a printer profile send the settings its own output needs
+    -- a pre-rasterized document, for instance, must carry the scaling and
+    margins that place it on the page. Omitted, it falls back to
+    print_policy.JOB_CONFIGURATION, which stays deliberately minimal so an
+    ordinary printer's own defaults decide colour, duplex and quality.
     """
     payload = client.post_json(
         f"/print/shares/{share_id}/jobs",
-        {"configuration": dict(print_policy.JOB_CONFIGURATION)},
+        {"configuration": dict(configuration if configuration is not None
+                               else print_policy.JOB_CONFIGURATION)},
         expected=(200, 201), retry=False,
     ) or {}
 
@@ -230,14 +264,18 @@ class PrintStageError(RuntimeError):
 
 def submit_document(client: GraphClient, share_id: str, data: bytes,
                     file_name: str, content_type: str,
-                    timeout: Optional[float] = None) -> str:
+                    timeout: Optional[float] = None,
+                    configuration: Optional[Dict[str, Any]] = None) -> str:
     """The whole four-step submission. Returns the job id.
 
     Every failure is re-raised as a PrintStageError naming the step, so the
     caller can write a Print_Message that points at the right system.
+
+    `configuration` is passed straight to create_job; see there for why a
+    printer profile may need to override the default.
     """
     try:
-        job_id, document_id = create_job(client, share_id)
+        job_id, document_id = create_job(client, share_id, configuration)
     except Exception as exc:
         raise PrintStageError(STAGE_CREATE, exc)
 

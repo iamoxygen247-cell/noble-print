@@ -412,3 +412,19 @@ def test_run_summary_uses_sentinels_not_missing_keys(graph, caplog):
     for key in ("found", "ok", "failed", "skipped", "remaining"):
         assert key in summary
         assert summary[key] == "-1"
+
+
+def test_the_created_job_body_carries_only_copies(graph):
+    """What actually goes on the wire, not just the constant.
+
+    Relocated here when the retired printer's test file was deleted. The
+    companion assertion on the constant itself lives in test_print_policy.py;
+    this one proves the constant survives the adapter unchanged.
+    """
+    graph.add_item("1")
+
+    post(SUBMIT, body())
+
+    created = graph.created_jobs()
+    assert len(created) == 1
+    assert created[0].body == {"configuration": {"copies": 1}}

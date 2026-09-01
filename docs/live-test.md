@@ -56,22 +56,37 @@ cd "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"
 #    connectors. Submits nothing, prints nothing.
 .\scripts\live-printer-check.ps1 -DiagnoseOnly
 
-# 2. The real thing -- generates a one-page PDF, runs the same four Graph calls
-#    the Function App makes, then polls the job to a terminal state.
-.\scripts\live-printer-check.ps1
-or 
-.\scripts\live-printer-check.ps1 -PdfPath "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print\samples\260607_0002.pdf"
+# 2. Dry run of the real thing -- converts and reports, prints nothing.
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\invoice.pdf" -PlanOnly
+
+# 3. The real thing -- one page comes out of the tray.
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\invoice.pdf"
 ```
 
-It signs in with **device code** using the Microsoft Graph PowerShell first-party
-app, so there is no app registration to create. It is the same path already
-validated in the sibling project's `docs/gitignore/printer_MFCL5800DW.txt`.
+**Use `live-print-test.ps1`, not `live-printer-check.ps1`, to print.** The older
+script uploads a PDF, which this printer rejects: it reports `image/pwg-raster`
+only. `live-printer-check.ps1 -DiagnoseOnly` is still the right tool for the
+registration and capability questions.
 
-Sign in as whoever should own print jobs. To print your own PDF instead:
+Both sign in with **device code** using the Microsoft Graph PowerShell
+first-party app, so there is no app registration to create. Sign in as whoever
+should own print jobs.
 
-```powershell
-.\scripts\live-printer-check.ps1 -PdfPath "C:\path\to\invoice.pdf"
-```
+**What makes step 3 worth trusting.** It does not carry its own print settings.
+It reads the share's live capabilities, hands them to `python -m printing.plan`,
+and uses whatever the *application* decides -- profile, upload content type,
+resolution and the full job configuration. So a green run is evidence about the
+code that ships, not about the script. The distinction matters here because the
+raster and the configuration are a matched pair: the converter renders full-bleed
+at the media size and depends on `scaling: fit` plus the device margins to place
+it on the sheet. A script with hardcoded settings could print perfectly while the
+deployed app printed cropped.
+
+Useful flags: `-PlanOnly` stops after conversion, `-KeepRaster` leaves the `.pwg`
+on disk so a bad page can be inspected, `-ShareId` targets a different printer.
+
+**Check the paper, not just the exit code.** A `completed` job with a cropped or
+scaled page means the configuration and the raster disagree.
 
 **Where the test page goes.** With no `-PdfPath` the script generates a fresh one
 into your TEMP directory and never touches the repo. Generating it each time is
@@ -120,39 +135,37 @@ print (UC-9). If Universal Print discards a finished job before Poll sees it,
 Poll gets a 404, writes nothing, and Resubmit reprints the document 72 hours
 later.
 
-Stage 1 left a **completed job `6`** behind, so measuring costs one call a day
-and nothing on paper — but **read the note below before trusting a 404.**
+**Nothing has been measured yet on the current printer.** The earlier run left a
+completed job on the retired DCP-L2540DW, and that device is gone — so there is no
+job to poll and no partial answer to build on. The count starts from zero.
+
+Once the first invoice prints on the MFC-L5800DW, note its job id and poll it once
+a day on the **printer** route — job ids are per-printer, and the printer id
+survives a re-share while the share id does not:
 
 ```powershell
-# The printer route, not the share route. Job ids are per-PRINTER, and the
-# printer id survives a re-share; the share id does not.
 Invoke-MgGraphRequest -Method GET `
-  -Uri "https://graph.microsoft.com/v1.0/print/printers/ffa65a34-615c-493b-9eff-d227133293ac/jobs/6"
+  -Uri "https://graph.microsoft.com/v1.0/print/printers/cf8d9fa1-0502-4b0d-b28e-22a52cdde8a1/jobs/<jobId>"
 ```
 
 The **last day this still returns a job** is the retention window. Set Flow B's
-interval well inside it. Completion itself is fast — job `6` finished in about
-five seconds — so the danger is never polling too early, only polling after the
-record is gone.
+interval well inside it. Completion itself is fast — a page finishes in seconds —
+so the danger is never polling too early, only polling after the record is gone.
 
-> **This measurement is dead, twice over.** First the 2026-08-31 re-share minted
-> share id `a11f0263-…` in place of `5de37377-…`, voiding the share-route call.
-> Then the printer itself was retired for the MFC-L5800DW. Job `6` lived on
-> printer `ffa65a34-…`, which is no longer the printer we use, so **no 404 here
-> tells us anything about retention** — and reading one as an answer would set
-> Flow B's cadence from a measurement that was never taken.
+> A 404 is only evidence when the job was created on **this** printer and through
+> the **current** share. Any other 404 says "that object is gone", not "retention
+> expired", and reading one as an answer would set Flow B's cadence from a
+> measurement that was never taken.
 >
-> **Restart the count from the first job printed on the MFC-L5800DW**, which
-> cannot happen until the PDF → PWG-raster conversion exists. Until then Flow B's
+> The first job cannot exist until the PDF → PWG-raster conversion ships. Until
+> then Flow B's
 > ten-minute cadence remains a guess.
 
 **Log what you find here:**
 
-| Checked | Job `6` still returns? |
+| Checked | Job still returns? |
 |---|---|
-| 2026-08-30, ~15 min after printing | yes |
-| 2026-08-31 | *(share re-created — measurement restarted, see above)* |
-| _(next check)_ | |
+| _(first check, once an invoice has printed)_ | |
 
 > One reading proves only that retention is longer than fifteen minutes, which
 > was never in doubt. The answer needs days, so check once a day until it 404s.

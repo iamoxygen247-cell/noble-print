@@ -92,6 +92,31 @@ def summarise(command: str, status: int, payload: dict) -> None:
             printer.get("printerId")))
         print("  accepting  : {}".format(printer.get("acceptingJobs")))
         print("  content    : {}".format(", ".join(printer.get("contentTypes") or [])))
+        if printer.get("dpis"):
+            print("  dpis       : {}".format(
+                ", ".join(str(d) for d in printer["dpis"])))
+
+        # Which printer profile would run. A printer that needs rasterizing says
+        # so here, before any file is queued -- rather than after every file has
+        # failed at preflight.
+        conversion = payload.get("conversion") or {}
+        if conversion:
+            if not conversion.get("supported"):
+                print("conversion   : NONE -- this printer accepts nothing we can "
+                      "produce. Every file would fail.")
+            else:
+                print("conversion   : {}{}".format(
+                    conversion.get("profile"),
+                    "" if conversion.get("uploadContentType") ==
+                          conversion.get("sourceContentType")
+                    else "  ({} -> {})".format(conversion.get("sourceContentType"),
+                                               conversion.get("uploadContentType"))))
+                job = conversion.get("jobConfiguration") or {}
+                if job:
+                    print("  job config : {}".format(
+                        ", ".join("{}={}".format(k, v) for k, v in sorted(job.items())
+                                  if not isinstance(v, dict))))
+
         print("candidates   : {}".format(payload.get("candidatesFound")))
         for item in payload.get("wouldSubmit") or []:
             print("    would submit {} ({})".format(item["itemId"], item["fileName"]))

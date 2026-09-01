@@ -300,30 +300,24 @@ printer **Ready**, **Shared**, **Is accepting jobs: Yes**, last seen one minute
 ago -- so the device was demonstrably fine and the message, which names
 *registered printers*, pointed at the wrong thing entirely.
 
-**Cause:** the printer share had been deleted and re-created (Share date
-`2026-08-31 16:14 UTC`, four minutes before the failing run). **Re-sharing mints
-a new share id.** `5de37377-8b08-459f-b7a6-670349acb4f7` became
-`a11f0263-68b7-45f4-b042-f1b4b30b60a3`. The printer id was untouched --
-`registeredDateTime` still read `2026-08-28T20:29:13Z`, which is the tell: the
-device never re-registered, only the share was replaced.
+**Cause:** the printer share had been deleted and re-created (Share date four
+minutes before the failing run). **Re-sharing mints a new share id.** The printer
+id was untouched -- `registeredDateTime` still read the original registration,
+which is the tell: the device never re-registered, only the share was replaced.
 
 **Fix:** read the current **Share Id** from *Universal Print > Printers > the
 printer > Overview*, then replace the old id everywhere it was written down. It
-was in eighteen places across six files:
+was in eighteen places across six files, so sweep rather than guess:
 
 ```powershell
-# scripts\live-printer-check.ps1 (the -ShareId default), README.md,
-# docs\design.md, docs\live-test.md, docs\deploy-to-azure.md,
-# tests\fixtures\printer_brother_dcp_l2540dw.json, tests\test_real_printer.py
-Select-String -Path .\README.md,.\docs\*.md,.\scripts\*.ps1,.\tests\*.py,.\tests\fixtures\*.json `
-    -Pattern "5de37377"          # the retired id
+Select-String -Path .\README.md,.\docs\*.md,.\scripts\*.ps1,.\tests\*.py `
+    -Pattern "<the retired share id>"
 ```
 
-Four hits survive on purpose and are not misses: `docs\design.md` (twice),
-`docs\live-test.md` and the fixture's `_source` note all name the retired id
-while explaining that it *is* retired. What must be zero is the retired id
-appearing in a **URL, a command, a default or a field value** -- read each hit,
-do not just count them.
+Expect hits in `scripts\live-printer-check.ps1` (the `-ShareId` default),
+`README.md`, `docs\design.md`, `docs\live-test.md` and `docs\deploy-to-azure.md`.
+The count must reach **zero**: a retired id has no business in a URL, a command,
+a default or a field value.
 
 **And the copies that are not in the repo:** the `printerShareId` in every Power
 Automate flow body (Submit and Resubmit), plus anything in `CLAUDE.local.md`.

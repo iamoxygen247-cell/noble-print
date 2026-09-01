@@ -3,9 +3,11 @@
 Step by step, in order. **The order matters**: several steps depend on the one
 before, and two of them fail *silently* if done out of sequence.
 
-> **Do [`docs/live-test.md`](live-test.md) first.** If the printer does not print
-> from a standalone script, nothing here will make it print. That test also
-> answers the one open question about this printer's registration.
+> **Do [`docs/e2e-testing.md`](e2e-testing.md) Part A first.** If a page does not
+> come out of the tray from a standalone script, nothing here will make it print —
+> and Part A needs no Azure resources at all, so it costs nothing to find out.
+> This printer accepts `image/pwg-raster` only, so that test is also the one that
+> proves the PDF → raster conversion works against the real device.
 
 ---
 
@@ -32,6 +34,35 @@ func --version        # Azure Functions Core Tools v4
 az login
 az account set --subscription "<SUBSCRIPTION_NAME_OR_ID>"
 ```
+
+> ### ⚠️ `az` and the TLS-inspecting proxy — read before the first `az` command
+>
+> On this machine a plain `az` command that touches the network fails with
+> `CERTIFICATE_VERIFY_FAILED`. `az` ships its own Python + OpenSSL, which does not
+> trust the inspection agent's root the way .NET tooling does. **`az login`
+> succeeding proves nothing** — it authenticates through the browser/broker, which
+> uses the Windows trust store; the resource calls afterwards do not.
+>
+> The fix is installed: an `az` wrapper function in the PowerShell profile pointing
+> at `%LOCALAPPDATA%\az-truststore\azrun.py`. So:
+>
+> * **In an interactive PowerShell window, plain `az` works** — the profile is loaded.
+> * **Anywhere else** (a script, a tool that spawns a child process), call it by
+>   absolute path. The PATH shim does not win, because machine PATH entries precede
+>   user ones:
+>   ```powershell
+>   & 'C:\Program Files\Microsoft SDKs\Azure\CLI2\python.exe' -B "$env:LOCALAPPDATA\az-truststore\azrun.py" <args>
+>   ```
+>
+> Confirm before continuing — this must return the group, not a certificate error:
+>
+> ```powershell
+> az group list --query "[].name" -o tsv
+> ```
+>
+> Expect intermittent `ConnectionResetError 10054` from the same agent, more often
+> on heavier responses. **Retry**; it is not a wrong name or a missing resource.
+> Full write-up in [`ai/troubleshooting.md`](ai/troubleshooting.md).
 
 ### Names used below
 
@@ -111,9 +142,24 @@ query fails.
 3. Primary column: **`Print_Status`** → **Create**
 
 While you are there, confirm the four columns exist with these **exact** display
-names — `Print_Status`, `Print_JobId`, `Print_Message`, `Printer_Name` — and note
-whether **content approval** is on (*Versioning settings*). If it is, tell me:
-Graph will not return non-Approved items and the permission set changes.
+names — `Print_Status`, `Print_JobId`, `Print_Message`, `Printer_Name`.
+
+### Library versioning — checked 2026-08-31, nothing to do
+
+Read from *Library settings → Versioning settings*:
+
+| Setting | Value | Consequence |
+|---|---|---|
+| **Require content approval** | **No** ✅ | Graph returns every item; no `_ModerationStatus` filtering, no extra permission, no risk of a write hiding an item from the next query |
+| Versioning | **major versions only** | Each field write makes a major version. Submit writes twice and Poll once, so expect ~3 versions per printed file |
+| Keep major versions | 500 | Ample — a file would have to print ~160 times to reach it |
+| Draft Item Security | *(inactive)* | Greyed out because approval and minor versions are both off |
+| **Require check out** | **No** ✅ | Load-bearing. If check-out were required, the app's field writes could fail or strand files checked out |
+
+**Both boxes that could have broken this pipeline are off**, so the design needs no
+moderation handling. Re-check if anyone changes versioning settings later: turning
+content approval on would need a `_ModerationStatus`-aware query and the
+*Approve items* permission on the service account.
 
 ---
 
@@ -140,15 +186,33 @@ az functionapp list-flexconsumption-runtimes --location $LOC --runtime python `
 
 Use a version that command actually returns.
 
-> **Your local venv is Python 3.14.7 and Azure will almost certainly offer
-> something lower.** That mismatch is **not a problem**: with remote build the
-> platform reinstalls from `requirements.txt` server-side against *its* runtime,
-> so no local wheel is shipped. Core Tools may print a version-mismatch warning —
-> it is noise. Never change the platform runtime to silence a warning.
+**Verified 2026-08-31 for `canadacentral`** (and `westus`), so you can expect:
+
+```
+3.14, 3.13, 3.12, 3.11, 3.10
+```
+
+> An earlier revision of this runbook said "Azure will almost certainly offer
+> something lower" than the local venv's 3.14.7. That is **no longer true** — 3.14
+> is offered. Ask the platform anyway; the point of the command is that the answer
+> changes.
 
 ```powershell
-$PYVER = "3.12"   # <- whatever the command above returned
+$PYVER = "3.14"   # matches the local venv; confirm against the command above
 ```
+
+**3.14 is the recommendation.** It matches `.venv` (3.14.7), so what the offline
+suite exercises and what the platform runs are the same minor version. The sibling
+project has run 3.14 on Flex Consumption since 2026-08-20.
+
+> Core Tools 4.12.0 prints *"Remote build for Python 3.14 is not yet supported for
+> Flex"* during publish. That warning is **stale and non-blocking** — the sibling
+> project verified the build succeeds anyway. Do not downgrade the runtime to
+> silence it, and do not chase a newer Core Tools for it.
+
+Either way the mismatch question is moot with remote build: the platform
+reinstalls from `requirements.txt` server-side against *its* runtime, so no local
+wheel is ever shipped.
 
 ### 3.3 Function App (Flex Consumption)
 
@@ -273,8 +337,16 @@ az functionapp config appsettings set --resource-group $RG --name $APP --setting
     "PRINT_BUSINESS_TZ=America/Vancouver" `
     "PRINT_BUDGET_SECONDS=90" `
     "GRAPH_TIMEOUT_SECONDS=30" `
+    "PRINT_RASTER_DPI=300" `
+    "PRINT_RASTER_MAX_BYTES=33554432" `
     "APPLICATIONINSIGHTS_CONNECTION_STRING=$AI_CONN"
 ```
+
+`PRINT_RASTER_*` apply only to printers that need rasterizing — see **Printer
+profiles** in `README.md`. 300 dpi is what this printer was proven with; a Letter
+page lands around 1.4 MB, well inside one upload chunk. Raising it multiplies both
+the CPU time per page and the upload, so measure before changing it. An
+out-of-range value warns and falls back rather than failing the run.
 
 **`PRINT_REFRESH_TOKEN` must NOT be set here.** It is a local-development escape
 hatch. It works in Azure, which is exactly the danger: the app would use a
@@ -293,7 +365,12 @@ az functionapp config appsettings list --resource-group $RG --name $APP `
 ## 7. Deploy the code
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest        # 353 tests must be green FIRST
+.\.venv\Scripts\python.exe -m pytest        # 357 tests must be green FIRST
+
+# func shells out to the RAW az.cmd for an ARM token and cannot refresh it over
+# the network through the inspecting proxy. Pre-warm the cache through the
+# truststore wrapper first, or publish fails with "Unable to connect to Azure".
+& 'C:\Program Files\Microsoft SDKs\Azure\CLI2\python.exe' -B "$env:LOCALAPPDATA\az-truststore\azrun.py" account get-access-token --output none
 
 cd functionapp
 func azure functionapp publish $APP --build remote
@@ -301,7 +378,20 @@ cd ..
 ```
 
 Remote build reinstalls from `requirements.txt` on the platform, so no local venv
-or wheel is shipped and native packages are built for the target OS.
+or wheel is shipped and native packages are resolved for the target OS.
+
+> **The one new dependency worth checking.** `requirements.txt` now includes
+> `pypdfium2` for the PDF → PWG-raster conversion. It publishes a
+> `py3-none-manylinux_2_17_x86_64` wheel — **verified present for 5.13.0** — so it
+> is Python-version agnostic and needs no compiler on the platform. Nothing native
+> is installed on the host, which matters because Flex Consumption has no
+> custom-container path. If a future version drops the manylinux wheel, remote
+> build will try to compile and fail; pin a working version rather than widening
+> the range.
+>
+> The `functionapp/printing/` package ships automatically — it is inside the
+> published folder, and `.funcignore` excludes only `tests/`, `.venv/`,
+> `__pycache__/` and the settings files.
 
 Publishing runs from `functionapp/`, so everything outside it — `tests/`,
 `scripts/`, `.venv/`, `docs/` — is already out of the artifact by construction.
@@ -344,6 +434,8 @@ Expected:
 | `PRINT_STATUS_WINDOW_DAYS` | `20` |
 | `PRINT_RESUBMIT_MIN_AGE_HOURS` | `72` |
 | `PRINT_BUSINESS_TZ` | `America/Vancouver` |
+| `PRINT_RASTER_DPI` | `300` |
+| `PRINT_RASTER_MAX_BYTES` | `33554432` |
 | `PRINT_REFRESH_TOKEN` | **absent** |
 
 Confirm sampling is off — if adaptive sampling is on, every count in the weekly
@@ -375,8 +467,9 @@ Same harness as local, just pointed at the deployed app.
 # 1. Validation path: must 400, must touch nothing.
 .\.venv\Scripts\python.exe scripts\test.py badpayload --base-url $BASE --key $KEY
 
-# 2. Dry run: resolves site, library, the four INTERNAL column names, and the
-#    printer's real capabilities. Prints nothing on paper.
+# 2. Dry run: resolves site, library, the four INTERNAL column names, the
+#    printer's real capabilities, and WHICH CONVERSION PROFILE would run.
+#    Prints nothing on paper.
 .\.venv\Scripts\python.exe scripts\test.py dryrun --base-url $BASE --key $KEY `
     --library "Documents" --folder "/Invoices/ToPrint" `
     --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
@@ -390,6 +483,11 @@ Same harness as local, just pointed at the deployed app.
 .\.venv\Scripts\python.exe scripts\test.py status --base-url $BASE --key $KEY `
     --library "Documents" --folder "/Invoices/ToPrint"
 ```
+
+In step 2's output, `conversion` must read **`pdf-to-pwg-raster`** for this
+printer. `NONE` means no profile matched and every file would fail at preflight.
+The `job config` line should match what
+[`e2e-testing.md`](e2e-testing.md) Part A printed with.
 
 **5. Open the library and read the four columns back.** This is the step people
 skip, and it is the one that catches a silent write failure — the response can
@@ -468,13 +566,10 @@ Alert when no `ep=submit` row appears in 2 hours.
 
 ## 12. Rollback
 
-> **Prerequisite: this project is not under version control yet** — there is no
-> `.git` directory, so the first line below has nothing to check out. Run
-> `git init` and make an initial commit before you rely on this path; until then
-> the only rollback available is the second one.
+The repository exists (branch `main`), so both paths below are available.
 
 ```powershell
-# Re-publish a known-good commit (needs a git repo -- see above)
+# Re-publish a known-good commit
 git checkout <GOOD_SHA>
 cd functionapp; func azure functionapp publish $APP --build remote; cd ..
 
@@ -497,7 +592,10 @@ immediately and leaves the queue intact.
 | Every query fails | `Print_Status` not indexed | Step 2 |
 | 403 from Key Vault in App Insights | Role is *Secrets User*, not *Officer* | Re-run step 4 |
 | Works for ~90 days then stops | Rotation was failing all along (read-only vault role) | Step 4, then step 5 |
-| `does not accept application/pdf` | Printer capability | Printer-side; `live-printer-check.ps1` shows the real list |
+| `does not accept application/pdf` | No printer profile matched this device's capability list | The app converts PDF → PWG raster; if it still refuses, the printer reports neither PDF nor `image/pwg-raster`. Check with `test.py dryrun` (`conversion: NONE`) and `live-printer-check.ps1 -DiagnoseOnly` |
+| `convert: ...` in `Print_Message` | The document could not be rasterized | A damaged or password-protected PDF, or one over `PRINT_RASTER_MAX_BYTES`. Reproduce locally: `python -m printing <file>.pdf out.pwg --dpi 300` |
+| Prints, but the page is cropped or scaled | The raster and the job configuration disagree | `scaling`/`margin`/`dpi` in `printing/profiles.py` must match the render dpi. Graph still reports `completed` — only the paper shows it |
+| `ModuleNotFoundError: pypdfium2` | Remote build did not install it | Confirm `pypdfium2` is in `functionapp/requirements.txt` and that publish used `--build remote` |
 | Stuck `PRINT_PENDING`, nothing prints | Nothing is delivering jobs to the device | [`live-test.md`](live-test.md) stage 1 |
 | Counts in the workbook look low | Adaptive sampling got enabled | Step 8 |
 
@@ -510,15 +608,19 @@ cause and verified the fix.
 ## Appendix — one-page checklist
 
 ```
+[ ]  0  e2e-testing.md Part A: a page came out of the tray, NOT cropped
+[ ]  0  az reaches Azure through the truststore wrapper (az group list works)
 [ ]  1  Entra app: public client flows ON, 5 delegated permissions, admin consent
 [ ]  2  SharePoint: 4 columns exist, Print_Status INDEXED, approval state known
-[ ]  3  Resources: RG, storage, Flex Consumption app, App Insights, Key Vault
+[ ]  3  Resources: RG, storage, Flex Consumption app ($PYVER from the platform),
+        App Insights, Key Vault
 [ ]  4  RBAC: app identity = Key Vault Secrets OFFICER (not User)
 [ ]  5  bootstrap_token.py run as the SERVICE ACCOUNT; secret exists in the vault
-[ ]  6  App settings set; PRINT_REFRESH_TOKEN absent; sampling off
-[ ]  7  pytest green, then publish --build remote; 3 functions listed
+[ ]  6  App settings set incl. PRINT_RASTER_*; PRINT_REFRESH_TOKEN absent; sampling off
+[ ]  7  pytest green (357); token pre-warmed; publish --build remote; 3 functions listed
 [ ]  8  Settings read BACK; defaultHostName captured; key captured
-[ ]  9  badpayload 400 · dryrun · one real file · READ THE COLUMNS · PRINT_EVENT in AI
+[ ]  9  badpayload 400 · dryrun shows conversion=pdf-to-pwg-raster · one real file ·
+        READ THE COLUMNS · READ THE PAPER · PRINT_EVENT in AI
 [ ] 10  Flows A-D created; A loops on remainingReady with an iteration cap
 [ ] 11  Silence alert created
 ```

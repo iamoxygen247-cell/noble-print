@@ -151,32 +151,16 @@ class FakeGraph:
         }
         return self.items[item_id]
 
-    def use_real_printer(self) -> Dict[str, Any]:
-        """Replace the invented share with Noble's actual Universal Print
-        registration (tests/fixtures/printer_brother_dcp_l2540dw.json).
+    def use_capabilities(self, **capabilities: Any) -> Dict[str, Any]:
+        """Replace the share's reported capabilities.
 
-        The point is not realism for its own sake: the real printer id and share
-        id are two different GUIDs, so a test that mixes them up fails with a
-        legible diff rather than with two lookalike placeholders. That is the
-        defect F3 shape.
+        The printer-specific fixture this used to load was removed with the
+        retired device. Tests that need a particular capability shape -- a
+        PWG-raster-only printer, say -- state it here rather than depending on
+        one recorded registration.
         """
-        data = load_fixture("printer_brother_dcp_l2540dw.json")
-        share = data["share"]
-
-        self.SHARE_ID = share["id"]
-        self.PRINTER_ID = share["printer"]["id"]
-        self.share = {
-            "id": share["id"],
-            "displayName": share["displayName"],
-            "isAcceptingJobs": share["isAcceptingJobs"],
-            "capabilities": {
-                "contentTypes": list(share["capabilities"]["contentTypes"]),
-            },
-            "status": dict(share["status"]),
-            "printer": {"id": share["printer"]["id"]},
-        }
-        self.shares = {share["id"]: self.share}
-        return data
+        self.share["capabilities"] = dict(capabilities)
+        return self.share
 
     def add_share(self, share_id: str, *, printer_id: str,
                   display_name: str = "Second printer",

@@ -141,18 +141,16 @@ Copy-Item functionapp\local.settings.json.template functionapp\local.settings.js
 | **Share Id** | `4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5` — pass this as `printerShareId`; it addresses jobs |
 | **Printer Id** | `cf8d9fa1-0502-4b0d-b28e-22a52cdde8a1` — used only to cancel a job; the app resolves it itself |
 
-> ## ⚠️ This printer cannot print PDFs yet
+> ## This printer takes raster only — the app converts
 >
-> It reports **`image/pwg-raster` and nothing else** (verified against the live API,
-> 2026-08-31). Every command in this README that submits a PDF will fail at
-> preflight with *"does not accept application/pdf"* until the PDF → PWG-raster
-> conversion is built. Universal Print will not convert for us: it only converts
-> **OXPS → PDF**, and only for printers that already accept PDF.
+> It reports **`image/pwg-raster` and nothing else** (verified against the live
+> API). Universal Print will not convert for us: it performs exactly one
+> conversion, **OXPS → PDF**, and only for printers that already accept PDF. So
+> the app rasterizes each PDF before upload — see **Printer profiles** below.
 >
-> The predecessor, the Brother DCP-L2540DW (share `a11f0263-…`, printer
-> `ffa65a34-…`), accepted `application/pdf` and `application/oxps` and worked
-> end to end. It was retired because it is not a Universal Print ready device.
-> Its fixture is kept in `tests/` as the PDF-passthrough test case.
+> The predecessor, a Brother DCP-L2540DW, accepted `application/pdf` directly. It
+> was retired because it is not a Universal Print ready device, and its
+> identifiers have been removed from this repo.
 
 They are different GUIDs and are **not** interchangeable. Jobs live at
 `/print/shares/{shareId}/jobs`, but cancel is documented only at
@@ -226,6 +224,44 @@ Settings. "It works locally" is not evidence about the deployed app.
 `PRINT_REFRESH_TOKEN` in `local.settings.json` is a local escape hatch so
 `func start` works without Key Vault access. It logs a warning on every use, so
 if it ever reaches Azure the evidence is in Application Insights.
+
+## Printer profiles — how a document is prepared
+
+`functionapp/printing/` decides what to upload for a given printer. A **profile**
+pairs a conversion with the job configuration that makes its output print
+correctly, because those two are one unit and not separable:
+
+| Profile | When it runs | Uploads |
+|---|---|---|
+| `passthrough` | the printer already accepts the document | the original bytes, `{"copies": 1}` |
+| `pdf-to-pwg-raster` | the printer reports `image/pwg-raster` but not PDF | an 8-bit greyscale PWG raster at 300 dpi, plus the settings below |
+
+The raster is rendered **full-bleed at the exact media size** — US Letter at
+300 dpi is always 2550×3300 — and deliberately does *not* inset the printer's
+unprintable margins. The job configuration compensates with `scaling: fit` and the
+device's reported margins. Change one without the other and pages print cropped;
+`tests/test_printing.py` pins the pair.
+
+```
+functionapp/printing/
+├── __init__.py        select_profile() and the PROFILES registry
+├── pwg_converter.py   PDF -> PWG 5102.4, with its own independent validator
+├── profiles.py        the profiles and their job configuration
+├── sender.py          convert, then hand to universal_print.py
+└── __main__.py        python -m printing INPUT.pdf OUTPUT.pwg --dpi 300
+```
+
+**Adding a printer** is a new profile class plus one entry in `PROFILES`. No route
+changes: `function_app.py` asks for a profile and never branches on a MIME type.
+
+Rendering uses **pypdfium2** (BSD-3/Apache-2.0, self-contained manylinux wheels).
+The PWG encoding is standard library only. Nothing native is installed on the
+host, which matters because Flex Consumption has no custom-container path.
+
+`python -m printing` produces a `.pwg` on disk for bench-testing a printer without
+SharePoint, Graph or the Function App. `scripts/test.py dryrun` reports which
+profile a share would select and the exact job configuration it would send —
+use it to find out a printer needs conversion *before* queueing any files.
 
 ## What a local run cannot prove
 
