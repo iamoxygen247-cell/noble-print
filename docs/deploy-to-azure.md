@@ -20,7 +20,7 @@ forgetting any of the others produces a working-looking app that does nothing.
 |---|---|---|---|
 | 1 | Entra app registration + admin consent | portal / `az ad` | every call 500s on auth |
 | 2 | SharePoint column index | SharePoint UI | **every query fails** |
-| 3 | Azure resources + RBAC | `az` | app cannot read its own secret |
+| 3 | Azure resources + RBAC | **Azure portal** | app cannot read its own secret |
 | 4 | Refresh token in Key Vault | `bootstrap_token.py` | every call 500s with a remedy message |
 | 5 | Function code | `func … publish` | — |
 | 6 | Application settings | `az … appsettings set` | app raises on missing config |
@@ -28,12 +28,35 @@ forgetting any of the others produces a working-looking app that does nothing.
 
 ### Prerequisites on your machine
 
+**Read the TLS note below before running any `az` command that touches the
+network** — including `az extension add`. Then:
+
 ```powershell
-az --version          # Azure CLI
+az --version          # Azure CLI          -- 2.87.0 is verified sufficient
 func --version        # Azure Functions Core Tools v4
+
 az login
-az account set --subscription "<SUBSCRIPTION_NAME_OR_ID>"
+
+# Several subscriptions are visible. Confirm you are in the right one BEFORE
+# creating anything -- there is no undo for resources in the wrong place.
+az account set --subscription "dev-Document Intelligence"
+az account show --query "{name:name, id:id, tenantId:tenantId}" -o table
 ```
+
+> **No CLI extensions are needed.** Step 3 creates the infrastructure in the
+> portal, so `az monitor app-insights` — which lives in the `application-insights`
+> extension and is *not* in the CLI core — never gets called. If you later script
+> the App Insights parts, install it first or you get
+> `ERROR: 'app-insights' is misspelled or not recognized by the system`; upgrading
+> the CLI does not help, as that group has never been in core.
+
+> **Do not run `az upgrade` during a deployment.** The CLI will offer it; decline.
+> On Windows the upgrade reinstalls the MSI, replacing
+> `C:\Program Files\Microsoft SDKs\Azure\CLI2\python.exe` — the exact interpreter
+> the truststore wrapper below invokes by absolute path — and it downloads that MSI
+> through the same inspecting proxy described below. A half-finished upgrade leaves
+> you with no working CLI mid-deploy. Upgrade afterwards, deliberately, then
+> re-verify with `az group list`.
 
 > ### ⚠️ `az` and the TLS-inspecting proxy — read before the first `az` command
 >
@@ -64,13 +87,42 @@ az account set --subscription "<SUBSCRIPTION_NAME_OR_ID>"
 > on heavier responses. **Retry**; it is not a wrong name or a missing resource.
 > Full write-up in [`ai/troubleshooting.md`](ai/troubleshooting.md).
 
+### The target subscription — confirmed 2026-08-31
+
+| | |
+|---|---|
+| Subscription | **dev-Document Intelligence** |
+| Subscription ID | `28e61545-cf6b-4c7c-9a6f-e31dfcc050a9` |
+| Directory | Noble & Associates Property Management (`noblehomes.ca`) |
+| **Tenant ID** | `ce21d3c3-2ce8-4fa8-bb57-69da9b3e7c91` |
+| Status | Active, Azure Plan |
+| **Your role** | **Owner** |
+
+Two of those are load-bearing:
+
+- **The tenant id is `$TENANT_ID` in step 1.** No need to re-read it from the app
+  registration blade — it is the same value, confirmed from three places: the
+  portal, `az account show`, and `live-printer-check.ps1`.
+- **Owner is what step 4 needs.** Creating role assignments requires *Owner* or
+  *User Access Administrator*; *Contributor* cannot do it, and the failure comes
+  late, at the Key Vault grant, after the resources already exist.
+
+These are resource identifiers, not credentials — useless without a token. No
+secret belongs in this file.
+
+> **This subscription is shared** with the sibling invoice project
+> (`rg-content-understanding-dev`, plus storage accounts and app-service plans, all
+> in **westus**). Everything here goes in its own resource group, `rg-noble-print`,
+> so the two never entangle while sitting in the same region.
+
 ### Names used below
 
-Set these once and paste the rest verbatim.
+**Step 3 creates these in the Azure portal.** Set the variables in PowerShell too
+— steps 5 to 9 use them — but nothing here creates anything.
 
 ```powershell
 $RG        = "rg-noble-print"
-$LOC       = "canadacentral"
+$LOC       = "westus"                    # portal shows this as "West US"
 $APP       = "func-noble-print"          # must be globally unique
 $STORAGE   = "stnobleprint"              # 3-24 lowercase alphanumerics, globally unique
 $VAULT     = "kv-noble-print"            # globally unique
@@ -78,6 +130,12 @@ $INSIGHTS  = "appi-noble-print"
 $WORKSPACE = "log-noble-print"
 $SECRET    = "up-print-refresh-token"
 ```
+
+> **Region: West US**, to sit with the rest of the estate — the sibling invoice
+> project's Function App, storage and app-service plans are all in westus. Flex
+> Consumption offers Python 3.10–3.14 there (verified 2026-08-31), so nothing is
+> given up by co-locating. Every resource below goes in **westus**; a resource in
+> the wrong region cannot be moved, only recreated.
 
 ---
 
@@ -94,7 +152,7 @@ documented `Application: Not supported`.
    - → **Register**
 
 2. **Authentication → Advanced settings → Allow public client flows → Yes → Save.**
-   Without this the device-code sign-in in step 4 cannot start.
+   Without this the device-code sign-in in step 5 cannot start.
 
 3. **API permissions → Add a permission → Microsoft Graph → Delegated**, add:
 
@@ -112,22 +170,23 @@ documented `Application: Not supported`.
    > Do **not** add `PrintConnector.Read.All`. Only the diagnostic script wants
    > it; the app deliberately does not.
 
-4. Copy from **Overview**:
+4. Copy the **Application (client) ID** from **Overview**. The tenant id is
+   already known, so only one value is new here:
 
 ```powershell
-$TENANT_ID = "<Directory (tenant) ID>"
-$CLIENT_ID = "<Application (client) ID>"
+$TENANT_ID = "ce21d3c3-2ce8-4fa8-bb57-69da9b3e7c91"   # confirmed, step 0
+$CLIENT_ID = "<Application (client) ID>"              # from this registration
 ```
 
 ### The service account
 
-Whoever signs in at step 4 **owns every print job**. Use a dedicated account, not
+Whoever signs in at step 5 **owns every print job**. Use a dedicated account, not
 a person's. Its lifecycle is now load-bearing:
 
 - The refresh token lasts **90 days**, rolling.
 - It is revoked by a password change, a self-service reset, an admin reset, or an
   explicit revocation. **Password expiry alone does not revoke it.**
-- Exclude the account from password-expiry policy, or diarise re-running step 4.
+- Exclude the account from password-expiry policy, or diarise re-running step 5.
 
 ---
 
@@ -163,136 +222,200 @@ content approval on would need a `_ModerationStatus`-aware query and the
 
 ---
 
-## 3. Azure resources
+## 3. Azure resources — in the portal
 
-### 3.1 Resource group and storage
+Done in the **Azure portal**, not the CLI. Everything goes in **West US**.
 
-```powershell
-az group create --name $RG --location $LOC
+> Portal wording drifts between releases. Where a label below does not match what
+> you see, match on *meaning* — the values are what matter, not the exact caption.
 
-az storage account create `
-    --name $STORAGE --resource-group $RG --location $LOC `
-    --sku Standard_LRS --allow-blob-public-access false
-```
+Throughout: **Subscription** = `dev-Document Intelligence`, **Region** = **West US**.
 
-### 3.2 Pick a supported Python runtime
+### 3.1 Resource group
 
-**Do not guess this, and do not copy a version from a blog.** Ask the platform:
+**Portal → Resource groups → + Create**
 
-```powershell
-az functionapp list-flexconsumption-runtimes --location $LOC --runtime python `
-    --query "[].{version:version, sku:sku.name}" -o table
-```
+| Field | Value |
+|---|---|
+| Subscription | `dev-Document Intelligence` |
+| Resource group | `rg-noble-print` |
+| Region | **West US** |
 
-Use a version that command actually returns.
+→ **Review + create** → **Create**.
 
-**Verified 2026-08-31 for `canadacentral`** (and `westus`), so you can expect:
+A dedicated group is not tidiness: it is what lets you delete the entire
+experiment in one action, and it keeps this app from entangling with the sibling
+invoice project that shares the subscription.
 
-```
-3.14, 3.13, 3.12, 3.11, 3.10
-```
+### 3.2 Storage account
 
-> An earlier revision of this runbook said "Azure will almost certainly offer
-> something lower" than the local venv's 3.14.7. That is **no longer true** — 3.14
-> is offered. Ask the platform anyway; the point of the command is that the answer
-> changes.
+**Portal → Storage accounts → + Create**
 
-```powershell
-$PYVER = "3.14"   # matches the local venv; confirm against the command above
-```
+| Field | Value |
+|---|---|
+| Resource group | `rg-noble-print` |
+| Storage account name | `stnobleprint` (3–24 lowercase alphanumerics, globally unique) |
+| Region | **West US** |
+| Performance | Standard |
+| Redundancy | **LRS** (Locally-redundant) |
 
-**3.14 is the recommendation.** It matches `.venv` (3.14.7), so what the offline
-suite exercises and what the platform runs are the same minor version. The sibling
-project has run 3.14 on Flex Consumption since 2026-08-20.
+On the **Advanced** tab: **Allow blob public access → Disabled**.
+
+→ **Review + create** → **Create**.
+
+The Function App needs this for its own host state and for the deployment package.
+LRS is deliberate — this holds no business data, only runtime bookkeeping.
+
+### 3.3 Which Python version?
+
+The portal only offers versions the platform supports, so the dropdown is the
+answer. Verified for **West US**, 2026-08-31: **3.14, 3.13, 3.12, 3.11, 3.10**.
+
+**Choose 3.14.** It matches the local `.venv` (3.14.7), so the offline suite and
+the platform run the same minor version. The sibling project has run 3.14 on Flex
+Consumption since 2026-08-20.
 
 > Core Tools 4.12.0 prints *"Remote build for Python 3.14 is not yet supported for
-> Flex"* during publish. That warning is **stale and non-blocking** — the sibling
-> project verified the build succeeds anyway. Do not downgrade the runtime to
-> silence it, and do not chase a newer Core Tools for it.
+> Flex"* during step 7. That warning is **stale and non-blocking** — the sibling
+> verified the build succeeds anyway. Do not downgrade the runtime to silence it.
 
-Either way the mismatch question is moot with remote build: the platform
-reinstalls from `requirements.txt` server-side against *its* runtime, so no local
-wheel is ever shipped.
+The local/platform version question is moot regardless: remote build reinstalls
+from `requirements.txt` server-side against *its* runtime, so no local wheel ships.
 
-### 3.3 Function App (Flex Consumption)
+### 3.4 Function App — Flex Consumption
 
-Flex Consumption, not Consumption: **the Linux Consumption plan is retiring on
-30 September 2028 and is receiving no new language versions.**
+**Portal → Function App → + Create → Flex Consumption**
 
-```powershell
-az functionapp create `
-    --resource-group $RG --name $APP --storage-account $STORAGE `
-    --flexconsumption-location $LOC `
-    --runtime python --runtime-version $PYVER `
-    --instance-memory 2048
-```
+The first screen asks you to pick a hosting option. Choose **Flex Consumption**,
+not Consumption: the Linux Consumption plan is retiring on 30 September 2028 and
+receives no new language versions.
 
-### 3.4 Application Insights
+**Basics**
 
-```powershell
-az monitor log-analytics workspace create `
-    --resource-group $RG --workspace-name $WORKSPACE --location $LOC
+| Field | Value |
+|---|---|
+| Resource group | `rg-noble-print` |
+| Function App name | `func-noble-print` (globally unique) |
+| Region | **West US** |
+| Runtime stack | **Python** |
+| Version | **3.14** |
+| Instance size / memory | **2048 MB** |
 
-$WS_ID = az monitor log-analytics workspace show `
-    --resource-group $RG --workspace-name $WORKSPACE --query id -o tsv
+**Storage** — select the existing `stnobleprint`.
 
-az monitor app-insights component create `
-    --app $INSIGHTS --location $LOC --resource-group $RG `
-    --workspace $WS_ID --application-type web
+**Monitoring** — **Enable Application Insights: Yes**, and let it create
+`appi-noble-print` (it also creates the Log Analytics workspace).
 
-$AI_CONN = az monitor app-insights component show `
-    --app $INSIGHTS --resource-group $RG --query connectionString -o tsv
-```
+> Doing App Insights here rather than separately is worth it: the portal wires
+> `APPLICATIONINSIGHTS_CONNECTION_STRING` into the app settings for you. Created
+> standalone, you have to copy the connection string across by hand in step 6, and
+> a missed one produces an app that runs and reports nothing.
+
+**Networking** — defaults. Public access is fine; the endpoints are protected by
+the function key.
+
+→ **Review + create** → **Create**. This takes a few minutes.
+
+**Instance memory** is 2048 MB deliberately: rasterizing a PDF page holds a bitmap
+in memory, and 512 MB is tight for a multi-page invoice. It can be changed later
+under **Settings → Scale and concurrency**.
 
 ### 3.5 Key Vault
 
-```powershell
-az keyvault create `
-    --name $VAULT --resource-group $RG --location $LOC `
-    --enable-rbac-authorization true
-```
+**Portal → Key Vaults → + Create**
+
+| Field | Value |
+|---|---|
+| Resource group | `rg-noble-print` |
+| Key vault name | `kv-noble-print` (globally unique) |
+| Region | **West US** |
+| Pricing tier | Standard |
+| **Permission model** | **Azure role-based access control (RBAC)** |
+
+→ **Review + create** → **Create**.
+
+> **The permission model matters.** Step 4 grants a *role*; if the vault is left on
+> the legacy **access policy** model those role assignments have no effect and the
+> app gets 403 at runtime, with nothing in the code to blame.
+
+### 3.6 Confirm what exists
+
+**Portal → Resource groups → `rg-noble-print` → Overview.** Expect five resources,
+all **West US**:
+
+| Resource | Type |
+|---|---|
+| `stnobleprint` | Storage account |
+| `func-noble-print` | Function App |
+| `appi-noble-print` | Application Insights |
+| `log-noble-print` (or an auto-generated name) | Log Analytics workspace |
+| `kv-noble-print` | Key vault |
 
 ---
 
-## 4. Identity and RBAC
+## 4. Identity and RBAC — in the portal
 
 The single most common cause of "it worked in dev": identical code, missing role.
 
-```powershell
-# System-assigned managed identity for the app
-az functionapp identity assign --resource-group $RG --name $APP
+### 4.1 Turn on the app's managed identity
 
-$PRINCIPAL = az functionapp identity show `
-    --resource-group $RG --name $APP --query principalId -o tsv
+**Portal → `func-noble-print` → Settings → Identity → System assigned**
 
-$VAULT_ID = az keyvault show --name $VAULT --resource-group $RG --query id -o tsv
+Set **Status → On** → **Save** → **Yes**.
 
-# Secrets OFFICER, not User: rotation WRITES the new refresh token back.
-az role assignment create `
-    --assignee-object-id $PRINCIPAL --assignee-principal-type ServicePrincipal `
-    --role "Key Vault Secrets Officer" --scope $VAULT_ID
-```
+Copy the **Object (principal) ID** that appears. That is the identity you grant
+access to next.
 
-> `Key Vault Secrets User` grants **read only**. The app redeems the refresh
-> token and Entra returns a *new* one, which must be stored. With read-only
-> access rotation fails silently every run and the pipeline stops working after
-> ~90 days, with nothing in the code to blame.
+### 4.2 Grant the app access to the vault
 
-Grant yourself the same role so step 5 can write the secret:
+**Portal → `kv-noble-print` → Access control (IAM) → + Add → Add role assignment**
 
-```powershell
-$ME = az ad signed-in-user show --query id -o tsv
-az role assignment create `
-    --assignee-object-id $ME --assignee-principal-type User `
-    --role "Key Vault Secrets Officer" --scope $VAULT_ID
-```
+| | |
+|---|---|
+| Role | **Key Vault Secrets Officer** |
+| Assign access to | **Managed identity** |
+| Members | Your Function App, `func-noble-print` |
 
-Verify:
+→ **Review + assign**.
 
-```powershell
-az role assignment list --scope $VAULT_ID `
-    --query "[].{who:principalName, role:roleDefinitionName}" -o table
-```
+> **Officer, not User.** `Key Vault Secrets User` is **read only**. The app redeems
+> the refresh token and Entra returns a *new* one, which must be written back. With
+> read-only access, rotation fails silently on every run and the pipeline stops
+> working after about 90 days — with nothing in the code to blame and no error
+> until it is already broken. This is the single highest-cost mistake in this
+> runbook.
+
+### 4.3 Grant yourself the same role
+
+Step 5 writes the secret from your machine, as you.
+
+**Same blade → + Add → Add role assignment**
+
+| | |
+|---|---|
+| Role | **Key Vault Secrets Officer** |
+| Assign access to | **User, group, or service principal** |
+| Members | your own account |
+
+→ **Review + assign**.
+
+> Being subscription **Owner** is not enough. Owner grants management-plane rights
+> over the vault; reading and writing *secrets* is a data-plane action and needs
+> this role explicitly.
+
+### 4.4 Verify
+
+**Portal → `kv-noble-print` → Access control (IAM) → Role assignments.**
+
+Both rows must be present and read **Key Vault Secrets Officer**:
+
+| Who | Role |
+|---|---|
+| `func-noble-print` (managed identity) | Key Vault Secrets Officer |
+| you | Key Vault Secrets Officer |
+
+Role assignments can take a minute or two to take effect. If step 5 fails with a
+403, wait and retry before changing anything.
 
 ---
 
@@ -338,9 +461,18 @@ az functionapp config appsettings set --resource-group $RG --name $APP --setting
     "PRINT_BUDGET_SECONDS=90" `
     "GRAPH_TIMEOUT_SECONDS=30" `
     "PRINT_RASTER_DPI=300" `
-    "PRINT_RASTER_MAX_BYTES=33554432" `
-    "APPLICATIONINSIGHTS_CONNECTION_STRING=$AI_CONN"
+    "PRINT_RASTER_MAX_BYTES=33554432"
 ```
+
+> **`APPLICATIONINSIGHTS_CONNECTION_STRING` is deliberately absent here** — the
+> portal wired it in when you enabled Application Insights during step 3.4. Setting
+> it again by hand risks overwriting a correct value with a stale one. Confirm it is
+> present in step 8; if it is missing, App Insights was not enabled on the Function
+> App and the app will run while reporting nothing.
+
+Prefer the portal? **`func-noble-print` → Settings → Environment variables →
+App settings** takes the same names and values one at a time. The CLI form is a
+single idempotent command, which is why it is the default here.
 
 `PRINT_RASTER_*` apply only to printers that need rasterizing — see **Printer
 profiles** in `README.md`. 300 dpi is what this printer was proven with; a Letter
@@ -437,6 +569,17 @@ Expected:
 | `PRINT_RASTER_DPI` | `300` |
 | `PRINT_RASTER_MAX_BYTES` | `33554432` |
 | `PRINT_REFRESH_TOKEN` | **absent** |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | **present** — set by the portal in 3.4, not by step 6. Missing means App Insights was never enabled on the app, and every count in the weekly report will be empty |
+
+The query above filters by prefix, so widen it to see the App Insights row:
+
+```powershell
+az functionapp config appsettings list --resource-group $RG --name $APP `
+    --query "[?name=='APPLICATIONINSIGHTS_CONNECTION_STRING'].name" -o tsv
+```
+
+Or read the whole set in the portal: **`func-noble-print` → Settings →
+Environment variables**.
 
 Confirm sampling is off — if adaptive sampling is on, every count in the weekly
 report is quietly wrong:
@@ -610,13 +753,18 @@ cause and verified the fix.
 ```
 [ ]  0  e2e-testing.md Part A: a page came out of the tray, NOT cropped
 [ ]  0  az reaches Azure through the truststore wrapper (az group list works)
+[ ]  0  az account show = dev-Document Intelligence (28e61545-...); role = Owner
+[ ]  0  did NOT run az upgrade
 [ ]  1  Entra app: public client flows ON, 5 delegated permissions, admin consent
-[ ]  2  SharePoint: 4 columns exist, Print_Status INDEXED, approval state known
-[ ]  3  Resources: RG, storage, Flex Consumption app ($PYVER from the platform),
-        App Insights, Key Vault
-[ ]  4  RBAC: app identity = Key Vault Secrets OFFICER (not User)
+[ ]  2  SharePoint: 4 columns exist, Print_Status INDEXED (approval already checked: off)
+[ ]  3  PORTAL, all WEST US: RG, storage, Flex Consumption app (Python 3.14,
+        2048 MB, App Insights ENABLED in the wizard), Key Vault on the RBAC
+        permission model -- 5 resources in the group
+[ ]  4  PORTAL: app managed identity ON; app AND you = Key Vault Secrets OFFICER
+        (not User) on the vault
 [ ]  5  bootstrap_token.py run as the SERVICE ACCOUNT; secret exists in the vault
-[ ]  6  App settings set incl. PRINT_RASTER_*; PRINT_REFRESH_TOKEN absent; sampling off
+[ ]  6  App settings set incl. PRINT_RASTER_*; PRINT_REFRESH_TOKEN absent;
+        APPLICATIONINSIGHTS_CONNECTION_STRING present (from 3.4); sampling off
 [ ]  7  pytest green (357); token pre-warmed; publish --build remote; 3 functions listed
 [ ]  8  Settings read BACK; defaultHostName captured; key captured
 [ ]  9  badpayload 400 · dryrun shows conversion=pdf-to-pwg-raster · one real file ·
