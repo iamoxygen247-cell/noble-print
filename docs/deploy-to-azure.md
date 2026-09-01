@@ -571,14 +571,22 @@ cd ..
 Remote build reinstalls from `requirements.txt` on the platform, so no local venv
 or wheel is shipped and native packages are resolved for the target OS.
 
-> **The one new dependency worth checking.** `requirements.txt` now includes
-> `pypdfium2` for the PDF → PWG-raster conversion. It publishes a
-> `py3-none-manylinux_2_17_x86_64` wheel — **verified present for 5.13.0** — so it
-> is Python-version agnostic and needs no compiler on the platform. Nothing native
-> is installed on the host, which matters because Flex Consumption has no
-> custom-container path. If a future version drops the manylinux wheel, remote
-> build will try to compile and fail; pin a working version rather than widening
-> the range.
+> **The one new dependency worth checking.** `requirements.txt` includes
+> `pypdfium2` for the PDF → PWG-raster conversion, **pinned exactly at 5.13.0**.
+> It publishes a `py3-none-manylinux_2_17_x86_64` wheel — **verified present for
+> 5.13.0** — so it is Python-version agnostic and needs no compiler on the
+> platform. Nothing native is installed on the host, which matters because Flex
+> Consumption has no custom-container path.
+>
+> **The pin is load-bearing, and it is the only dependency here that is pinned.**
+> Remote build re-resolves `requirements.txt` on the platform, so a range would
+> let a later publish of the *same commit* install a newer pdfium than the offline
+> suite ever ran against. pdfium may legitimately change its rasterization between
+> releases, and the only guard is the byte-exact output hash in
+> `tests/test_printing.py` — which is meaningful only while the deployed version
+> equals the tested one. To upgrade: bump the pin, run `pytest`, and if the hash
+> test fails, print one page (`docs/e2e-testing.md` Part A) and confirm the device
+> accepts it before updating `FIXTURE_SHA256_300DPI`.
 >
 > The `functionapp/printing/` package ships automatically — it is inside the
 > published folder, and `.funcignore` excludes only `tests/`, `.venv/`,

@@ -29,4 +29,16 @@ tzdata>=2024.1
 # to be installed on the host. That matters because Flex Consumption has no
 # custom-container path and binaries shipped in the package are unsupported
 # there. The PWG encoding itself is stdlib (printing/pwg_converter.py).
-pypdfium2>=5,<6
+#
+# PINNED EXACTLY, not ranged. Remote build re-resolves requirements.txt on the
+# platform at publish time, so a range would let Azure install a pdfium newer
+# than the one the offline suite ran against -- and pdfium may legitimately
+# change its rasterization between releases. The guard against that is a
+# byte-exact hash of the converted output
+# (tests/test_printing.py::test_the_conversion_is_byte_identical_to_the_pinned_output),
+# and that hash is only meaningful if the deployed version equals the tested one.
+#
+# To upgrade: bump this pin, run pytest, and if the hash test fails, print one
+# page (docs/e2e-testing.md Part A) and confirm the device accepts it BEFORE
+# updating FIXTURE_SHA256_300DPI. The pin and the hash move together.
+pypdfium2==5.13.0
