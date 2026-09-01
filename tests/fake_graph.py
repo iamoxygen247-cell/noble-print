@@ -179,7 +179,8 @@ class FakeGraph:
 
     def add_job(self, job_id: str, state: str = "pending",
                 description: str = "", details: Optional[List[str]] = None,
-                acknowledged: Optional[str] = None) -> None:
+                acknowledged: Optional[str] = None,
+                created: Optional[str] = None) -> None:
         """A print job.
 
         `acknowledged` is printJob.acknowledgedDateTime -- "the dateTimeOffset
@@ -187,6 +188,11 @@ class FakeGraph:
         is precisely why the design spent months asserting the job "carries no
         timestamp": the only shape anyone tested against was this one. It is
         modelled now, and defaults to absent so the fallback path stays covered.
+
+        `created` is printJob.createdDateTime -- POLL'S STALL CLOCK. Absent by
+        default, which is the honest shape for a job whose age we cannot
+        establish, and which the decision logic must handle without guessing.
+        Pass `iso(minutes=...)` to make a job look stuck.
         """
         self.jobs[job_id] = {
             "id": job_id,
@@ -201,6 +207,8 @@ class FakeGraph:
         }
         if acknowledged:
             self.jobs[job_id]["acknowledgedDateTime"] = acknowledged
+        if created:
+            self.jobs[job_id]["createdDateTime"] = created
 
     def fail_next(self, method: str, url_contains: str, *, status: int = 500,
                   payload: Any = None, times: int = 1) -> None:
@@ -358,7 +366,7 @@ class FakeGraph:
         item["fields"].update(body or {})
         item["version"] += 1
         item["eTag"] = '"{},{}"'.format(item_id, item["version"])
-        # SharePoint bumps the modified stamp on every write. Resubmit orders on
+        # SharePoint bumps the modified stamp on every write. Poll reads it as
         # it, so the fake must model it or the starvation test is meaningless.
         self._clock += 1
         item["lastModifiedDateTime"] = "2026-08-30T{:02d}:{:02d}:00Z".format(

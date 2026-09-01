@@ -23,9 +23,15 @@ from datetime import datetime, timedelta, timezone
 NOW = datetime(2026, 8, 30, 21, 0, 0, tzinfo=timezone.utc)
 
 
-def iso(*, days: float = 0, hours: float = 0) -> str:
-    """A SharePoint createdDateTime that far before NOW."""
-    return (NOW - timedelta(days=days, hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+def iso(*, days: float = 0, hours: float = 0, minutes: float = 0) -> str:
+    """A timestamp that far before NOW.
+
+    Used for both SharePoint's createdDateTime and printJob.createdDateTime.
+    `minutes` matters for the retry schedule, whose first boundaries are five and
+    fifteen minutes apart.
+    """
+    return (NOW - timedelta(days=days, hours=hours, minutes=minutes)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _handler(name: str):
@@ -34,7 +40,6 @@ def _handler(name: str):
 
 SUBMIT = _handler("submit_print_jobs")
 POLL = _handler("poll_print_status")
-RESUBMIT = _handler("resubmit_print_jobs")
 
 
 def post(handler, payload: Any) -> func.HttpResponse:

@@ -320,7 +320,7 @@ The count must reach **zero**: a retired id has no business in a URL, a command,
 a default or a field value.
 
 **And the copies that are not in the repo:** the `printerShareId` in every Power
-Automate flow body (Submit and Resubmit), plus anything in `CLAUDE.local.md`.
+Automate flow body (Submit and Poll), plus anything in `CLAUDE.local.md`.
 Those fail the same way and no test catches them.
 
 Step 1 of `live-printer-check.ps1` now catches the 404 and lists the share ids

@@ -18,9 +18,14 @@ STANDARD LIBRARY ONLY -- it runs anywhere with no install step. It is not
 collected by pytest (pytest.ini scopes testpaths to tests/); it talks to a
 running host, which is exactly what the offline suite does not.
 
-Note that dryrun/stale are MODES OF THE ENDPOINTS, not logic in this file. A
-harness with its own code path proves nothing about the deployed app; going
-through the real endpoint exercises the real auth, resolution and queries.
+Note that dryrun is a MODE OF THE ENDPOINT, not logic in this file. A harness
+with its own code path proves nothing about the deployed app; going through the
+real endpoint exercises the real auth, resolution and queries.
+
+The retry knobs -- --stall-minutes, --give-up-days, --max-retries -- go into the
+request body exactly as Power Automate sends them, which is how the pacing is
+retuned without a deploy. Use them here to prove a change before putting it in a
+flow.
 """
 
 from __future__ import annotations
@@ -38,8 +43,6 @@ ROUTES = {
     "submit": "/api/print/submit",
     "dryrun": "/api/print/submit",
     "status": "/api/print/status",
-    "stale": "/api/print/status",
-    "resubmit": "/api/print/resubmit",
 }
 
 # Windows redirects stdout as cp1252, so a file name with an accent raises
@@ -125,24 +128,18 @@ def summarise(command: str, status: int, payload: dict) -> None:
                   "would submit nothing.")
         return
 
-    if command == "stale":
-        count = payload.get("staleCount", 0)
-        print("stale (past the {}-day window): {}".format(
-            payload.get("windowDays"), count))
-        for item in payload.get("staleItems") or []:
-            print("    {} {}  created {}  job {}".format(
-                item["itemId"], item["fileName"], item["created"],
-                item["jobId"] or "-"))
-        if count:
-            print("\nThese are excluded by BOTH status and resubmit, so nothing "
-                  "will touch them again. Handle them by hand.")
-        return
+    if command == "status" and "stallMinutes" in payload:
+        # Echoed by the endpoint, so this shows what was ACTUALLY in force rather
+        # than what the caller believes it sent -- the difference matters once the
+        # numbers live in a Power Automate flow instead of the code.
+        print("settings        : stall={}min giveUp={}d maxRetries={}".format(
+            payload.get("stallMinutes"), payload.get("giveUpDays"),
+            payload.get("maxRetries")))
 
     for key in ("candidatesFound", "remainingReady", "submitted", "failed",
-                "skipped", "checked", "completed", "stillRunning", "notFound",
-                "malformed", "awaitingResubmit", "uncheckedCount", "staleCount",
-                "resubmitted", "completedInstead", "cancelled",
-                "printerAvailable", "budgetExhausted"):
+                "skipped", "checked", "completed", "requeued", "gaveUp",
+                "stillRunning", "notFound", "malformed", "pendingFound",
+                "uncheckedCount", "printerAvailable", "budgetExhausted"):
         if key in payload:
             print("{:<16}: {}".format(key, payload[key]))
 
@@ -151,8 +148,9 @@ def summarise(command: str, status: int, payload: dict) -> None:
             item.get("itemId", "?"), item.get("result", "?"),
             item.get("message") or item.get("jobId") or item.get("fileName") or ""))
         # A job that printed but whose id could not be recorded. The document is
-        # on paper; SharePoint does not know it, so Resubmit will print it again.
-        # Nothing else in this output would tell you.
+        # on paper; SharePoint does not know it, so Poll reads the row as a
+        # crashed submission and requeues it within minutes. Nothing else in this
+        # output would tell you.
         if item.get("warning"):
             print("    !! {}".format(item["warning"]))
 
@@ -181,8 +179,14 @@ def main() -> int:
     parser.add_argument("--folder", default="")
     parser.add_argument("--printer-share-id", default="")
     parser.add_argument("--batch-size", type=int)
-    parser.add_argument("--window-days", type=int)
-    parser.add_argument("--min-age-hours", type=int)
+    # The retry knobs, sent in the body exactly as a Power Automate flow sends
+    # them -- so a value proved here can be pasted straight into the flow.
+    parser.add_argument("--give-up-days", type=int,
+                        help="status: fail a PRINT_PENDING row older than this")
+    parser.add_argument("--stall-minutes", type=int,
+                        help="status: a job idle this long counts as stalled")
+    parser.add_argument("--max-retries", type=int,
+                        help="status: most requeues one file may receive")
     parser.add_argument("--json", action="store_true", help="print the raw response")
     args = parser.parse_args()
 
@@ -200,16 +204,18 @@ def main() -> int:
         return 0
 
     body = {"library": args.library, "folder": args.folder}
-    if args.command in ("submit", "dryrun", "resubmit") and args.printer_share_id:
+    if args.command in ("submit", "dryrun") and args.printer_share_id:
         body["printerShareId"] = args.printer_share_id
     if args.command == "dryrun":
         body["dryRun"] = True
     if args.batch_size is not None:
         body["batchSize"] = args.batch_size
-    if args.window_days is not None:
-        body["windowDays"] = args.window_days
-    if args.min_age_hours is not None:
-        body["minAgeHours"] = args.min_age_hours
+    if args.give_up_days is not None:
+        body["giveUpDays"] = args.give_up_days
+    if args.stall_minutes is not None:
+        body["stallMinutes"] = args.stall_minutes
+    if args.max_retries is not None:
+        body["maxRetries"] = args.max_retries
 
     if args.command in ("submit", "dryrun") and not args.printer_share_id:
         parser.error("--printer-share-id is required for {}".format(args.command))

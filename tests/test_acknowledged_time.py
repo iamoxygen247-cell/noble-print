@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 
 import print_policy
 import universal_print
-from helpers import NOW, POLL, RESUBMIT, as_json, iso, post
+from helpers import NOW, POLL, as_json, iso, post
 
 BODY = {"library": "Documents", "folder": "/Invoices/ToPrint"}
 
@@ -85,6 +85,25 @@ def test_the_adapter_reads_acknowledged_date_time():
     assert universal_print.job_acknowledged_at(None) is None
 
 
+def test_the_adapter_reads_created_date_time():
+    """The other field the same live job exposed, and the one Poll's stall clock
+    runs on. Absent reads as None rather than as zero, so a job whose age cannot
+    be established is left alone instead of cancelled."""
+    assert universal_print.job_created_at(
+        {"createdDateTime": "2026-08-31T05:24:37Z"}) == "2026-08-31T05:24:37Z"
+    assert universal_print.job_created_at({}) is None
+    assert universal_print.job_created_at(None) is None
+
+
+def test_the_two_timestamps_are_not_confused():
+    """Both are on the same object and 26 seconds apart on the measured job.
+    Reading the wrong one would make every fresh job look stalled, or every
+    stalled job look fresh."""
+    job = {"createdDateTime": "2026-08-31T05:24:37Z",
+           "acknowledgedDateTime": ACK_ISO}
+    assert universal_print.job_created_at(job) != universal_print.job_acknowledged_at(job)
+
+
 # --- Poll ---------------------------------------------------------------------
 
 
@@ -127,19 +146,28 @@ def test_two_jobs_completing_in_one_run_get_their_own_timestamps(graph, frozen_n
     assert graph.field("2", "Print_Message") == "printed on 2026-08-30 22:39:31"
 
 
-# --- Resubmit -----------------------------------------------------------------
+# --- one writer, so nothing can disagree --------------------------------------
 
 
-def test_resubmit_marking_a_late_completion_uses_the_same_source(graph, frozen_now):
-    """Resubmit finding a job already completed writes the same message Poll
-    would have. Two code paths writing the same column must agree, or the audit
-    trail says different things depending on which endpoint got there first."""
+def test_a_late_completion_beyond_every_deadline_still_uses_the_printers_time(
+        graph, frozen_now):
+    """This used to assert that Resubmit's `completed_late` branch wrote the same
+    message as Poll -- two code paths on one column had to agree or the audit
+    trail would differ depending on which endpoint arrived first. Poll is now the
+    only writer, so that class of disagreement is gone by construction.
+
+    What still needs pinning is the ORDERING inside poll_decision: a job that
+    completed after the give-up deadline is recorded as printed, with the
+    printer's own timestamp, not failed. The paper came out.
+    """
     graph.add_item("1", status=print_policy.PENDING, job_id="1801",
-                   printer=graph.SHARE_ID, created=iso(days=5))
-    graph.add_job("1801", state="completed", acknowledged=ACK_ISO)
+                   printer=graph.SHARE_ID, created=iso(days=30))
+    graph.add_job("1801", state="completed", acknowledged=ACK_ISO,
+                  created=iso(days=30))
 
-    payload = as_json(post(RESUBMIT, dict(BODY, printerShareId=graph.SHARE_ID)))
+    payload = as_json(post(POLL, BODY))
 
-    assert payload["completedInstead"] == 1
+    assert payload["completed"] == 1
+    assert payload["gaveUp"] == 0, "a job that printed is never a failure"
     assert graph.field("1", "Print_Message") == "printed on 2026-08-30 22:25:03"
     assert len(graph.created_jobs()) == 0, "a completed job must never reprint"

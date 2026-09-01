@@ -451,8 +451,8 @@ def test_cancelling_an_already_gone_job_counts_as_success(client, graph):
 
 
 def test_a_failed_cancel_returns_false_rather_than_raising(client, graph):
-    """Best-effort by contract: the caller is already resubmitting, and refusing
-    to resubmit because the cancel failed would leave the document unprinted.
+    """Best-effort by contract: the caller is about to requeue the file, and
+    refusing to do so because the cancel failed would leave it unprinted.
     False is the signal that a duplicate print is possible."""
     graph.add_job("1825", state="stopped")
     graph.fail_next("POST", "/cancel", status=500, times=3)

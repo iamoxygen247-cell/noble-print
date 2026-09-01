@@ -513,8 +513,9 @@ az functionapp config appsettings set --resource-group $RG --name $APP --setting
     "SHAREPOINT_HOSTNAME=noblehomes.sharepoint.com" `
     "SHAREPOINT_SITE_PATH=/sites/PM" `
     "PRINT_BATCH_SIZE=5" `
-    "PRINT_STATUS_WINDOW_DAYS=20" `
-    "PRINT_RESUBMIT_MIN_AGE_HOURS=72" `
+    "PRINT_GIVE_UP_DAYS=10" `
+    "PRINT_STALL_MINUTES=5" `
+    "PRINT_MAX_RETRIES=10" `
     "PRINT_BUSINESS_TZ=America/Vancouver" `
     "PRINT_BUDGET_SECONDS=90" `
     "GRAPH_TIMEOUT_SECONDS=30" `
@@ -590,8 +591,13 @@ matters: it holds the local refresh token. Confirm what shipped:
 
 ```powershell
 az functionapp function list --resource-group $RG --name $APP --query "[].name" -o tsv
-# expect: submit_print_jobs, poll_print_status, resubmit_print_jobs
+# expect exactly two: submit_print_jobs, poll_print_status
 ```
+
+**Two, not three.** A `resubmit_print_jobs` in that list means an old build is
+still deployed. Fewer than two means the worker failed to index the app — usually
+a missing import or a `requirements.txt` problem — and the deploy will otherwise
+look like it succeeded.
 
 ### If publish misbehaves
 
@@ -621,8 +627,9 @@ Expected:
 | `KEY_VAULT_URI` | `https://kv-noble-print.vault.azure.net/` |
 | `SHAREPOINT_HOSTNAME` / `SHAREPOINT_SITE_PATH` | your site |
 | `PRINT_BATCH_SIZE` | `5` |
-| `PRINT_STATUS_WINDOW_DAYS` | `20` |
-| `PRINT_RESUBMIT_MIN_AGE_HOURS` | `72` |
+| `PRINT_GIVE_UP_DAYS` | `10` |
+| `PRINT_STALL_MINUTES` | `5` |
+| `PRINT_MAX_RETRIES` | `10` |
 | `PRINT_BUSINESS_TZ` | `America/Vancouver` |
 | `PRINT_RASTER_DPI` | `300` |
 | `PRINT_RASTER_MAX_BYTES` | `33554432` |
@@ -699,7 +706,7 @@ look perfect while the PATCH is failing.
 | `Print_Status` = `PRINT_PENDING` | `PRINT_COMPLETED` |
 | `Printer_Name` = the share id | unchanged |
 | `Print_JobId` = a short number (per-printer, starts near 1) | unchanged |
-| `Print_Message` = empty | `printed on 2026-08-30 09:14:07` |
+| `Print_Message` = **whatever it held before** (the claim no longer clears it) | `printed on 2026-08-30 09:14:07` — a completion **replaces** the column |
 
 **6. Confirm telemetry arrived** — the weekly report depends on it:
 
@@ -713,16 +720,44 @@ traces
 
 ## 10. Power Automate flows
 
-Four flows. Each calls the app with the function key in the `code` query
+**Three flows.** Each calls the app with the function key in the `code` query
 parameter. **No flow may ever write the four columns itself** — one writer only,
 or you get a race you will debug at 2 a.m.
 
 | Flow | Recurrence | Body |
 |---|---|---|
 | **A — Submit** | 15 min | `{"library":"AI_DropBox_V2026","folder":"/Backup/Invoice","printerShareId":"4429bf4e-…","batchSize":5}` |
-| **B — Poll** | 10 min | `{"library":"AI_DropBox_V2026","folder":"/Backup/Invoice"}` |
-| **C — Resubmit** | daily 02:00 | `{"library":"AI_DropBox_V2026","folder":"/Backup/Invoice","printerShareId":"4429bf4e-…"}` |
+| **B — Poll** | 10 min | `{"library":"AI_DropBox_V2026","folder":"/Backup/Invoice","giveUpDays":10,"stallMinutes":5,"maxRetries":10}` |
 | **D — Digest** | Mon 07:00 | SharePoint *Get items* per status; email the counts |
+
+> **There is no Flow C.** A daily Resubmit flow used to exist; recovery moved into
+> Flow B on 2026-09-01. If you are working from an older copy of this runbook, do
+> not create it — `POST /api/print/resubmit` returns 404.
+
+> **Run B before A** if you ever put them in one flow. Poll's requeue writes
+> `PRINT_READY`, which Submit consumes, so Poll-first makes a recovery actionable
+> in the same cycle instead of up to 15 minutes later. They are separate flows on
+> separate timers here, which is fine — this only matters if you merge them.
+
+### The three numbers in Flow B's body
+
+They are the whole reason the retry pacing lives in the flow rather than in app
+settings: **changing them needs no deploy and no app restart.** Each falls back to
+its app setting, then its built-in default, so omitting them is safe.
+
+| Key | Default | What it does |
+|---|---|---|
+| `stallMinutes` | 5 | How long a print job may sit before it counts as stalled. Also the base of the retry schedule: retry *n* falls due at `stallMinutes × (2ⁿ − 1)` |
+| `maxRetries` | 10 | Most requeues one file may get. Stops **new work** at about 3d 13h |
+| `giveUpDays` | 10 | When to stop waiting: cancel the outstanding job and write `PRINT_FAILED`. Stops **waiting** |
+
+Between the two bounds is a grace period of roughly 6½ days: no more jobs are
+created, but the last one stays live, so a printer that comes back still prints
+the document.
+
+An out-of-range value is a **400** — the response names the key and its range.
+The response also echoes all three back, so what was actually in force is visible
+in the run history rather than inferred from what you meant to send.
 
 Flow A must loop, because the batch is 5:
 
@@ -740,9 +775,11 @@ other test passes and the flow says nothing. That flag is the only thing in the
 response that distinguishes "nothing to print" from "nothing *can* print".
 
 **Poll's cadence is load-bearing.** If Universal Print discards a finished job
-before Poll sees it, Poll gets a 404, writes nothing, and Resubmit reprints the
-document 72 hours later. Measure how long finished jobs stay readable in your
-tenant and set the interval well inside it.
+before Poll sees it, Poll gets a 404, reads that as a stalled attempt, and
+requeues the document — printing it twice. Measure how long finished jobs stay
+readable in your tenant and keep the interval well inside it. The risk is set by
+this cadence, not by the retry schedule, but the reprint now arrives in minutes
+rather than three days, so there is less time to catch it by hand.
 
 Store the function key in the flow's HTTP action as a **secure input**, never in
 a description or a comment.
@@ -823,10 +860,14 @@ cause and verified the fix.
 [ ]  5  bootstrap_token.py run as the SERVICE ACCOUNT; secret exists in the vault
 [ ]  6  App settings set incl. PRINT_RASTER_*; PRINT_REFRESH_TOKEN absent;
         APPLICATIONINSIGHTS_CONNECTION_STRING present (from 3.4); sampling off
-[ ]  7  pytest green (357); token pre-warmed; publish --build remote; 3 functions listed
+[ ]  7  pytest green (389); token pre-warmed; publish --build remote; TWO functions
+        listed -- submit_print_jobs, poll_print_status (a third means an old build)
 [ ]  8  Settings read BACK; defaultHostName captured; key captured
 [ ]  9  badpayload 400 · dryrun shows conversion=pdf-to-pwg-raster · one real file ·
         READ THE COLUMNS · READ THE PAPER · PRINT_EVENT in AI
-[ ] 10  Flows A-D created; A loops on remainingReady with an iteration cap
+[ ]  9  e2e-testing.md Part C: printer off -> status shows requeued=1 and the host
+        logs `cancelled` THEN `requeued`; printer on -> exactly ONE sheet
+[ ] 10  Flows A, B, D created -- there is NO Flow C; A loops on remainingReady
+        with an iteration cap; B carries stallMinutes/maxRetries/giveUpDays
 [ ] 11  Silence alert created
 ```

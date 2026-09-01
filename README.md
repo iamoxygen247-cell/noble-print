@@ -61,13 +61,23 @@ cd "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"
 **Then open the library and read the four columns.** A 200 response is not proof
 the write landed.
 
-## The three endpoints
+## The two endpoints
 
 | Name | Route | What it does |
 |---|---|---|
 | **Submit** | `POST /api/print/submit` | Claims the oldest `PRINT_READY` files and creates print jobs |
-| **Poll** | `POST /api/print/status` | Checks `PRINT_PENDING` jobs and marks the finished ones |
-| **Resubmit** | `POST /api/print/resubmit` | Cancels and retries outstanding jobs older than 72 hours |
+| **Poll** | `POST /api/print/status` | Checks `PRINT_PENDING` jobs: marks the finished, requeues the stalled, fails the hopeless |
+
+Poll owns recovery. A stalled job is cancelled and the file handed back to
+`PRINT_READY` on an exponential schedule — retry *n* becomes due at
+`5 × (2ⁿ − 1)` minutes from the file's creation, so 5, 15, 35, 75 … — up to 10
+retries, then `PRINT_FAILED` after 10 days. Poll runs every 10 minutes, so the
+first requeue is observed at ≈10 min rather than ≈5. The pacing lives
+in the Power Automate request body (`stallMinutes`, `maxRetries`, `giveUpDays`),
+so it is retuned without a deploy.
+
+> A third endpoint, `POST /api/print/resubmit`, ran daily and would not touch a
+> file until it was 72 hours old. It was retired on 2026-09-01.
 
 ## The columns
 

@@ -7,6 +7,7 @@ the **code**, not the other docs — a few of those have drifted.
 
 | | Owner | Change it by | Redeploy? |
 |---|---|---|---|
+| 🎛️ | **Power Automate request body** | edit the flow's HTTP body (app setting is the fallback) | no |
 | 🔧 | **App — setting** | Function App application setting | no |
 | 🛠 | **App — code** | edit the constant in source | **yes** |
 | 📄 | **App — host.json** | edit `functionapp/host.json` | **yes** |
@@ -19,10 +20,11 @@ the **code**, not the other docs — a few of those have drifted.
 
 | Owner | Count | Examples |
 |---|---|---|
-| 🔧 App — setting | 5 | `GRAPH_TIMEOUT_SECONDS`, `PRINT_BUDGET_SECONDS`, the two windows |
+| 🔧 App — setting | 3 | `GRAPH_TIMEOUT_SECONDS`, `PRINT_BUDGET_SECONDS`, `PRINT_BUSINESS_TZ` |
+| 🎛️ **Flow body**, app setting as fallback | 4 | `batchSize`, `stallMinutes`, `maxRetries`, `giveUpDays` |
 | 🛠 App — code | 4 | retry attempts, backoff, `Retry-After` cap, token refresh margin |
 | 📄 App — host.json | 1 | `functionTimeout` (currently unset) |
-| 🔁 Power Automate | 4 | Flow A / B / C / D recurrences |
+| 🔁 Power Automate | 3 | Flow A / B / D recurrences |
 | 🔒 Azure / Microsoft | 6 | connector budget, token lifetimes, URL expiries, job retention |
 
 ---
@@ -89,41 +91,81 @@ Graph documents that adding one to the upload `PUT` "might result in an HTTP 401
 The download URL is fetched immediately before use and never cached, which is why
 `get_download_url` and `download` are two calls made back to back.
 
-## 5. Business windows — measured in UTC against `createdDateTime`
+## 5. The retry schedule — measured in UTC against `createdDateTime`
 
 | Timer | Value | Range | Owner | Defined in |
 |---|---|---|---|---|
-| `PRINT_STATUS_WINDOW_DAYS` | **20 days** | 1–365 | 🔧 setting + request `windowDays` | [print_policy.py:71](../functionapp/print_policy.py#L71) |
-| `PRINT_RESUBMIT_MIN_AGE_HOURS` | **72 hours** | 1–8760 | 🔧 setting + request `minAgeHours` | [print_policy.py:75](../functionapp/print_policy.py#L75) |
-| `PRINT_BUSINESS_TZ` | `America/Vancouver` | — | 🔧 setting | [print_policy.py:79](../functionapp/print_policy.py#L79) |
+| `PRINT_STALL_MINUTES` | **5 min** | 1–1440 | 🎛️ **request `stallMinutes`** + setting | [print_policy.py](../functionapp/print_policy.py) |
+| `PRINT_MAX_RETRIES` | **10** | 1–20 | 🎛️ **request `maxRetries`** + setting | [print_policy.py](../functionapp/print_policy.py) |
+| `PRINT_GIVE_UP_DAYS` | **10 days** | 1–365 | 🎛️ **request `giveUpDays`** + setting | [print_policy.py](../functionapp/print_policy.py) |
+| `PRINT_BUSINESS_TZ` | `America/Vancouver` | — | 🔧 setting | [print_policy.py](../functionapp/print_policy.py) |
 
-- **20 days** — trailing window. Poll and Resubmit *both* exclude rows outside it,
-  so a row stuck past 20 days is never touched again (**G1, the 20-day cliff**).
-  Poll reports them as `staleCount` / `staleItems` — the only automatic signal.
-- **72 hours** — gates Resubmit (R15), measured from file creation (R16).
-  Boundary is **inclusive**, so a file exactly 72 h old is eligible.
-- **`PRINT_BUSINESS_TZ` is display only** — the `printed on …` message. Window
+🎛️ means **the Power Automate flow body is the primary source**, ahead of the app
+setting. That is deliberate: the pacing of the whole retry schedule can be retuned
+by editing a flow, with no deploy and no app restart.
+
+**Retry `n` falls DUE at file age `PRINT_STALL_MINUTES × (2ⁿ − 1)`** — Poll acts
+on its next run, so observed times are quantised to Flow B's cadence:
+
+| Retry | Due at | | Retry | Due at |
+|---|---|---|---|---|
+| 1 | 5 min | | 6 | 5h 15m |
+| 2 | 15 min | | 7 | 10h 35m |
+| 3 | 35 min | | 8 | 21h 15m |
+| 4 | 1h 15m | | 9 | 1d 18h 35m |
+| 5 | 2h 35m | | 10 | 3d 13h 15m |
+
+- **5 minutes** is both the stall threshold — how long a *job* may sit without
+  finishing — and the base of the schedule above. One knob rescales everything.
+  Measured from `printJob.createdDateTime`, the job's own clock, so a SharePoint
+  edit cannot reset it.
+- **10 retries** bounds the **work**. Each requeue costs a render, a PDF→PWG
+  conversion and an upload, so this is what stops an undeliverable document from
+  consuming the printer's attention forever. Reached at about 3d 13h.
+- **10 days** bounds the **waiting**. Past it, Poll cancels the outstanding job and
+  writes `PRINT_FAILED` with a reason. Between the two bounds is a **grace period**
+  of roughly 6½ days in which no new work is done but the last job stays live — so
+  a printer that comes back still gets the document out.
+- **The retry count is never stored.** The schema is four columns with no attempt
+  counter; the count is derived from the file's age, and the current job's creation
+  time says how many retries preceded it.
+- **The polling cadence is the floor on the early boundaries.** Flow B runs every
+  10 minutes, so the 5- and 15-minute boundaries fall inside one interval: a
+  permanently stalled file produces **nine** requeue events, the first at ≈10 min,
+  carrying retry numbers 1 and 3–10. Lowering `PRINT_STALL_MINUTES` below the
+  recurrence does not speed the early retries up — only shortening the recurrence
+  does.
+
+- **`PRINT_BUSINESS_TZ` is display only** — the `printed on …` message. Schedule
   arithmetic never touches it, and the two paths are separate tested functions
   because mixing them is how daylight-saving bugs get in.
 
-> **Two clocks, easily conflated:**
-> `age = now − createdDateTime` — never changes; drives both windows above.
-> `idle = now − lastModifiedDateTime` — our writes bump it; orders Resubmit's
-> retry queue. Using `age` for that queue was defect **F2**.
+> **Three clocks, easily conflated:**
+> `file age = now − listItem.createdDateTime` — never changes; drives the retry
+> boundaries and the give-up test (R16). Our own writes would reset any clock based
+> on `lastModifiedDateTime`, so the schedule would stall after one retry.
+> `job age = now − printJob.createdDateTime` — the job's own clock; decides whether
+> THIS attempt has stalled. A SharePoint edit cannot touch it.
+> `attempt start` — the file's age when the current job was created. This is what
+> says how many retries are already spent, and it is why no counter column exists.
 
 ## 6. Power Automate cadences
 
-**No timer trigger exists anywhere in the function app** — all three routes are
+**No timer trigger exists anywhere in the function app** — both routes are
 HTTP-triggered. Every row here is a flow edit with nothing to redeploy.
 
 | Flow | Cadence | Owner |
 |---|---|---|
 | **A — Submit** | every **15 min**, `Do Until remainingReady == 0` **or 10 iterations** | 🔁 flow |
 | **B — Poll** | every **10 min** | 🔁 flow |
-| **C — Resubmit** | **daily, 02:00** | 🔁 flow |
 | **D — Weekly digest** | **Mondays 07:00** | 🔁 flow |
 
-Note **[6]** — Flow B's cadence is a correctness control, not a preference.
+Flow C — a daily Resubmit pass — **was deleted on 2026-09-01**; recovery is Flow
+B's. Note **[6]** — Flow B's cadence is a correctness control, not a preference,
+and it now also sets how quickly a stalled job is retried.
+
+Flow B's body carries `stallMinutes`, `maxRetries` and `giveUpDays`, so the entire
+retry schedule is a flow edit too.
 
 ## 7. External and unmeasured
 
@@ -178,9 +220,11 @@ watches for *silence in the logs*, which reads identically to a quiet week.
 
 **[6] Flow B's 10-minute cadence prevents UC-9.** Poll must run more often than
 Universal Print discards finished jobs. If a job completes and is purged before
-Poll sees it, Poll gets a 404, writes nothing, and Resubmit reprints the document
-72 hours later. The mitigation is entirely the cadence — and the cadence should be
-set from the measurement in **[7]**, which has not been taken.
+Poll sees it, Poll gets a 404, reads that as a stalled attempt, and requeues the
+document — printing it twice. The mitigation is entirely the cadence, and the
+cadence should be set from the measurement in **[7]**, which has not been taken.
+Note the reprint now lands within minutes rather than after 72 hours, so there is
+correspondingly less time to catch it by hand.
 
 **[7] Universal Print job retention is the one unknown that matters.** It *sets*
 Flow B's cadence. Nothing has been measured on the MFC-L5800DW; the earlier reading
@@ -208,18 +252,26 @@ accepts `image/pwg-raster` only.
 
 ---
 
-## Not implemented
+## Built, 2026-09-01
 
-Confirmed absent from `functionapp/` by grep, 2026-09-01. Recorded so they are not
-mistaken for settings that can be changed.
+This section used to list two timers as "design discussion only":
 
-| Timer | Proposed | Status |
+| Timer | Proposed then | Shipped as |
 |---|---|---|
-| `PRINT_STALL_MINUTES` | 2 min | Design discussion only — would requeue a stalled `PRINT_PENDING` row. |
-| give-up threshold | 20 min | Design discussion only — would mark a long-pending row `PRINT_FAILED`. |
+| `PRINT_STALL_MINUTES` | 2 min | **5 min**, and it doubles as the base of the exponential schedule |
+| give-up threshold | 20 min | **`PRINT_GIVE_UP_DAYS`, 10 days** — the original 20 minutes would have failed documents a printer could still have recovered |
 
-If built, these add a third and fourth clock to §5 and move recovery off Flow C's
-daily pass onto Flow B's 10-minute one.
+The note ended: *"If built, these add a third and fourth clock to §5 and move
+recovery off Flow C's daily pass onto Flow B's 10-minute one."* That is exactly
+what happened. **Flow C and the Resubmit endpoint no longer exist**; §5 above is
+the result.
+
+One thing the original sketch got wrong: a single give-up threshold is not enough.
+It conflates two limits that want different values — how much *work* an
+undeliverable document may consume (`maxRetries`) and how long to keep *waiting*
+(`giveUpDays`). Separating them is what creates the grace period.
+
+Nothing else is currently proposed-but-absent.
 
 ---
 

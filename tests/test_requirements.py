@@ -25,7 +25,7 @@ import re
 import pytest
 
 import print_policy
-from helpers import POLL, RESUBMIT, SUBMIT, as_json, iso, post
+from helpers import POLL, SUBMIT, as_json, iso, post
 
 SUBMIT_BODY = {"library": "Documents", "folder": "/Invoices/ToPrint",
                "printerShareId": "share-guid"}
@@ -151,7 +151,7 @@ def test_R5_deviation_the_status_is_written_before_the_job_is_created(graph):
     an eTag-conditioned claim, and only the job id afterwards.
 
     The end state is identical. The difference is how a crash behaves: claiming
-    first loses a print (Resubmit recovers it after 72h), claiming last prints
+    first loses a print (Poll requeues it within minutes), claiming last prints
     the document twice and nothing recovers that.
     """
     graph.add_item("1")
@@ -260,19 +260,27 @@ def test_R9_queries_only_pending_files(graph, frozen_now):
     assert [i["itemId"] for i in payload["items"]] == ["PRINT_PENDING"]
 
 
-def test_R9_the_window_is_twenty_days(graph, frozen_now):
+def test_R9_superseded_no_pending_row_is_excluded_by_age(graph, frozen_now):
+    """R9's 20-day window used to decide WHETHER A ROW WAS LOOKED AT, and a row
+    outside it was touched by nothing ever again -- the G1 strand.
+
+    The window is now a give-up threshold (10 days by default), and it decides the
+    OUTCOME rather than the scope. Every pending row is examined; an old one is
+    failed explicitly instead of vanishing. A job that completed is still recorded
+    as completed however old it is, because the paper came out.
+    """
     graph.add_item("inside", status="PRINT_PENDING", job_id="a",
-                   printer=graph.SHARE_ID, created=iso(days=19))
+                   printer=graph.SHARE_ID, created=iso(days=9))
     graph.add_item("outside", status="PRINT_PENDING", job_id="b",
                    printer=graph.SHARE_ID, created=iso(days=21))
-    graph.add_job("a", state="completed")
-    graph.add_job("b", state="completed")
+    graph.add_job("a", state="completed", created=iso(days=9))
+    graph.add_job("b", state="completed", created=iso(days=21))
 
     post(POLL, POLL_BODY)
 
     assert graph.status_of("inside") == "PRINT_COMPLETED"
-    assert graph.status_of("outside") == "PRINT_PENDING"
-    assert print_policy.DEFAULT_WINDOW_DAYS == 20
+    assert graph.status_of("outside") == "PRINT_COMPLETED",         "an old row is no longer invisible; it is judged like any other"
+    assert print_policy.DEFAULT_GIVE_UP_DAYS == 10
 
 
 def test_R9_checks_ALL_files_in_the_window_not_a_subset(graph, frozen_now):
@@ -330,81 +338,65 @@ def test_R10_a_job_not_yet_completed_is_left_alone(graph, frozen_now):
 
 
 # =============================================================================
-# "another endpoint ... to re-submit outstanding print jobs in PRINT_PENDING or
-#  PRINT_FAILED status for the past 20 days and that are older than 72 hours from
-#  the initial print request ... the same as the file creation datetime"
+# RETIRED: "another endpoint ... to re-submit outstanding print jobs in
+#  PRINT_PENDING or PRINT_FAILED status for the past 20 days and that are older
+#  than 72 hours from the initial print request"
+#
+# R12-R17 described the Resubmit endpoint. That endpoint was removed by decision
+# on 2026-09-01 and its recovery work folded into Poll, on an exponential
+# schedule starting at five minutes instead of a single 72-hour gate. The clauses
+# went with it:
+#
+#   R12  a third endpoint                 -- no third endpoint exists
+#   R13  PRINT_PENDING or PRINT_FAILED    -- Poll queries PRINT_PENDING only;
+#                                            PRINT_FAILED is now TERMINAL
+#   R14  past 20 days                     -- replaced by giveUpDays, default 10,
+#                                            and it now FAILS the row instead of
+#                                            silently dropping it (closes G1)
+#   R15  older than 72 hours              -- replaced by the retry schedule
+#   R17  the scope contradiction          -- moot; there is one query
+#
+# R16 is the exception. Its insight outlived the endpoint and is pinned below.
 # =============================================================================
 
 
-@pytest.mark.parametrize("status", ["PRINT_PENDING", "PRINT_FAILED"])
-def test_R13_both_named_statuses_are_resubmitted(graph, frozen_now, status):
-    graph.add_item("1", status=status, job_id="", printer=graph.SHARE_ID,
-                   created=iso(hours=100))
-
-    payload = as_json(post(RESUBMIT, SUBMIT_BODY))
-
-    assert payload["resubmitted"] == 1
-
-
-def test_R17_resolution_ready_and_blank_are_out_of_scope(graph, frozen_now):
-    """The requirement gives two different scopes -- "PRINT_PENDING or
-    PRINT_FAILED" and "NOT EQUAL to PRINT_COMPLETED" -- which differ on
-    PRINT_READY and on a blank status. The first is the one in force
-    (docs/design.md R17): PRINT_READY belongs to Submit."""
-    graph.add_item("ready", status="PRINT_READY", created=iso(hours=200))
-    graph.add_item("blank", status="", created=iso(hours=200))
-    graph.add_item("completed", status="PRINT_COMPLETED", created=iso(hours=200))
-
-    payload = as_json(post(RESUBMIT, SUBMIT_BODY))
-
-    assert payload["candidatesFound"] == 0
-
-
-def test_R14_the_window_is_twenty_days(graph, frozen_now):
-    graph.add_item("inside", status="PRINT_FAILED", job_id="",
-                   printer=graph.SHARE_ID, created=iso(days=19))
-    graph.add_item("outside", status="PRINT_FAILED", job_id="",
-                   printer=graph.SHARE_ID, created=iso(days=21))
-
-    payload = as_json(post(RESUBMIT, SUBMIT_BODY))
-
-    assert [i["itemId"] for i in payload["items"]] == ["inside"]
-
-
-def test_R15_only_files_older_than_72_hours(graph, frozen_now):
-    graph.add_item("young", status="PRINT_FAILED", job_id="",
-                   printer=graph.SHARE_ID, created=iso(hours=71))
-    graph.add_item("old", status="PRINT_FAILED", job_id="",
-                   printer=graph.SHARE_ID, created=iso(hours=73))
-
-    payload = as_json(post(RESUBMIT, SUBMIT_BODY))
-
-    assert [i["itemId"] for i in payload["items"]] == ["old"]
-    assert print_policy.DEFAULT_MIN_AGE_HOURS == 72
-
-
-def test_R16_the_age_is_measured_from_the_file_creation_time(graph, frozen_now):
+def test_R16_the_retry_schedule_is_measured_from_the_file_creation_time(
+        graph, frozen_now):
     """"The initial print request date/time is the same as the file creation
-    datetime in sharepoint." Not the last-modified time, which our own writes
-    bump -- if age were measured on that, a file we just retried would instantly
-    look young and never be retried again.
+    datetime in sharepoint."
+
+    Still load-bearing, and for the same reason it always was: OUR OWN WRITES
+    BUMP lastModifiedDateTime. Drive the schedule from that and every requeue
+    resets the file to age zero, the next boundary is never reached, and the
+    retries stop dead after the first one. createdDateTime never moves, so the
+    boundaries stay fixed for the life of the document.
+
+    The fixture separates the two. A crashed submission -- PRINT_PENDING with no
+    job id -- claimed 13 minutes into the file's life and now 40 minutes old:
+
+        from createdDateTime   40 min -> past the 35 min boundary -> retry 3 DUE
+        from lastModified      27 min -> still short of 35        -> nothing due
+
+    So a requeue here can only happen if the right timestamp is being read.
     """
-    graph.add_item("1", status="PRINT_FAILED", job_id="", printer=graph.SHARE_ID,
-                   created=iso(hours=100),      # eligible by creation time
-                   modified=iso(hours=1))       # touched an hour ago
+    graph.add_item("1", status="PRINT_PENDING", job_id="", printer=graph.SHARE_ID,
+                   created=iso(minutes=40),      # the schedule reads THIS
+                   modified=iso(minutes=27))     # not this
 
-    payload = as_json(post(RESUBMIT, SUBMIT_BODY))
+    payload = as_json(post(POLL, POLL_BODY))
 
-    assert payload["resubmitted"] == 1, (
-        "age must come from createdDateTime, not lastModifiedDateTime")
+    assert payload["requeued"] == 1, (
+        "the schedule must come from createdDateTime, not lastModifiedDateTime")
 
 
-def test_R12_resubmission_creates_a_new_print_job(graph, frozen_now):
+def test_PRINT_FAILED_is_terminal_now_that_Resubmit_is_gone(graph, frozen_now):
+    """The one behaviour R13 guaranteed that nothing replaces. A failed row is
+    never picked up again by anything; a human resets it. Recorded as a test so
+    the change is visible rather than merely absent."""
     graph.add_item("1", status="PRINT_FAILED", job_id="", printer=graph.SHARE_ID,
                    created=iso(hours=100))
 
-    post(RESUBMIT, SUBMIT_BODY)
+    payload = as_json(post(POLL, POLL_BODY))
 
-    assert graph.calls_to("/jobs", method="POST"), "no replacement job was created"
-    assert graph.field("1", "Print_Status") == "PRINT_PENDING"
-    assert graph.field("1", "Print_JobId") != ""
+    assert payload["checked"] == 0, "Poll must not touch PRINT_FAILED"
+    assert graph.status_of("1") == "PRINT_FAILED"

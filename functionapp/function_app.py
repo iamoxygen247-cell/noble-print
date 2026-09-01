@@ -1,9 +1,9 @@
 """
-function_app.py — the three HTTP endpoints Power Automate calls.
+function_app.py — the two HTTP endpoints Power Automate calls.
 
-    Submit    POST /api/print/submit     claim PRINT_READY files, create print jobs
-    Poll      POST /api/print/status     check PRINT_PENDING jobs, mark the finished
-    Resubmit  POST /api/print/resubmit   cancel + retry outstanding jobs over 72h old
+    Submit  POST /api/print/submit   claim PRINT_READY files, create print jobs
+    Poll    POST /api/print/status   check PRINT_PENDING jobs; mark the finished,
+                                     requeue the stalled, fail the hopeless
 
 This module is a THIN ORCHESTRATOR. It sequences calls and shapes responses. It
 contains no rules: every threshold, status string, window and message format
@@ -16,12 +16,18 @@ setting PRINT_PENDING -- BEFORE its print job is created. The requirement writes
 the status afterwards; this is a deliberate deviation, recorded at R5, because
 the two orderings fail differently:
 
-    claim first   a crash loses the print; Resubmit recovers it after 72h
+    claim first   a crash loses the print; Poll requeues it at the next retry
+                  boundary -- about ten minutes, given Flow B's cadence
     claim last    a crash prints the document twice; nothing recovers that
 
 A recoverable lost print beats a silent double print. The consequence, which
 Poll must respect: a PRINT_PENDING row with an empty Print_JobId is normal, not
-an error -- it is a crashed submission waiting for Resubmit.
+an error -- it is a crashed submission, and Poll requeues it.
+
+RECOVERY LIVES IN POLL. There used to be a third endpoint, Resubmit, on a daily
+flow that would not touch a file until it was 72 hours old. Poll now does that
+work on its ten-minute cadence with an exponential schedule, so a jam at 09:00 is
+retried by 09:10 rather than at 02:00 two nights later.
 
 Two log lines carry all the reporting (docs/design.md §13):
     RUN_SUMMARY   one per invocation
@@ -55,7 +61,6 @@ app = func.FunctionApp()
 
 EP_SUBMIT = "submit"
 EP_POLL = "poll"
-EP_RESUBMIT = "resubmit"
 
 
 # --- responses and logging ----------------------------------------------------
@@ -169,7 +174,7 @@ def _share_for(client: GraphClient, cache: Dict[str, Any], share_id: str):
 
     Returns None rather than raising because one of its callers is the
     best-effort cancel: a share we can no longer look up must not abort a
-    resubmission.
+    requeue.
     """
     if not share_id:
         return None
@@ -181,6 +186,42 @@ def _share_for(client: GraphClient, cache: Dict[str, Any], share_id: str):
                             exc_info=True)
             cache[share_id] = None
     return cache[share_id]
+
+
+def _cancel_outstanding(client: GraphClient, cache: Dict[str, Any],
+                        item: PrintFile, endpoint: str = EP_POLL) -> bool:
+    """Kill the job behind a row before its status is rewritten. Best-effort.
+
+    Both callers rewrite the row immediately afterwards -- one to PRINT_READY, one
+    to PRINT_FAILED -- and in both cases leaving the job alive is a correctness
+    bug, not untidiness (CLAUDE.md rule 2, defect D1):
+
+        requeue   the original prints ALONGSIDE its replacement once someone
+                  clears the jam
+        give up   the abandoned job prints days later against a row that says
+                  PRINT_FAILED
+
+    Cancel is documented ONLY on /print/printers/{id}/jobs/{id}/cancel, so it
+    needs the printer id behind the share, not the share id held in
+    Printer_Name. Returns False when there is nothing to cancel or the cancel did
+    not take; the caller proceeds regardless, because a stuck document is worse
+    than a possible duplicate -- but `cancel_job` logs it, and that log line is
+    the only warning a duplicate may appear.
+    """
+    if not item.job_id or not item.printer:
+        return False
+    origin = _share_for(client, cache, item.printer)
+    printer_id = origin.printer_id if origin else ""
+    cancelled = universal_print.cancel_job(client, printer_id, item.job_id)
+    if cancelled:
+        # A cancel is a per-file outcome in its own right, and this line is the
+        # ONLY record that a particular job was killed -- Print_JobId is cleared
+        # on the requeue that follows. `cancelled` is part of the closed result
+        # vocabulary the weekly report counts (design.md §13).
+        _print_event(endpoint, item.item_id, from_status=item.status,
+                     job=item.job_id, printer=item.printer,
+                     result="cancelled", file_name=item.file_name)
+    return cancelled
 
 
 class Budget:
@@ -234,18 +275,19 @@ def _dry_run_conversion(share: universal_print.ShareInfo) -> Dict[str, Any]:
 
 
 RESULT_SUBMITTED = "submitted"
-RESULT_RESUBMITTED = "resubmitted"
 RESULT_FAILED = "failed"
 RESULT_SKIPPED = "skipped"
 
 
 def _submit_one(client: GraphClient, context: ListContext, share: universal_print.ShareInfo,
-                item: PrintFile, endpoint: str,
-                result_name: str = RESULT_SUBMITTED) -> Dict[str, Any]:
+                item: PrintFile, endpoint: str) -> Dict[str, Any]:
     """Claim one file and put it on the printer.
 
-    Used verbatim by BOTH Submit and Resubmit -- one code path, so a fix or a
-    regression can only happen in one place, and one set of tests covers both.
+    Submit is now the only caller. It used to be shared verbatim with Resubmit,
+    which is why a retry is indistinguishable from a first attempt here: Poll
+    hands a stalled file back to PRINT_READY and Submit picks it up knowing
+    nothing about its history. The retry count lives in the file's age, not in a
+    flag threaded through this function.
 
     Returns a per-item record for the response. Never raises for an ordinary
     failure: a document that cannot print is recorded on the file itself and the
@@ -260,11 +302,22 @@ def _submit_one(client: GraphClient, context: ListContext, share: universal_prin
     # --- claim ---------------------------------------------------------------
     # eTag-conditioned: a 412 means a concurrent invocation got there first.
     # This is the entire double-print guard for overlapping scheduled runs.
+    #
+    # Print_JobId IS cleared: a stale id would send Poll looking up a job that
+    # belongs to a previous attempt.
+    #
+    # Print_Message is NOT. It used to be, and that quietly defeated the retry
+    # history: Poll appends "Job Id N cancelled. Retry job" on the way OUT of
+    # PRINT_PENDING, and this claim is the very next write, so the entry was gone
+    # within one Flow A cycle and the column could never hold more than one.
+    # Nothing is lost by keeping it -- every terminal outcome REPLACES this column
+    # ("printed on ..." on success, the error text on failure), so a stale entry is
+    # visible only while the row is PRINT_PENDING, which is exactly when someone
+    # asking "why is this taking so long?" wants to read it.
     claimed = sharepoint.patch_fields(client, context, item.item_id, {
         print_policy.COLUMN_STATUS: print_policy.PENDING,
         print_policy.COLUMN_PRINTER: share_id,
         print_policy.COLUMN_JOB_ID: "",
-        print_policy.COLUMN_MESSAGE: "",
     }, etag=item.etag)
 
     if not claimed:
@@ -313,8 +366,9 @@ def _submit_one(client: GraphClient, context: ListContext, share: universal_prin
                 print_policy.COLUMN_MESSAGE: message,
             })
         except Exception:
-            # The file is left at PRINT_PENDING with no job id, which Resubmit
-            # recovers after 72h. Losing the message is bad; losing the file is worse.
+            # The file is left at PRINT_PENDING with no job id, which Poll reads
+            # as a crashed submission and requeues. Losing the message is bad;
+            # losing the file is worse.
             logging.exception("could not record the failure on item %s", item.item_id)
 
         _print_event(endpoint, item.item_id, from_status=item.status,
@@ -332,10 +386,15 @@ def _submit_one(client: GraphClient, context: ListContext, share: universal_prin
     # PATCH raises and we let it out, two things happen, both bad. The batch dies
     # with a 500, so files that printed perfectly well are never reported to the
     # flow. And the row is left at PRINT_PENDING with an empty Print_JobId --
-    # which this design defines as "a crashed submission Resubmit owns" (§5.3),
-    # so in 72 hours Resubmit prints the document a second time. That is exactly
-    # the silent double print the claim-first ordering exists to prevent,
-    # reintroduced one line from the end.
+    # which this design defines as a crashed submission (§5.3), so Poll requeues
+    # it and the document prints a second time. That is exactly the silent double
+    # print the claim-first ordering exists to prevent, reintroduced one line from
+    # the end.
+    #
+    # MOVING RECOVERY INTO POLL MADE THIS WORSE, NOT BETTER. Resubmit would have
+    # reprinted after 72 hours, which left a working day to notice. Poll requeues
+    # at the first retry boundary -- about FIVE MINUTES -- so the duplicate is
+    # already in the tray before anyone reads the log.
     #
     # We cannot recover the write, so we do the two things we can: keep going,
     # and say so loudly. The log line is the ONLY warning that a reprint is
@@ -347,18 +406,18 @@ def _submit_one(client: GraphClient, context: ListContext, share: universal_prin
                                 {print_policy.COLUMN_JOB_ID: job_id})
     except Exception:
         warning = (f"possible duplicate print: job {job_id} was started but its id "
-                   f"could not be written to SharePoint, so Resubmit will treat "
-                   f"this row as a crashed submission and may print it a second "
-                   f"time after {print_policy.DEFAULT_MIN_AGE_HOURS}h")
+                   f"could not be written to SharePoint, so Poll will treat this "
+                   f"row as a crashed submission and requeue it within roughly "
+                   f"{print_policy.DEFAULT_STALL_MINUTES} minutes")
         logging.error("%s (item %s, printer %s)",
                       warning, item.item_id, share_id, exc_info=True)
 
     _print_event(endpoint, item.item_id, from_status=item.status,
                  to_status=print_policy.PENDING, job=job_id, printer=share_id,
-                 result=result_name, file_name=item.file_name,
+                 result=RESULT_SUBMITTED, file_name=item.file_name,
                  ms=int((time.monotonic() - started) * 1000))
     record = {"itemId": item.item_id, "fileName": item.file_name,
-              "result": result_name, "jobId": job_id}
+              "result": RESULT_SUBMITTED, "jobId": job_id}
     if warning:
         record["warning"] = warning
     return record
@@ -493,7 +552,15 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
         body = _body(req)
         library = _required_str(body, "library")
         folder = _required_folder(body)
-        window_days = _tunable(print_policy.resolve_window_days, body.get("windowDays"))
+        # All three retry knobs come from the flow body first, then the app
+        # setting, then the default -- so the pacing of the whole retry schedule
+        # can be retuned by editing Power Automate, with no deploy.
+        give_up_days = _tunable(print_policy.resolve_give_up_days,
+                                body.get("giveUpDays"))
+        stall_minutes = _tunable(print_policy.resolve_stall_minutes,
+                                 body.get("stallMinutes"))
+        max_retries = _tunable(print_policy.resolve_max_retries,
+                               body.get("maxRetries"))
 
         client = _client()
         context = _resolve_list(client, library)
@@ -502,30 +569,26 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
             client, context, print_policy.PENDING, folder)
 
         now = print_policy.now_utc()
-        in_window = [f for f in pending
-                     if print_policy.within_window(f.created, window_days, now)]
 
-        # Files past the window are excluded by BOTH Poll and Resubmit, so
-        # nothing will ever touch them again (docs/design.md G1). Reporting them
-        # costs no extra call -- they are already in the result set -- and it is
-        # the only automatic signal that a document is stranded.
-        stale = [f for f in pending
-                 if not print_policy.within_window(f.created, window_days, now)]
-
-        # EVERY job in the window is checked. The requirement says "query the
-        # sharepoint folder for ALL files ... with PRINT_STATUS = PRINT_PENDING",
-        # and unlike Submit there is no loop in the Poll flow to collect a
-        # remainder. Capping it also starved: taking the oldest N meant a handful
-        # of long-running jobs occupied every slot run after run, so a newer job
-        # that HAD completed was never marked and eventually aged past the 20-day
-        # window into limbo. Only the wall-clock budget bounds this now, and what
-        # it leaves behind is reported rather than silently dropped.
-        ordered = print_policy.select_oldest(in_window, len(in_window))
+        # EVERY pending row is considered -- there is no window pre-filter any
+        # more. A file past the give-up threshold used to be dropped here and
+        # touched by nothing ever again (docs/design.md G1); now it reaches the
+        # loop and is failed explicitly, which is what closes that hole.
+        #
+        # No batch cap either. The requirement says "query the sharepoint folder
+        # for ALL files ... with PRINT_STATUS = PRINT_PENDING", and unlike Submit
+        # there is no loop in the Poll flow to collect a remainder. Capping it
+        # also starved: taking the oldest N meant a handful of long-running jobs
+        # occupied every slot run after run. Only the wall-clock budget bounds
+        # this, and what it leaves behind is reported rather than dropped.
+        ordered = print_policy.select_oldest(pending, len(pending))
 
         budget = Budget(started=started)
         items: List[Dict[str, Any]] = []
         completed = failed = still_running = not_found = malformed = 0
-        visited = awaiting_resubmit = 0
+        requeued = gave_up = 0
+        visited = 0
+        shares: Dict[str, Any] = {}
 
         for item in ordered:
             if budget.exhausted:
@@ -535,35 +598,51 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
             visited += 1
 
             # A PRINT_PENDING row with no job id is a crashed submission, not an
-            # error: Submit claimed it and died before creating the job. Resubmit
-            # owns it. Polling it would be meaningless -- but it is still COUNTED.
-            # This is the one state the design tells you to expect (§5.3), and it
-            # used to appear in no counter at all, so the numbers did not add up
-            # to the rows in the window and a growing pile of crashed submissions
-            # was invisible until Resubmit happened to pick them up 72h later.
-            if not item.job_id:
-                awaiting_resubmit += 1
-                continue
-            if not item.printer:
-                malformed += 1
-                items.append({"itemId": item.item_id, "fileName": item.file_name,
-                              "result": "malformed",
-                              "message": "Print_JobId is set but Printer_Name is empty"})
-                continue
+            # error: Submit claimed it and died before creating the job (rule 1,
+            # the deliberate cost of claiming first). Poll now OWNS this case --
+            # it used to be left for Resubmit 72 h later. There is no job to
+            # inspect, so it goes into poll_decision with no job and no job age,
+            # which reads as stalled, and the schedule requeues it.
+            job = None
+            state = ""
+            if item.job_id:
+                if not item.printer:
+                    malformed += 1
+                    items.append({"itemId": item.item_id, "fileName": item.file_name,
+                                  "result": "malformed",
+                                  "message": "Print_JobId is set but Printer_Name is empty"})
+                    continue
 
-            job = universal_print.get_job(client, item.printer, item.job_id)
-            if job is None:
-                not_found += 1
-                items.append({"itemId": item.item_id, "fileName": item.file_name,
-                              "result": "not_found", "jobId": item.job_id,
-                              "message": "the job is no longer known to Universal Print"})
-                _print_event(EP_POLL, item.item_id, from_status=item.status,
-                             job=item.job_id, printer=item.printer,
-                             result="not_found", file_name=item.file_name)
-                continue
+                job = universal_print.get_job(client, item.printer, item.job_id)
+                if job is None:
+                    # Universal Print no longer has it. Counted for visibility,
+                    # then treated like any other dead attempt: unrecoverable, so
+                    # the schedule decides whether to try again.
+                    not_found += 1
+                    _print_event(EP_POLL, item.item_id, from_status=item.status,
+                                 job=item.job_id, printer=item.printer,
+                                 result="not_found", file_name=item.file_name)
+                else:
+                    state = universal_print.job_state(job)
 
-            state = universal_print.job_state(job)
-            action = print_policy.poll_action(state)
+            # The current attempt's own clock. The job's createdDateTime where
+            # there is a job; otherwise when we last wrote the row, which for a
+            # crashed submission is the claim itself.
+            job_created = print_policy.parse_graph_datetime(
+                universal_print.job_created_at(job)) if job else None
+            attempt_started = job_created or item.modified
+
+            action, attempt = print_policy.poll_decision(
+                state,
+                file_created=item.created,
+                has_job=job is not None,
+                job_created=job_created,
+                attempt_started=attempt_started,
+                now=now,
+                stall_minutes=stall_minutes,
+                give_up_days=give_up_days,
+                max_retries=max_retries,
+            )
 
             if action == print_policy.POLL_COMPLETE:
                 # The PRINTER's acknowledgement if it gave one, else the moment
@@ -606,29 +685,99 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                              printer=item.printer, result="failed_terminal",
                              file_name=item.file_name)
 
+            elif action == print_policy.POLL_REQUEUE:
+                # CANCEL BEFORE REQUEUING -- defect D1, and CLAUDE.md rule 2.
+                # Graph defines `stopped` as "an issue with the printer needs to
+                # be addressed BEFORE THE JOB CAN CONTINUE": the job is alive.
+                # Leave it running and the original prints alongside the
+                # replacement the moment somebody clears the jam. Best-effort: a
+                # failed cancel still requeues, because a stuck document is the
+                # worse outcome, but it is logged as the only warning a duplicate
+                # may appear.
+                #
+                # Cancel is documented only on the PRINTER route, so it needs the
+                # printer id behind the share -- not the share id in Printer_Name.
+                _cancel_outstanding(client, shares, item)
+
+                message = print_policy.append_message(
+                    item.message,
+                    print_policy.requeue_message(item.job_id, attempt))
+                # eTag-conditioned like the claim: two overlapping Poll runs must
+                # not both cancel and both append.
+                written = sharepoint.patch_fields(client, context, item.item_id, {
+                    print_policy.COLUMN_STATUS: print_policy.READY,
+                    print_policy.COLUMN_JOB_ID: "",
+                    print_policy.COLUMN_MESSAGE: message,
+                }, etag=item.etag)
+                if not written:
+                    still_running += 1
+                    items.append({"itemId": item.item_id, "fileName": item.file_name,
+                                  "result": "skipped", "jobId": item.job_id,
+                                  "message": "another run requeued this file first"})
+                    continue
+
+                requeued += 1
+                items.append({"itemId": item.item_id, "fileName": item.file_name,
+                              "result": "requeued", "jobId": item.job_id,
+                              "message": message})
+                _print_event(EP_POLL, item.item_id, from_status=item.status,
+                             to_status=print_policy.READY, job=item.job_id,
+                             printer=item.printer, result="requeued",
+                             file_name=item.file_name)
+
+            elif action == print_policy.POLL_GIVE_UP:
+                # Cancel whatever is still outstanding FIRST. Without it the
+                # abandoned job could print days later against a row that reads
+                # PRINT_FAILED -- the column would be lying about paper that came
+                # out of the tray.
+                _cancel_outstanding(client, shares, item)
+
+                message = print_policy.append_message(
+                    item.message,
+                    print_policy.give_up_message(attempt, give_up_days))
+                sharepoint.patch_fields(client, context, item.item_id, {
+                    print_policy.COLUMN_STATUS: print_policy.FAILED,
+                    print_policy.COLUMN_MESSAGE: message,
+                })
+                gave_up += 1
+                items.append({"itemId": item.item_id, "fileName": item.file_name,
+                              "result": "gave_up", "jobId": item.job_id,
+                              "message": message})
+                _print_event(EP_POLL, item.item_id, from_status=item.status,
+                             to_status=print_policy.FAILED, job=item.job_id,
+                             printer=item.printer, result="gave_up",
+                             file_name=item.file_name)
+
             else:
+                # Three situations reach here and all want silence: a healthy job
+                # in flight, a stalled job inside the backoff gap, and a stalled
+                # job whose retries are spent but which is still inside the
+                # give-up window. The last is the grace period -- no more work is
+                # spent on it, but its final job stays live, so a printer that
+                # comes back still gets the document out.
                 still_running += 1
                 items.append({"itemId": item.item_id, "fileName": item.file_name,
                               "result": "still_running", "jobId": item.job_id,
-                              "message": state})
+                              "message": state or "no job"})
 
-        _run_summary(EP_POLL, library=library, folder=folder, found=len(in_window),
-                     ok=completed, failed=failed, skipped=still_running,
+        _run_summary(EP_POLL, library=library, folder=folder, found=len(ordered),
+                     ok=completed, failed=failed + gave_up, skipped=still_running,
                      remaining=-1, http_status=200, started=started)
         return _json_response(200, {
-            "library": library, "folder": folder, "windowDays": window_days,
+            "library": library, "folder": folder,
+            # Echoed back so a flow's own tuning is visible in the response and in
+            # the App Insights trace, not just in whatever the flow meant to send.
+            "giveUpDays": give_up_days, "stallMinutes": stall_minutes,
+            "maxRetries": max_retries,
             "checked": len(items), "completed": completed, "failed": failed,
+            "requeued": requeued, "gaveUp": gave_up,
             "stillRunning": still_running, "notFound": not_found,
             "malformed": malformed, "budgetExhausted": budget.exhausted,
-            # These four account for every row in the window, exactly once:
-            #   checked + awaitingResubmit + uncheckedCount == pendingInWindow
-            "pendingInWindow": len(ordered),
-            "awaitingResubmit": awaiting_resubmit,
+            # These account for every pending row, exactly once (defect S5 -- a
+            # crashed submission used to appear in no counter at all):
+            #   checked + uncheckedCount == pendingFound
+            "pendingFound": len(ordered),
             "uncheckedCount": len(ordered) - visited,
-            "staleCount": len(stale),
-            "staleItems": [{"itemId": f.item_id, "fileName": f.file_name,
-                            "created": f.created, "jobId": f.job_id}
-                           for f in stale],
             "items": items,
         })
 
@@ -638,169 +787,6 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
         return _json_response(400, {"error": str(exc)})
     except Exception as exc:
         return _server_error(EP_POLL, exc, library, folder, "-", started)
-
-
-# --- Resubmit -----------------------------------------------------------------
-
-
-@app.route(route="print/resubmit", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
-def resubmit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
-    started = time.monotonic()
-    library = folder = printer_share_id = "-"
-    try:
-        body = _body(req)
-        library = _required_str(body, "library")
-        folder = _required_folder(body)
-        window_days = _tunable(print_policy.resolve_window_days, body.get("windowDays"))
-        min_age_hours = _tunable(print_policy.resolve_min_age_hours,
-                                 body.get("minAgeHours"))
-        batch_size = _tunable(print_policy.resolve_batch_size, body.get("batchSize"))
-        requested_share = (body.get("printerShareId") or "").strip()
-        printer_share_id = requested_share or "-"
-
-        client = _client()
-        context = _resolve_list(client, library)
-
-        # Outstanding == PRINT_PENDING or PRINT_FAILED. Two separate equality
-        # queries rather than `ne PRINT_COMPLETED`: Graph filters one indexed
-        # field at a time, `ne` on text is weakly supported, and the union is
-        # exactly what the requirement names (docs/design.md R17).
-        candidates: List[PrintFile] = []
-        seen: set = set()
-        for status in print_policy.RESUBMIT_STATUSES:
-            for found in sharepoint.query_by_status(client, context, status, folder):
-                # The two queries run at different instants, so a file whose
-                # status changes between them appears in both. De-duplicate by
-                # item id: the second pass would lose the eTag race anyway, but
-                # it would still be counted twice in the response.
-                if found.item_id in seen:
-                    continue
-                seen.add(found.item_id)
-                candidates.append(found)
-
-        now = print_policy.now_utc()
-        eligible = [f for f in candidates
-                    if print_policy.within_window(f.created, window_days, now)
-                    and print_policy.older_than(f.created, min_age_hours, now)]
-
-        budget = Budget(started=started)
-        items: List[Dict[str, Any]] = []
-        resubmitted = completed_instead = still_running = failed = cancelled = 0
-        shares: Dict[str, universal_print.ShareInfo] = {}
-
-        # Least recently ATTEMPTED first, not oldest-created. createdDateTime
-        # never changes, so ordering a retry queue by it means a file that fails
-        # every time is chosen every time and everything newer waits behind it
-        # forever. Our own writes bump lastModifiedDateTime, so an attempt sends
-        # a file to the back of the queue and the backlog rotates.
-        for item in print_policy.select_least_recently_attempted(eligible, batch_size):
-            if budget.exhausted:
-                break
-
-            share_id = requested_share or item.printer
-            if not share_id:
-                failed += 1
-                items.append({"itemId": item.item_id, "fileName": item.file_name,
-                              "result": "failed",
-                              "message": "no printer: the file has no Printer_Name "
-                                         "and the request supplied no printerShareId"})
-                continue
-
-            share = _share_for(client, shares, share_id)
-            if share is None:
-                failed += 1
-                items.append({"itemId": item.item_id, "fileName": item.file_name,
-                              "result": "failed",
-                              "message": "printer share {!r} could not be "
-                                         "resolved".format(share_id)})
-                continue
-
-            # Check the existing job before doing anything irreversible.
-            if item.job_id:
-                job = universal_print.get_job(client, item.printer or share_id,
-                                              item.job_id)
-                action = (print_policy.RESUBMIT_RESUBMIT if job is None
-                          else print_policy.resubmit_action(
-                              universal_print.job_state(job)))
-
-                if action == print_policy.RESUBMIT_MARK_COMPLETED:
-                    # It finished between Poll's last run and now. Reprinting
-                    # would put a second copy in the tray.
-                    #
-                    # Same timestamp source Poll uses, deliberately: two code
-                    # paths write this column, and if they disagreed the audit
-                    # trail would say something different depending on which
-                    # endpoint happened to get there first.
-                    message = print_policy.printed_on_message(
-                        print_policy.completion_time(
-                            universal_print.job_acknowledged_at(job), now))
-                    sharepoint.patch_fields(client, context, item.item_id, {
-                        print_policy.COLUMN_STATUS: print_policy.COMPLETED,
-                        print_policy.COLUMN_MESSAGE: message,
-                    })
-                    completed_instead += 1
-                    items.append({"itemId": item.item_id, "fileName": item.file_name,
-                                  "result": "completed_late", "jobId": item.job_id,
-                                  "message": message})
-                    _print_event(EP_RESUBMIT, item.item_id, from_status=item.status,
-                                 to_status=print_policy.COMPLETED, job=item.job_id,
-                                 printer=share_id, result="completed_late",
-                                 file_name=item.file_name)
-                    continue
-
-                if action == print_policy.RESUBMIT_SKIP:
-                    still_running += 1
-                    items.append({"itemId": item.item_id, "fileName": item.file_name,
-                                  "result": "still_running", "jobId": item.job_id,
-                                  "message": universal_print.job_state(job)})
-                    continue
-
-                if action == print_policy.RESUBMIT_CANCEL_THEN_RESUBMIT:
-                    # `stopped` means the printer needs attention BEFORE THE JOB
-                    # CAN CONTINUE -- the job is alive. Without this cancel, the
-                    # original and the replacement both print once someone clears
-                    # the jam. Best-effort: a failed cancel is logged and we
-                    # still resubmit, because a stuck document is worse.
-                    # Cancel against the printer the job WAS submitted to,
-                    # which is not necessarily the one we are about to use. When
-                    # the request overrides the printer, aiming at the new one
-                    # 404s -- and a 404 reads as "already gone" -- so this would
-                    # report a clean cancel while the original stayed alive to
-                    # print alongside its replacement.
-                    origin = _share_for(client, shares, item.printer or share_id)
-                    printer_id = origin.printer_id if origin else ""
-                    if universal_print.cancel_job(client, printer_id, item.job_id):
-                        cancelled += 1
-                        _print_event(EP_RESUBMIT, item.item_id, job=item.job_id,
-                                     printer=item.printer or share_id,
-                                     result="cancelled", file_name=item.file_name)
-
-            record = _submit_one(client, context, share, item, EP_RESUBMIT,
-                                 result_name=RESULT_RESUBMITTED)
-            items.append(record)
-            if record["result"] == RESULT_RESUBMITTED:
-                resubmitted += 1
-            elif record["result"] == RESULT_FAILED:
-                failed += 1
-
-        _run_summary(EP_RESUBMIT, library=library, folder=folder,
-                     printer=printer_share_id, found=len(eligible), ok=resubmitted,
-                     failed=failed, skipped=still_running, remaining=-1,
-                     http_status=200, started=started)
-        return _json_response(200, {
-            "library": library, "folder": folder, "windowDays": window_days,
-            "minAgeHours": min_age_hours, "candidatesFound": len(eligible),
-            "resubmitted": resubmitted, "completedInstead": completed_instead,
-            "stillRunning": still_running, "cancelled": cancelled, "failed": failed,
-            "budgetExhausted": budget.exhausted, "items": items,
-        })
-
-    except BadRequest as exc:
-        _run_summary(EP_RESUBMIT, library=library, folder=folder,
-                     printer=printer_share_id, http_status=400, started=started)
-        return _json_response(400, {"error": str(exc)})
-    except Exception as exc:
-        return _server_error(EP_RESUBMIT, exc, library, folder, printer_share_id, started)
 
 
 # --- shared error handling ----------------------------------------------------

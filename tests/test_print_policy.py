@@ -77,24 +77,6 @@ def test_within_window_excludes_unparseable_creation_time():
     assert policy.within_window(None, 20, NOW) is False
 
 
-# --- the 72-hour rule ---------------------------------------------------------
-
-
-@pytest.mark.parametrize("delta,expected", [
-    (timedelta(hours=72), True),                       # exactly 72h: eligible
-    (timedelta(hours=72, seconds=1), True),
-    (timedelta(hours=71, minutes=59), False),          # just short: not yet
-    (timedelta(hours=1), False),
-    (timedelta(days=10), True),
-])
-def test_older_than_72_hours(delta, expected):
-    assert policy.older_than(NOW - delta, 72, NOW) is expected
-
-
-def test_older_than_excludes_unparseable_creation_time():
-    assert policy.older_than(None, 72, NOW) is False
-
-
 def test_windows_are_computed_in_utc_across_a_dst_change():
     """The windows must be wall-clock-independent.
 
@@ -113,6 +95,31 @@ def test_windows_are_computed_in_utc_across_a_dst_change():
 # --- Universal Print state mapping -------------------------------------------
 
 
+def decide(state="stopped", *, file_age_minutes=1.0, job_age_minutes=None,
+           spent_at_minutes=None, stall_minutes=5, give_up_days=10,
+           max_retries=10):
+    """poll_decision in the units the schedule is actually specified in.
+
+    `spent_at_minutes` is the file's age when the current attempt began, which is
+    what encodes how many retries are already spent. It defaults to 0 -- a first
+    attempt, claimed the moment the file appeared, with nothing spent yet.
+    """
+    file_created = NOW - timedelta(minutes=file_age_minutes)
+    job_created = (None if job_age_minutes is None
+                   else NOW - timedelta(minutes=job_age_minutes))
+    started_at = 0 if spent_at_minutes is None else spent_at_minutes
+    return policy.poll_decision(
+        state,
+        file_created=file_created,
+        has_job=job_age_minutes is not None or state not in ("", None),
+        job_created=job_created,
+        attempt_started=NOW - timedelta(minutes=file_age_minutes - started_at),
+        now=NOW,
+        stall_minutes=stall_minutes, give_up_days=give_up_days,
+        max_retries=max_retries,
+    )
+
+
 @pytest.mark.parametrize("state,expected", [
     ("completed", policy.POLL_COMPLETE),
     ("canceled", policy.POLL_FAIL),
@@ -123,55 +130,217 @@ def test_windows_are_computed_in_utc_across_a_dst_change():
     ("stopped", policy.POLL_NONE),
     ("unknown", policy.POLL_NONE),
 ])
-def test_poll_action_covers_every_documented_state(state, expected):
-    assert policy.poll_action(state) == expected
+def test_poll_decision_covers_every_documented_state(state, expected):
+    """A one-minute-old job on a one-minute-old file: nothing is stalled yet, so
+    only the terminal states produce a write."""
+    action, _ = decide(state, file_age_minutes=1.0, job_age_minutes=1.0)
+    assert action == expected
 
 
-def test_poll_action_handles_all_eight_states():
-    """If Graph ever adds a ninth state we want the default (write nothing), not
-    a KeyError -- but the eight documented ones must all be accounted for."""
+def test_poll_decision_handles_all_eight_states():
+    """If Graph ever adds a ninth state we want a defined answer, not a KeyError
+    -- but the eight documented ones must all be accounted for."""
     assert len(policy.ALL_JOB_STATES) == 8
     for state in policy.ALL_JOB_STATES:
-        assert policy.poll_action(state) in (
-            policy.POLL_COMPLETE, policy.POLL_FAIL, policy.POLL_NONE)
+        action, _ = decide(state, file_age_minutes=1.0, job_age_minutes=1.0)
+        assert action in (policy.POLL_COMPLETE, policy.POLL_FAIL, policy.POLL_NONE,
+                          policy.POLL_REQUEUE, policy.POLL_GIVE_UP)
 
 
-@pytest.mark.parametrize("state,expected", [
-    ("completed", policy.RESUBMIT_MARK_COMPLETED),
-    ("pending", policy.RESUBMIT_SKIP),
-    ("processing", policy.RESUBMIT_SKIP),
-    ("canceled", policy.RESUBMIT_RESUBMIT),
-    ("aborted", policy.RESUBMIT_RESUBMIT),
-    ("paused", policy.RESUBMIT_CANCEL_THEN_RESUBMIT),
-    ("stopped", policy.RESUBMIT_CANCEL_THEN_RESUBMIT),
-    ("unknown", policy.RESUBMIT_CANCEL_THEN_RESUBMIT),
-])
-def test_resubmit_action_covers_every_documented_state(state, expected):
-    assert policy.resubmit_action(state) == expected
+@pytest.mark.parametrize("state", ["paused", "stopped", "unknown", "pending",
+                                   "processing"])
+def test_every_non_terminal_state_can_stall(state):
+    """THE double-print guard, at the rules layer.
 
-
-def test_a_stopped_job_must_be_cancelled_before_reprinting():
-    """THE double-print guard.
-
-    Graph defines `stopped` as "an issue with the printer needs to be addressed
-    BEFORE THE JOB CAN CONTINUE" -- the job is alive. Reprinting without
-    cancelling means the original and the replacement both come out once someone
-    clears the jam. This assertion is the reason cancel_job exists.
+    None of these is documented as dead, so any of them may still print. A
+    requeue therefore has to cancel first -- which is exactly what POLL_REQUEUE
+    tells the caller to do. Reprinting without the cancel means the original and
+    the replacement both come out once someone clears the jam.
     """
-    assert policy.resubmit_action("stopped") == policy.RESUBMIT_CANCEL_THEN_RESUBMIT
+    action, _ = decide(state, file_age_minutes=6.0, job_age_minutes=6.0)
+    assert action == policy.POLL_REQUEUE
 
 
-def test_an_unrecognised_state_is_treated_conservatively():
-    """Anything the service invents later gets cancel-then-resubmit: safe for
-    correctness (no duplicate) at the cost of one wasted cancel call."""
-    assert policy.resubmit_action("teleporting") == policy.RESUBMIT_CANCEL_THEN_RESUBMIT
-    assert policy.poll_action("teleporting") == policy.POLL_NONE
-    assert policy.poll_action(None) == policy.POLL_NONE
+@pytest.mark.parametrize("state", ["completed", "canceled", "aborted"])
+def test_a_terminal_state_is_never_stalled(state):
+    """However old it is. There is nothing to cancel and nothing to wait for."""
+    assert policy.job_is_stalled(state, True, 10_000, 5) is False
+
+
+def test_an_unrecognised_state_is_treated_as_still_live():
+    """Anything the service invents later is assumed able to print, so it is
+    requeued (with a cancel) rather than failed -- safe for correctness at the
+    cost of one wasted cancel call."""
+    action, _ = decide("teleporting", file_age_minutes=6.0, job_age_minutes=6.0)
+    assert action == policy.POLL_REQUEUE
 
 
 @pytest.mark.parametrize("state", ["COMPLETED", " Completed ", "cOmPlEtEd"])
 def test_state_matching_is_case_and_space_insensitive(state):
-    assert policy.poll_action(state) == policy.POLL_COMPLETE
+    action, _ = decide(state, file_age_minutes=1.0, job_age_minutes=1.0)
+    assert action == policy.POLL_COMPLETE
+
+
+# --- the exponential retry schedule -------------------------------------------
+
+# base * (2**n - 1) for base = 5. These are the numbers the runbook quotes and
+# the live stall test is timed against, so they are pinned literally rather than
+# recomputed from the formula -- a test that repeats the implementation's
+# arithmetic cannot catch the arithmetic being wrong.
+BOUNDARIES = [5, 15, 35, 75, 155, 315, 635, 1275, 2555, 5115]
+
+
+@pytest.mark.parametrize("n,minutes", list(enumerate(BOUNDARIES, start=1)))
+def test_each_retry_falls_due_at_its_boundary(n, minutes):
+    assert policy.retries_due(minutes, 5, 10) == n
+    assert policy.retries_due(minutes - 0.001, 5, 10) == n - 1
+
+
+def test_all_ten_retries_fit_inside_the_ten_day_give_up_window():
+    """With the shipped defaults it is max_retries that stops the retrying, at
+    about 3d 13h, not the calendar. The remaining 6.5 days are the grace period
+    in which the final job may still print."""
+    assert BOUNDARIES[-1] < 10 * 24 * 60
+    assert policy.retries_due(10 * 24 * 60, 5, 10) == 10
+
+
+def test_retries_due_is_capped_at_the_maximum():
+    """However ancient the row, the arithmetic must not run away."""
+    assert policy.retries_due(10_000_000, 5, 10) == 10
+    assert policy.retries_due(10_000_000, 5, 3) == 3
+
+
+def test_retries_due_is_monotonic():
+    previous = 0
+    for minutes in range(0, 6000, 7):
+        current = policy.retries_due(minutes, 5, 10)
+        assert current >= previous, "the count may never go backwards"
+        previous = current
+
+
+def test_nothing_is_due_before_the_first_boundary():
+    assert policy.retries_due(0, 5, 10) == 0
+    assert policy.retries_due(4.9, 5, 10) == 0
+    assert policy.retries_due(None, 5, 10) == 0
+
+
+def test_the_schedule_rescales_with_the_stall_threshold():
+    """One knob. A one-minute threshold gives 1, 3, 7, 15 ... minutes."""
+    assert [policy.retries_due(m, 1, 10) for m in (1, 3, 7, 15)] == [1, 2, 3, 4]
+
+
+def test_a_requeue_needs_a_NEWLY_crossed_boundary():
+    """THE BACKOFF. Two retries are already spent (the attempt began at 27
+    minutes); the third is not due until 35. At 32 minutes the job is stalled and
+    retries remain, and still nothing happens."""
+    action, _ = decide(file_age_minutes=32, job_age_minutes=5,
+                       spent_at_minutes=27)
+    assert action == policy.POLL_NONE
+
+    action, attempt = decide(file_age_minutes=40, job_age_minutes=13,
+                             spent_at_minutes=27)
+    assert action == policy.POLL_REQUEUE
+    assert attempt == 3
+
+
+def test_a_job_inside_the_stall_threshold_is_not_stalled():
+    action, _ = decide(file_age_minutes=100, job_age_minutes=4)
+    assert action == policy.POLL_NONE
+
+
+def test_a_missing_job_is_stalled_immediately():
+    """A crashed submission or a purged job: nothing is coming, so there is no
+    age to wait on."""
+    assert policy.job_is_stalled("", False, None, 5) is True
+
+
+def test_a_job_whose_age_is_unknown_is_not_stalled():
+    """Cancelling a job we cannot age could kill one that is printing right now
+    and queue a second copy. Abstaining only delays a retry."""
+    assert policy.job_is_stalled("stopped", True, None, 5) is False
+
+
+# --- the grace period and giving up -------------------------------------------
+
+
+def test_spent_retries_stop_the_requeue_without_failing_the_row():
+    """THE GRACE PERIOD: no more work, but the row stays PRINT_PENDING so its
+    last job can still print and be recorded."""
+    action, _ = decide(file_age_minutes=6000, job_age_minutes=600,
+                       spent_at_minutes=6000, max_retries=2)
+    assert action == policy.POLL_NONE
+
+
+def test_past_the_give_up_threshold_the_row_is_failed():
+    action, _ = decide(file_age_minutes=11 * 24 * 60, job_age_minutes=600)
+    assert action == policy.POLL_GIVE_UP
+
+
+def test_completion_beats_the_give_up_threshold():
+    """ORDER OF CHECKS. The paper came out; a row saying PRINT_FAILED about a
+    document that printed is worse than a late success."""
+    action, _ = decide("completed", file_age_minutes=99 * 24 * 60,
+                       job_age_minutes=600)
+    assert action == policy.POLL_COMPLETE
+
+
+def test_a_row_with_no_creation_time_is_left_alone():
+    """It cannot be aged, so neither the give-up test nor the schedule means
+    anything for it. Guessing would either abandon a live document or retry one
+    forever."""
+    action, _ = policy.poll_decision(
+        "stopped", file_created=None, has_job=True,
+        job_created=NOW - timedelta(minutes=600), attempt_started=None, now=NOW,
+        stall_minutes=5, give_up_days=10, max_retries=10)
+    assert action == policy.POLL_NONE
+
+
+# --- appending to Print_Message -----------------------------------------------
+
+
+def test_append_message_keeps_the_earlier_entry():
+    result = policy.append_message("convert: bad PDF", "Job Id 7 cancelled")
+    assert "convert: bad PDF" in result
+    assert "Job Id 7 cancelled" in result
+
+
+def test_append_message_handles_an_empty_column():
+    assert policy.append_message("", "first") == "first"
+    assert policy.append_message(None, "first") == "first"
+
+
+def test_append_message_drops_the_OLDEST_entries_when_it_overflows():
+    """255 characters is the column's limit. The newest entry is what someone is
+    reading the row to understand, so it is the one that must survive."""
+    existing = policy.MESSAGE_SEPARATOR.join("entry number {}".format(i)
+                                             for i in range(40))
+    result = policy.append_message(existing, "the newest thing")
+
+    assert len(result) <= policy.MESSAGE_MAX_CHARS
+    assert result.endswith("the newest thing")
+    assert "entry number 0" not in result
+
+
+def test_append_message_never_leaves_half_an_entry():
+    existing = policy.MESSAGE_SEPARATOR.join("x" * 60 for _ in range(10))
+    result = policy.append_message(existing, "newest")
+
+    assert len(result) <= policy.MESSAGE_MAX_CHARS
+    for part in result.split(policy.MESSAGE_SEPARATOR):
+        assert part in ("x" * 60, "newest"), "entries must not be sliced"
+
+
+def test_the_requeue_message_names_the_job_it_cancelled():
+    """Print_JobId is cleared on requeue, so this is the only surviving record of
+    which job was killed."""
+    assert "1825" in policy.requeue_message("1825", 3)
+
+
+def test_the_give_up_message_says_how_many_attempts_and_how_long():
+    """PRINT_FAILED is terminal and a human acts on it, so the last thing written
+    has to be worth reading."""
+    message = policy.give_up_message(9, 10)
+    assert "9" in message and "10" in message
 
 
 # --- the printed-on message ---------------------------------------------------
@@ -327,20 +496,50 @@ def test_batch_size_bad_env_falls_back_instead_of_failing(monkeypatch, bad):
     assert policy.resolve_batch_size() == policy.DEFAULT_BATCH_SIZE
 
 
-def test_window_and_age_defaults_match_the_requirement():
-    assert policy.resolve_window_days() == 20
-    assert policy.resolve_min_age_hours() == 72
+def test_the_retry_knob_defaults():
+    assert policy.resolve_give_up_days() == 10
+    assert policy.resolve_stall_minutes() == 5
+    assert policy.resolve_max_retries() == 10
 
 
 @pytest.mark.parametrize("resolver,bad", [
-    (policy.resolve_window_days, 0),
-    (policy.resolve_window_days, 400),
-    (policy.resolve_min_age_hours, 0),
-    (policy.resolve_min_age_hours, 100000),
+    (policy.resolve_give_up_days, 0),
+    (policy.resolve_give_up_days, 400),
+    (policy.resolve_stall_minutes, 0),
+    (policy.resolve_stall_minutes, 2000),
+    (policy.resolve_max_retries, 0),
+    (policy.resolve_max_retries, 99),
 ])
-def test_window_and_age_range_validation(resolver, bad):
+def test_retry_knob_range_validation(resolver, bad):
+    """An out-of-range REQUEST value raises, which function_app._tunable turns
+    into a 400 -- the caller's error, not a server fault."""
     with pytest.raises(ValueError):
         resolver(bad)
+
+
+@pytest.mark.parametrize("resolver,env", [
+    (policy.resolve_give_up_days, "PRINT_GIVE_UP_DAYS"),
+    (policy.resolve_stall_minutes, "PRINT_STALL_MINUTES"),
+    (policy.resolve_max_retries, "PRINT_MAX_RETRIES"),
+])
+def test_a_request_value_beats_the_app_setting(monkeypatch, resolver, env):
+    """The ordering that lets Power Automate retune the schedule with no deploy:
+    request first, then the app setting, then the built-in default."""
+    monkeypatch.setenv(env, "7")
+    assert resolver() == 7, "the app setting is the fallback"
+    assert resolver(3) == 3, "the request body wins"
+
+
+@pytest.mark.parametrize("resolver,env", [
+    (policy.resolve_give_up_days, "PRINT_GIVE_UP_DAYS"),
+    (policy.resolve_stall_minutes, "PRINT_STALL_MINUTES"),
+    (policy.resolve_max_retries, "PRINT_MAX_RETRIES"),
+])
+def test_a_bad_app_setting_falls_back_instead_of_failing(monkeypatch, resolver, env):
+    """Server misconfiguration must not take every request down with it -- the
+    opposite of how a bad REQUEST value is treated."""
+    monkeypatch.setenv(env, "not-a-number")
+    assert resolver() > 0
 
 
 def test_budget_default_undercuts_the_connector_timeout():
@@ -430,12 +629,17 @@ def test_column_names_match_the_requirement():
     assert len(policy.COLUMN_DISPLAY_NAMES) == 4
 
 
-def test_resubmit_scope_excludes_ready_and_completed():
-    """The requirement stated the scope two ways; this pins the one in force.
-    Including PRINT_READY would duplicate Submit's job (docs/design.md R17)."""
-    assert policy.RESUBMIT_STATUSES == (policy.PENDING, policy.FAILED)
-    assert policy.READY not in policy.RESUBMIT_STATUSES
-    assert policy.COMPLETED not in policy.RESUBMIT_STATUSES
+def test_print_failed_is_terminal():
+    """Nothing in the app retries PRINT_FAILED -- a human resets the row. Poll
+    only ever queries PRINT_PENDING, and only ever writes PRINT_FAILED as a final
+    answer, so there is no path that picks a failed row back up.
+
+    This replaces the old RESUBMIT_STATUSES guard. Resubmit did retry
+    PRINT_FAILED; nothing does now, which is why the give-up message has to carry
+    enough for someone to act on.
+    """
+    assert not hasattr(policy, "RESUBMIT_STATUSES")
+    assert policy.FAILED not in (policy.READY, policy.PENDING)
 
 
 def test_the_default_job_configuration_carries_only_copies():

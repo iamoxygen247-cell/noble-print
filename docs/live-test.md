@@ -132,7 +132,7 @@ document must be rasterized before upload.
 
 The one remaining unknown, and the only one that can still cause a duplicate
 print (UC-9). If Universal Print discards a finished job before Poll sees it,
-Poll gets a 404, writes nothing, and Resubmit reprints the document 72 hours
+Poll gets a 404, reads it as a stalled attempt, and requeues the document within minutes
 later.
 
 **Nothing has been measured yet on the current printer.** The earlier run left a
@@ -293,7 +293,7 @@ exactly that reason.
 | `candidatesFound: 0` but files are there | Folder path or status value mismatch | Check `dryrun`'s resolved folder; confirm the status text is exactly `PRINT_READY` |
 | `does not accept application/pdf` | The printer reports no PDF support | Printer-side; stage 1 shows the real list |
 | `PRINT_PENDING` forever, nothing prints | Stage 1's failure mode — nothing is delivering jobs | Fix the registration, not the code |
-| Job id in the column but a 404 on status | The job aged out of Universal Print | Poll more often; Resubmit will retry after 72h |
+| Job id in the column but a 404 on status | The job aged out of Universal Print | Poll more often -- Poll requeues it, which reprints the document |
 
 Anything you hit that is not on this list is worth adding to
 `docs/ai/troubleshooting.md` — that file is the project's memory.

@@ -329,6 +329,21 @@ def job_acknowledged_at(job: Optional[Dict[str, Any]]) -> Optional[str]:
     return (job or {}).get("acknowledgedDateTime") or None
 
 
+def job_created_at(job: Optional[Dict[str, Any]]) -> Optional[str]:
+    """printJob.createdDateTime, or None.
+
+    THE STALL CLOCK. Poll measures how long a job has sat without finishing from
+    this, not from anything in SharePoint, because it belongs to the job: nobody
+    editing the library row can reset it, and it survives a requeue by virtue of
+    the replacement being a different job with its own value.
+
+    Costs no extra call -- `get_job` fetches the whole resource with no $select,
+    so the field is already in the response. Confirmed present on a live job in
+    tests/test_acknowledged_time.py.
+    """
+    return (job or {}).get("createdDateTime") or None
+
+
 def job_description(job: Optional[Dict[str, Any]]) -> str:
     """A human-readable reason, for Print_Message on a failed job."""
     status = (job or {}).get("status") or {}
@@ -342,10 +357,10 @@ def job_description(job: Optional[Dict[str, Any]]) -> str:
 def cancel_job(client: GraphClient, printer_id: str, job_id: str) -> bool:
     """Cancel a job so a replacement cannot print alongside it. True if cancelled.
 
-    Best-effort by contract. The caller is already resubmitting; refusing to
-    resubmit because the cancel failed would leave a document unprinted, which is
-    the worse outcome. But a False return is logged loudly, because it is the
-    only signal that a duplicate print is possible.
+    Best-effort by contract. The caller is about to requeue or abandon the file;
+    refusing to do so because the cancel failed would leave a document unprinted,
+    which is the worse outcome. But a False return is logged loudly, because it is
+    the only signal that a duplicate print is possible.
 
     Note the PRINTER route -- cancel is not documented on /print/shares/...
     """
@@ -361,6 +376,6 @@ def cancel_job(client: GraphClient, printer_id: str, job_id: str) -> bool:
         if exc.status_code == 404:
             return True
         logging.warning("could not cancel print job %s on printer %s: %s. "
-                        "Resubmitting anyway -- a duplicate print is possible.",
+                        "Continuing anyway -- a duplicate print is possible.",
                         job_id, printer_id, exc)
         return False

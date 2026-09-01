@@ -27,10 +27,14 @@ a runtime configuration engine — see §9. Volume/traffic scaling is explicitly
 | Name | Route | Responsibility |
 |---|---|---|
 | **Submit** | `POST /api/print/submit` | Claim the oldest `PRINT_READY` files and create print jobs |
-| **Poll** | `POST /api/print/status` | Check `PRINT_PENDING` jobs, mark the finished ones |
-| **Resubmit** | `POST /api/print/resubmit` | Cancel and retry outstanding jobs older than 72 h |
+| **Poll** | `POST /api/print/status` | Check `PRINT_PENDING` jobs: mark the finished, requeue the stalled, fail the hopeless |
 
 Referred to by name throughout — never "endpoint 1/2/3".
+
+> **Resubmit was retired on 2026-09-01.** A third endpoint, `POST
+> /api/print/resubmit`, ran daily and would not touch a file until it was 72 hours
+> old. Its work moved into Poll on a five-minute exponential schedule. R12–R17
+> described it and are retired with it; see §2.
 
 ### Agreed decisions
 
@@ -40,7 +44,7 @@ Referred to by name throughout — never "endpoint 1/2/3".
 | Printer identifier | **Printer share id** → `/print/shares/{id}/...` |
 | Batch model | Small synchronous batch (default **5**, max 15); the flow loops on `remainingReady` |
 | `Print_Message` clock | `America/Vancouver` |
-| Resubmit scope | **`PRINT_PENDING` + `PRINT_FAILED` only** (not `PRINT_READY`, not blank) |
+| Recovery scope | **`PRINT_PENDING` only.** `PRINT_FAILED` is terminal — a human resets it |
 | Reuse mechanism | Fixed constants in one module; no profile/config engine |
 | Job configuration | Fixed `{"copies": 1}`; printer defaults decide duplex/colour/paper |
 | Poll on canceled/aborted | Mark `PRINT_FAILED` immediately |
@@ -62,12 +66,12 @@ Referred to by name throughout — never "endpoint 1/2/3".
 | R9 | Query the folder, **last 20 days**, `PRINT_STATUS = "PRINT_PENDING"` | **Poll** step 1 | Window on `createdDateTime`, consistent with R16 |
 | R10 | `COMPLETED` → `PRINT_COMPLETED` | **Poll** step 3 | |
 | R11 | `Print_Message` = when it printed, `printed on 2026-08-01 14:23:23` | **Poll** step 3 | ⚠️ `printJob` has **no completion field**, so no exact answer exists. Uses the printer's own `acknowledgedDateTime`, falling back to the moment Poll observed completion; rendered in `America/Vancouver`. Documented, not fabricated (§P-3.5). **Revised — see below.** |
-| R12 | A third endpoint to re-submit outstanding jobs | **Resubmit** | |
-| R13 | `PRINT_PENDING` **or** `PRINT_FAILED` | **Resubmit** step 1 | |
-| R14 | Past 20 days | **Resubmit** step 2 | |
-| R15 | Older than 72 hours from the initial print request | **Resubmit** step 2 | |
-| R16 | Initial print request time = SharePoint file creation time | **Resubmit** step 2 | `listItem.createdDateTime` |
-| R17 | "Outstanding = `PRINT_STATUS` ≠ `PRINT_COMPLETED`" | **Resubmit** step 1 | ⚠️ **Contradiction resolved:** R17 also captures `PRINT_READY` and blank. You chose R13's literal reading |
+| ~~R12~~ | ~~A third endpoint to re-submit outstanding jobs~~ | **RETIRED** | No third endpoint exists. Recovery is Poll's |
+| ~~R13~~ | ~~`PRINT_PENDING` **or** `PRINT_FAILED`~~ | **RETIRED** | Poll queries `PRINT_PENDING` only. **`PRINT_FAILED` is now terminal** — nothing retries it |
+| ~~R14~~ | ~~Past 20 days~~ | **SUPERSEDED** | `giveUpDays`, default 10. It now *fails* the row rather than dropping it — this is what closes G1 |
+| ~~R15~~ | ~~Older than 72 hours~~ | **SUPERSEDED** | The exponential schedule: 5, 15, 35, 75 … minutes |
+| **R16** | Initial print request time = SharePoint file creation time | **Poll — `poll_decision`** | ✅ **Still in force.** The schedule reads `createdDateTime`; our own writes bump `lastModifiedDateTime`, so driving it from that would reset the file to age zero on every requeue and the retries would stop after the first |
+| ~~R17~~ | ~~"Outstanding = `PRINT_STATUS` ≠ `PRINT_COMPLETED`"~~ | **MOOT** | The contradiction was about which statuses a second query should sweep. There is one query |
 | R18 | Python | throughout | Azure Functions Python v2 model |
 | R19 | Reuse learnings/structure from `noble-invoice-process` | §8, §9, §13 | Playbook §§2.1–2.8, 5–7 applied |
 | R20 | Testing in the design | §10 | Five tiers |
@@ -88,7 +92,8 @@ Referred to by name throughout — never "endpoint 1/2/3".
 > | the moment Poll looked | **our cron** — moves if the schedule changes | up to a full 10-minute interval late |
 >
 > Poll now prefers the acknowledgement and falls back to the observed time when a job carries none.
-> Resubmit's `completed_late` branch uses the same source, because two paths writing one column must
+> Poll is now the ONLY writer of this column, so the class of disagreement this note guarded against
+> (two paths writing one column) is gone by construction. Kept because two paths writing one column must
 > agree. `tests/test_acknowledged_time.py`.
 >
 > The lesson is about the fake, not the field: **a fixture that omits a property teaches everyone the
@@ -97,10 +102,11 @@ Referred to by name throughout — never "endpoint 1/2/3".
 
 ### Gaps in the requirement, surfaced
 
-- **G1 — The 20-day cliff.** A file stuck at `PRINT_PENDING` beyond 20 days is excluded by **both**
-  Poll and Resubmit and becomes permanently invisible. This follows from the requirement's own
-  window. No behaviour change; mitigation is `scripts/test.py --stale` plus a KQL/SharePoint check
-  (§13.7). Documented in the runbook.
+- **G1 — The 20-day cliff. FIXED 2026-09-01.** A file stuck at `PRINT_PENDING` beyond 20 days used
+  to be excluded by **both** Poll and Resubmit and become permanently invisible — no status change,
+  no alert, and only a `staleCount` field to hint at it. Poll now examines **every** pending row and
+  writes `PRINT_FAILED` with a reason past `giveUpDays`, so no row strands *for age*. The `staleCount` /
+  `staleItems` fields and the `test.py stale` command are gone with the hole they described.
 - **G2 — `Printer_Name` holds an id, not a name.** Followed literally. The preflight already reads
   the share's `displayName`, so storing the friendly name later is a one-line change.
 - **G3 — Non-printable files.** Handled: the file's content type is checked against the share's
@@ -155,14 +161,11 @@ Recurrence → HTTP POST /api/print/status {"library","folder"}
           → Condition: status != 200 → notify
 ```
 Cadence is load-bearing: Poll must run more often than Universal Print discards finished jobs, or
-a completed job disappears before Poll sees it and Resubmit reprints it (UC-9). Measure that
+a completed job disappears before Poll sees it and Poll requeues it (UC-9). Measure that
 retention window during rollout (§4 open items) and set the cadence from the measurement.
 
-**Flow C — Print Resubmit** (daily, 02:00)
-```
-Recurrence → HTTP POST /api/print/resubmit {"library","folder","printerShareId"}
-          → Condition: status != 200 → notify
-```
+**Flow C — retired.** Recovery moved into Flow B. Delete this flow; leaving it
+running will 404 every night.
 
 **Flow D — Weekly digest** (Mondays 07:00) — see §13.7.
 
@@ -221,7 +224,7 @@ Read from Microsoft's documentation, not recalled.
 2. **Blob lease removed.** I proposed serialising refresh-token rotation with a blob lease. The
    platform does not revoke old refresh tokens on rotation, so concurrent refreshes both succeed
    and last-write-wins stores a valid token. One component deleted (§P-2 *Simplicity First*).
-3. **Resubmit had a double-print bug.** My earlier design resubmitted a `stopped` job without
+3. **Recovery had a double-print bug.** My earlier design replaced a `stopped` job without
    cancelling it. `stopped` means the printer needs attention **and the job can continue** — so
    when the printer is fixed, the old job *and* the new one both print. Fixed in §5.7: **cancel
    the old job before creating a replacement.** This is a correctness fix, not a refinement.
@@ -252,7 +255,7 @@ Read from Microsoft's documentation, not recalled.
 │  Power Automate  │   function-key auth    │        Function App  (Python v2)          │
 │  A Submit        │ ─────────────────────► │  function_app.py    3 routes, thin        │
 │  B Poll          │                        │        ├── print_policy.py   PURE rules   │
-│  C Resubmit      │ ◄───────────────────── │        │      stdlib only, no I/O         │
+│                  │                        │        │      stdlib only, no I/O         │
 │  D Weekly digest │   counts for looping   │        ├── sharepoint.py      adapter     │
 └──────────────────┘                        │        ├── universal_print.py adapter     │
          │                                  │        └── graph_client.py / graph_auth.py│
@@ -303,7 +306,7 @@ JOB_CONFIGURATION = {"copies": 1}   # printer defaults decide duplex/colour/pape
 POLICY_VERSION = "1.0"
 ```
 
-**Time discipline:** every window comparison (20 days, 72 hours) is done in **UTC** against
+**Time discipline:** every age comparison (the give-up threshold, the retry boundaries) is done in **UTC** against
 `createdDateTime`. `America/Vancouver` is used for **display only**, in the `printed on …`
 message. Mixing the two is how DST bugs get in; a test asserts both behaviours.
 
@@ -323,7 +326,7 @@ message. Mixing the two is how DST bugs get in; a test asserts both behaviours.
        ┌─────►│        PRINT_PENDING         │
        │      │  jobId set   = submitted OK  │
        │      │  jobId empty = crashed after │
-       │      │      claim (Resubmit's job)  │
+       │      │      claim (Poll requeues)   │
        │      └───┬───────────┬──────────┬───┘
        │          │           │          │
        │  Submit  │    Poll   │   Poll   │
@@ -334,12 +337,12 @@ message. Mixing the two is how DST bugs get in; a test asserts both behaviours.
        │  │ PRINT_FAILED  │ │PRINT_COMPLETED│
        │  └───────┬───────┘ │  (terminal)   │
        │          │         └───────────────┘
-       └──────────┴──  Resubmit: createdDateTime inside 20 days
-                       AND older than 72 h → cancel old job, re-claim
+       └──────────┴──  Poll: stalled past stallMinutes AND a new retry
+                       boundary crossed → cancel old job, back to PRINT_READY
 ```
 
 **Why the claim precedes submission (deviation at R5).** A crash after the claim leaves
-`PRINT_PENDING` with an empty `Print_JobId` — recovered by Resubmit after 72 h. A crash after
+`PRINT_PENDING` with an empty `Print_JobId` — requeued by Poll at the next retry boundary. A crash after
 submitting but before writing the status would print the document **twice** on the next run.
 *A recoverable lost print beats a silent double print.* The consequence the whole design must
 respect: **Poll must tolerate `PRINT_PENDING` rows with no job id and never treat them as errors.**
@@ -356,18 +359,39 @@ uses the pair, and so does every log correlation (§13.3).
 
 | Event | `Print_Status` | `Printer_Name` | `Print_JobId` | `Print_Message` |
 |---|---|---|---|---|
-| Submit — claim | `PRINT_PENDING` | share id | cleared | cleared |
+| Submit — claim | `PRINT_PENDING` | share id | cleared | **preserved** |
 | Submit — job started | — | — | job id | — |
 | Submit — failed (download/create/upload/start) | `PRINT_FAILED` | share id | — (stays empty) | error text, truncated |
 | Submit — claim lost (412) | — | — | — | — |
 | Poll — `completed` | `PRINT_COMPLETED` | — | — | `printed on YYYY-MM-DD HH:MM:SS` |
 | Poll — `canceled` / `aborted` | `PRINT_FAILED` | — | — | job `description` + `details` |
-| Poll — in-flight state or 404 | — | — | — | — |
-| Resubmit — re-claim | `PRINT_PENDING` | share id | cleared | cleared |
-| Resubmit — job already `completed` | `PRINT_COMPLETED` | — | — | `printed on …` |
-| Resubmit — job in flight | — | — | — | — |
+| Poll — in flight, inside the stall threshold | — | — | — | — |
+| Poll — stalled, inside the backoff gap | — | — | — | — |
+| Poll — stalled, retries exhausted, inside give-up | — | — | — | — |
+| **Poll — stalled, retry due** | `PRINT_READY` | — | **cleared** | **append** `Job Id N cancelled. Retry job` |
+| **Poll — past the give-up threshold** | `PRINT_FAILED` | — | — | **append** the give-up reason |
 
 This table **is** the Tier C test suite: one assertion per row.
+
+**The last two rows are the only places the app appends to `Print_Message`**
+rather than replacing it. Everywhere else the column is overwritten wholesale.
+`Print_JobId` is cleared on a requeue because the job has been cancelled and no
+longer exists — but its id survives inside the appended message, so the audit
+trail is not lost.
+
+> **Why the claim PRESERVES `Print_Message`** (it used to clear it). The retry
+> history is written by Poll on the way *out* of `PRINT_PENDING`; Submit's claim is
+> the very next write. Clearing there erased the history within one Flow A cycle —
+> at most fifteen minutes — so the column could never hold more than a single
+> entry and the append was a no-op in practice.
+>
+> Nothing is lost by keeping it. Every terminal outcome REPLACES the column:
+> `printed on …` on success, the error text on failure. So a stale entry can only
+> be visible while the row is `PRINT_PENDING`, which is exactly when someone
+> wondering "why is this taking so long?" wants to read it.
+>
+> `Print_JobId` is still cleared, and that half **is** load-bearing: a stale job id
+> would send Poll looking up a job belonging to a previous attempt.
 
 ### 5.5 Submit — sequence
 
@@ -378,7 +402,7 @@ POST /api/print/submit {library, folder, printerShareId, batchSize}
  ├─ 3 PREFLIGHT  GET /print/shares/{id}?$select=id,displayName,isAcceptingJobs,
  │                 capabilities,status&$expand=printer($select=id)
  │      reject early: share missing · not accepting jobs · contentTypes lacks the file type
- │      cache the PRINTER id from the expand — Resubmit needs it to cancel (§5.7)
+ │      cache the PRINTER id from the expand — Poll needs it to cancel (§5.7)
  ├─ 4 GET items  $filter=fields/<status> eq 'PRINT_READY'  $expand=fields
  │               Prefer: HonorNonIndexedQueriesWarningMayFailRandomly
  │               follow @odata.nextLink to a page cap
@@ -412,7 +436,7 @@ POST /api/print/submit {library, folder, printerShareId, batchSize}
 > started — paper is on its way. An unguarded failure there did two things: it killed the batch with
 > a 500, discarding the record of every file that had already printed, and it left the row at
 > `PRINT_PENDING` with an **empty** `Print_JobId` — which §5.3 defines as "a crashed submission
-> Resubmit owns". Resubmit would then print the document a second time. That is the silent double
+> a crashed submission". Poll would then print the document a second time. That is the silent double
 > print the claim-first ordering exists to prevent, reintroduced one line from the end. The write
 > cannot be recovered, so instead the batch continues, the per-item record carries a `warning`, and
 > an `ERROR` line names the coming duplicate — the only warning anyone will ever get. `PRINT_EVENT`
@@ -425,80 +449,126 @@ POST /api/print/submit {library, folder, printerShareId, batchSize}
 
 ### 5.6 Poll — sequence
 
-> **Revised after review (F1).** Poll originally took a batch, capped at 15. That
-> violated the requirement ("query ... for **all** files") and starved: taking the
-> oldest N meant a handful of long-running jobs held every slot run after run, so
-> a newer job that HAD completed was never marked and eventually aged past the
-> 20-day window into limbo. Poll now checks **every** job in the window, bounded
-> only by the wall-clock budget, and reports `uncheckedCount` if the budget trips.
+> **Revised twice.** After review (F1), Poll stopped taking a batch of 15: that
+> violated the requirement ("query ... for **all** files") and starved, because a
+> handful of long-running jobs held every slot run after run. Then on 2026-09-01
+> it absorbed Resubmit entirely, so it now owns the full lifecycle of a
+> `PRINT_PENDING` row.
 
 ```
-POST /api/print/status {library, folder, windowDays?=20}
+POST /api/print/status {library, folder,
+                        giveUpDays?=10, stallMinutes?=5, maxRetries?=10}
  ├─ validate → resolve list + columns
  ├─ GET items $filter=fields/<status> eq 'PRINT_PENDING'
- │     in Python: keep createdDateTime inside windowDays (UTC)
- │                SKIP items whose Print_JobId is empty   ← Resubmit owns those (§5.3)
- │                SKIP items whose Printer_Name is empty  ← defensive; report as malformed
- └─ per item: GET /print/shares/{Printer_Name}/jobs/{Print_JobId}
-      completed           → PRINT_COMPLETED + "printed on <now, America/Vancouver>"
-      canceled | aborted  → PRINT_FAILED + description/details
-      pending|processing|paused|stopped|unknown → write NOTHING
-      HTTP 404            → write NOTHING, report it; Resubmit handles it after 72 h
- ◄─ 200 {checked, completed, failed, stillRunning, notFound, malformed,
-         pendingInWindow, awaitingResubmit, uncheckedCount,
-         staleCount, staleItems, budgetExhausted, items:[…]}
+ │     NO window pre-filter. Every pending row reaches the loop -- an old one is
+ │     now FAILED explicitly rather than dropped out of scope (this is what
+ │     closes G1). No batch cap either; only the wall-clock budget bounds it.
+ │     SKIP items with a Print_JobId but no Printer_Name → report as malformed
+ └─ per item:
+      job = Print_JobId ? GET /print/shares/{Printer_Name}/jobs/{id} : none
+            404 → counted as notFound, then treated as "no job"
 
-      Three of those account for every row in the window exactly once:
-          checked + awaitingResubmit + uncheckedCount == pendingInWindow
-      `awaitingResubmit` counts the PRINT_PENDING-with-no-job-id rows -- the
-      normal crashed-submission state of §5.3. They used to be counted nowhere,
+      poll_decision(state, file age, job age, attempt age) → in ORDER:
+        1. completed            → PRINT_COMPLETED + "printed on <acknowledged>"
+                                  BEFORE the give-up test: a job that finished a
+                                  minute late still put paper in the tray
+        2. canceled | aborted   → PRINT_FAILED + description/details
+        3. past giveUpDays      → ***CANCEL***, then PRINT_FAILED + reason
+        4. stalled AND retries left AND a NEW boundary crossed
+                                → ***CANCEL***, then PRINT_READY + appended note
+        5. otherwise            → write NOTHING
+
+      "stalled" = no job at all (crashed submission or 404), or a live
+      non-terminal job whose own createdDateTime is older than stallMinutes.
+      A job whose age cannot be determined is NOT stalled -- cancelling one that
+      might be printing would queue a second copy.
+
+ ◄─ 200 {checked, completed, failed, requeued, gaveUp, stillRunning, notFound,
+         malformed, pendingFound, uncheckedCount, budgetExhausted,
+         giveUpDays, stallMinutes, maxRetries, items:[…]}
+
+      Two of those account for every row exactly once:
+          checked + uncheckedCount == pendingFound
+      A crashed submission (PRINT_PENDING, no job id) lands in `checked` like
+      anything else, because Poll now acts on it. It used to be counted nowhere,
       so the one state the design tells you to expect was the one the response
-      could not show, and a growing pile of them stayed invisible until Resubmit
-      picked them up 72 h later (S5).
+      could not show (S5).
+
+      The three knobs are echoed back so the response says what was actually in
+      force, not what the flow believed it sent.
 ```
 
-### 5.7 Resubmit — sequence
+### 5.7 The retry schedule
+
+Retry `n` falls due at file age **`stallMinutes × (2ⁿ − 1)`**. With the defaults:
+
+| Retry | Due at | | Retry | Due at |
+|---|---|---|---|---|
+| 1 | 5 min | | 6 | 5h 15m |
+| 2 | 15 min | | 7 | 10h 35m |
+| 3 | 35 min | | 8 | 21h 15m |
+| 4 | 1h 15m | | 9 | 1d 18h 35m |
+| 5 | 2h 35m | | 10 | 3d 13h 15m |
+
+**The count is derived, never stored.** The schema is four columns and there is no
+attempt counter. Because every requeue creates a *new* print job, the current
+job's creation time says how far into the schedule this attempt began:
+
+> A requeue is due iff the job is stalled **and**
+> `retries_due(now) > retries_due(the file's age when this attempt started)`.
 
 ```
-POST /api/print/resubmit {library, folder, printerShareId?, windowDays?=20,
-                          minAgeHours?=72, batchSize?}
- ├─ validate → resolve list + columns → preflight printer (captures the PRINTER id)
- ├─ TWO queries, unioned: fields/<status> eq 'PRINT_PENDING'
- │                        fields/<status> eq 'PRINT_FAILED'
- │    (not `ne PRINT_COMPLETED`: only one indexed field may be filtered, `ne` on text
- │     is weakly supported, and the union matches R13)
- ├─ in Python: inside windowDays AND older than minAgeHours (UTC, from createdDateTime)
- │             sort LEAST RECENTLY ATTEMPTED first (lastModifiedDateTime), take batchSize
- │             (F2: createdDateTime never changes, so ordering a RETRY queue by it
- │              means a file that fails every time is chosen every time and nothing
- │              newer is ever reached. Eligibility still uses createdDateTime — R16
- │              says the print request time IS the file creation time.)
- └─ per candidate:
-      has Print_JobId? → GET the job first
-           completed             → PRINT_COMPLETED + message; DO NOT reprint
-           pending | processing  → leave untouched, count stillRunning
-           paused|stopped|unknown → ***CANCEL FIRST***, then resubmit
-                POST /print/printers/{printerId}/jobs/{jobId}/cancel → 204
-                the printerId is the ORIGINAL printer's, resolved from the item's
-                Printer_Name -- NOT the request's override. Aiming at the new
-                printer 404s, and a 404 reads as "already gone", so it would
-                report a clean cancel while the original stayed alive (F3).
-                best-effort: on failure, log and still resubmit
-           canceled | aborted    → already terminal, no cancel needed → resubmit
-           HTTP 404              → nothing to cancel → resubmit
-      no Print_JobId (claim-crash row) → resubmit directly
-      resubmit == the SAME per-file routine Submit uses (§5.5 steps 5.1–5.7)
-      printer = request printerShareId, else the item's Printer_Name,
-                else fail that item with a clear message
- ◄─ 200 {candidatesFound, resubmitted, completedInstead, stillRunning,
-         cancelled, failed, items:[…]}
+T+0    file created, job J1                retries_due(0)  = 0
+T+5    J1 stalled                          retries_due(5)  = 1 > 0  -> REQUEUE
+T+12   Submit creates J2                   retries_due(12) = 1
+T+17   J2 stalled                          retries_due(17) = 2 > 1  -> REQUEUE
+T+27   Submit creates J3                   retries_due(27) = 2
+T+32   J3 stalled                          retries_due(32) = 2      -> wait
+T+40   J3 still stalled                    retries_due(40) = 3 > 2  -> REQUEUE
 ```
 
-> **Why cancel first.** `stopped` means "an issue with the printer needs to be addressed **before
-> the job can continue**" — the job is alive. Resubmitting without cancelling means that when the
-> printer is fixed, the original *and* the replacement both print. Cancel is best-effort: if it
-> fails we still resubmit, because a stuck document is the worse outcome — but we log it, and the
-> log line is what tells you a duplicate is possible.
+The T+32→T+40 gap **is** the backoff. Without it an offline printer would be
+retried every ten minutes all night, each round costing a render, a PDF→PWG
+conversion and an upload.
+
+> **A boundary is when a retry becomes DUE, not when it happens.** Poll acts on
+> its next run, so the observed times are quantised to Flow B's ten-minute
+> cadence — and the first two boundaries, 5 and 15 minutes, fall inside a single
+> interval. Simulated against the real `poll_decision` with the shipped defaults,
+> a permanently stalled file produces **nine requeue events**, at roughly 10, 40,
+> 80, 160, 320, 640, 1280, 2560 and 5120 minutes, carrying retry numbers 1 and
+> 3–10; number 2 is consumed by the cadence. Give-up then lands at 10.01 days.
+>
+> This matters when reading a live run: expect the first requeue at ≈10 minutes,
+> not ≈5. Lowering `stallMinutes` below the polling interval does not make the
+> early retries faster — only shortening Flow B's recurrence does.
+
+**Two bounds doing different jobs.** `maxRetries` bounds the *work* and stops new
+jobs at about 3d 13h. `giveUpDays` bounds the *waiting* and fails the row at 10
+days. Between them sits a **grace period** of roughly 6½ days in which no further
+work is spent but the final job stays live — so a printer that comes back still
+gets the document out, and check 1 records it as printed.
+
+> **Why cancel first.** `stopped` means "an issue with the printer needs to be
+> addressed **before the job can continue**" — the job is alive. Requeue without
+> cancelling and, when the printer is fixed, the original *and* the replacement
+> both print. Cancel is best-effort: on failure we still requeue, because a stuck
+> document is the worse outcome — but we log it, and that log line is what tells
+> you a duplicate is possible.
+>
+> **Giving up cancels too.** Otherwise an abandoned job prints days later against
+> a row that reads `PRINT_FAILED`, and the column is lying about paper.
+>
+> Cancel is documented only on `/print/printers/{id}/jobs/{id}/cancel`, so it needs
+> the PRINTER id resolved from the share named in `Printer_Name`.
+
+### 5.8 Tuning without a deploy
+
+`batchSize`, `giveUpDays`, `stallMinutes` and `maxRetries` resolve **request body
+→ app setting → default**. The request body is how Power Automate sets them, so
+the pacing of the whole retry schedule is a number in a flow, not a redeploy. An
+out-of-range *request* value is a 400; an out-of-range *app setting* warns and
+falls back, because a server misconfiguration must not fail every call.
 
 ---
 
@@ -530,7 +600,7 @@ as a 500 naming `scripts/bootstrap_token.py`.
 **6.5 Configuration (§P-2.7).** Values that **name an environment** get no default and raise when
 missing: `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `KEY_VAULT_URI`, `SHAREPOINT_HOSTNAME`,
 `SHAREPOINT_SITE_PATH`. **Tunables** get a constant default + env override + **range validation**:
-`PRINT_BATCH_SIZE`, `PRINT_STATUS_WINDOW_DAYS`, `PRINT_RESUBMIT_MIN_AGE_HOURS`,
+`PRINT_BATCH_SIZE`, `PRINT_GIVE_UP_DAYS`, `PRINT_STALL_MINUTES`, `PRINT_MAX_RETRIES`,
 `PRINT_BUSINESS_TZ`, `GRAPH_TIMEOUT_SECONDS`. Out-of-range **request** → 400; out-of-range **env**
 → warn and fall back, because server misconfiguration must not fail every request.
 
@@ -561,12 +631,12 @@ kind of configuration: setting it appeared to work and did nothing (S4).
 | **UC-2** | Printer share offline / not accepting jobs. | Preflight fails **before any claim**. 200, `submitted: 0`, clear message, **no column touched**. Files stay `PRINT_READY`. |
 | **UC-3** | Unsupported file type. | Caught at preflight against `capabilities.contentTypes`; that file gets `PRINT_FAILED` + explicit message, not an opaque upload error. |
 | **UC-4** | Job prints normally. Flow B runs. | `PRINT_COMPLETED`, `Print_Message = "printed on 2026-08-30 14:23:23"` (Vancouver). Terminal. |
-| **UC-5** | Someone cancels at the printer. | Poll sees `canceled` → `PRINT_FAILED` + description. Flow C reprints 72 h later. |
-| **UC-6** | Crash between claim and job creation. | `PRINT_PENDING`, **empty** `Print_JobId`. Poll skips it. Flow C resubmits after 72 h. No double print, no lost file. |
+| **UC-5** | Someone cancels at the printer. | Poll sees `canceled` → `PRINT_FAILED` + description. **Terminal** — a deliberate cancel is respected, not undone. |
+| **UC-6** | Crash between claim and job creation. | `PRINT_PENDING`, **empty** `Print_JobId`. Poll reads that as stalled and requeues it at the next Poll run, ≈10 min. No double print, no lost file. |
 | **UC-7** | Flow A schedules overlap; two runs start together. | Both pick the same files; `If-Match` means exactly one wins per file, the loser records `skipped`. **No file printed twice.** |
-| **UC-8** | Printer unplugged; job sits `stopped` for 4 days. | Poll writes nothing. Flow C at 72 h **cancels the stopped job**, then resubmits. When the printer is fixed the old job is gone, so only the replacement prints. |
-| **UC-9** | Job completes but Universal Print purges it before Poll runs. | Poll gets 404 and writes nothing. Flow C resubmits after 72 h → **prints twice.** Mitigated by keeping Poll's cadence inside the measured retention window (§3). |
-| **UC-10** | `PRINT_PENDING`, 25 days old. | Excluded by both Poll and Resubmit — permanently stuck (**G1**). `--stale` and the §13.6 workbook tile report it. |
+| **UC-8** | Printer unplugged; job sits `stopped` for 4 days. | Poll **cancels the stopped job** and requeues on the backoff, the last requeue at ~3d 13h, then holds. When the printer is fixed the old jobs are gone, so only the newest prints. |
+| **UC-9** | Job completes but Universal Print purges it before Poll runs. | Poll gets 404, reads it as stalled and requeues → **prints twice.** Unchanged in likelihood — the risk is set by Poll's 10-minute cadence against the retention window (§3) — but the reprint now lands in minutes, not days. |
+| **UC-10** | `PRINT_PENDING`, 25 days old. | **FIXED.** Past `giveUpDays` Poll cancels the outstanding job and writes `PRINT_FAILED` with a reason. Nothing strands (**G1** closed). |
 | **UC-11** | Malformed request. | 400 with a specific message and **zero** SharePoint writes, so the corrected retry is not locked out. |
 | **UC-12** | Refresh token revoked (service account password reset). | Every endpoint 500s with an unambiguous "re-run `scripts/bootstrap_token.py`"; no partial writes; Flow C's notification fires. |
 | **UC-13** | "How many printed last week?" | §13.5 query 2, or the workbook's weekly chart. |
@@ -624,7 +694,8 @@ configurability nobody requested (§P-2).
 ## 10. Testing
 
 **Tier A — pure rules, `tests/test_print_policy.py`** (stdlib only, no network, sub-second)
-- 20-day and 72-hour boundaries: exactly 72 h, 71:59, 72:01; a window edge across a Vancouver DST
+- Retry boundaries pinned literally (5, 15, 35, 75, 155, 315, 635, 1275, 2555, 5115 min); the
+  give-up edge across a Vancouver DST
   transition — **asserting the window is computed in UTC while the message renders local**
 - oldest-first selection ascending, deterministic on ties; exactly `batchSize` taken
 - all **8** job states map to the right action, including `unknown` and the cancel-first set
@@ -656,12 +727,18 @@ token provider. **The §5.4 write matrix is the specification: one test per row.
 - `412` on claim → `skipped`, **no print job created** (UC-7)
 - bad request → 400 with **zero** SharePoint writes (UC-11)
 - budget exhaustion stops **between** files, never leaving a claimed-but-unsubmitted row
-- Poll: `completed` → exact regex; `canceled`/`aborted` → `PRINT_FAILED`; **in-flight and 404 write
-  nothing**; outside 20 days excluded; empty `Print_JobId` and empty `Printer_Name` skipped (UC-6)
-- Resubmit: only the two statuses (**never `PRINT_READY` or blank** — guards the R17 decision);
-  only inside 20 days and older than 72 h; a `completed` job marked completed and **not reprinted**;
-  an in-flight job left alone; **a `stopped` job is cancelled before the replacement is created**
-  (UC-8) and a failed cancel still resubmits but is logged; a claim-crash row resubmitted
+- Poll — completion and failure: `completed` → exact regex, and it wins even past the give-up
+  deadline; `canceled`/`aborted` → `PRINT_FAILED`; a job inside `stallMinutes` writes nothing;
+  empty `Printer_Name` reported as malformed
+- Poll — the retry schedule: every boundary pinned literally (5/15/35/…/5115 min); a stalled job
+  **inside the backoff gap writes nothing**; a crashed submission (empty `Print_JobId`, UC-6) and a
+  404 are both requeued; a job whose age cannot be determined is left alone
+- Poll — **a stalled job is CANCELLED before the requeue** (D1/UC-8), the cancel uses the PRINTER id
+  from the row's own `Printer_Name`, and a failed cancel still requeues but is logged
+- Poll — giving up: past `giveUpDays` the outstanding job is cancelled and the row written
+  `PRINT_FAILED` with a reason; exhausted retries open the **grace period** instead of failing
+- Poll — tunables: `giveUpDays`/`stallMinutes`/`maxRetries` honoured from the request body, echoed
+  in the response, and an out-of-range one is a 400 that writes nothing
 - auth: live token reused; near-expiry triggers exactly one refresh; rotated token written back;
   a revoked token surfaces the bootstrap message (UC-12)
 - **logging:** every terminal per-file outcome emits exactly one `PRINT_EVENT` with the documented
@@ -676,18 +753,20 @@ token provider. **The §5.4 write matrix is the specification: one test per row.
   than logic in the harness: it therefore exercises the same auth, resolution and
   queries the real run uses, so a green dry run is evidence about the deployed
   app rather than about a script.
-- **`staleCount` / `staleItems` on Poll.** The files past the 20-day window (G1),
-  which both Poll and Resubmit exclude and nothing will ever touch again.
-  Reporting them costs no extra API call — they are already in the result set —
-  and it is the only automatic signal that a document is stranded. Poll reports
-  them and never writes to them: deciding what to do is a human's call.
+- ~~**`staleCount` / `staleItems` on Poll.**~~ **Removed 2026-09-01.** They
+  reported the files past the 20-day window that nothing would ever touch again
+  (G1). That hole is now fixed rather than reported: Poll examines every pending
+  row and writes `PRINT_FAILED` with a reason past `giveUpDays`, so there is
+  nothing left to strand. Leaving the fields in would report zero forever and
+  imply the cliff was still there.
 
 **Tier D — one live harness, `scripts/test.py`** (stdlib only; `pytest.ini` sets `testpaths = tests`).
 `--base-url` defaults to `http://localhost:7071`, `--key` for the deployed app (§P-6.5).
-Subcommands `submit` / `status` / `resubmit`, plus `--dry-run` (resolve site, list, **the four
+Subcommands `submit` / `status`, plus `dryrun` (resolve site, list, **the four
 internal column names**, index and content-approval state, printer capabilities and printer id —
-print them, print nothing on paper), `--stale` (rows past the 20-day window, UC-10/G1), and
-`--bad-payload` (must 400 with no writes).
+print them, print nothing on paper) and `badpayload` (must 400 with no writes). The retry knobs
+`--stall-minutes` / `--give-up-days` / `--max-retries` go into the body exactly as a flow sends
+them, so a value can be proved here before it is pasted into Power Automate.
 
 **Tier E — deploy smoke sequence** (§P-7.6): bad payload → 400 · `--dry-run` → resolved names ·
 one real file → a job id · **then read the four SharePoint columns back** · **then run §13.5 query
@@ -730,8 +809,16 @@ Then open the library and confirm the four columns match §5.4.
 ## 12a. Findings from the post-implementation review
 
 Six defects were found by reviewing the finished code against the requirement.
-Each has a regression test in `tests/test_review_findings.py` that failed before
+Each had a regression test in `tests/test_review_findings.py` that failed before
 the fix. Recorded here because the reasoning is worth more than the diff.
+
+> **F2, F3 and F6 are history, not live behaviour.** All three were properties of
+> the Resubmit endpoint's shape, and all three became *structurally impossible*
+> when it was retired: Poll has no batch cap (F2), takes no printer override (F3),
+> and runs one query (F6). Their tests went with the endpoint; the reasons are
+> kept at the head of `test_review_findings.py` so a deleted regression cannot
+> quietly come back. **D1 — cancel before replace — did NOT go away**, and its
+> tests were ported into `test_poll.py` before `test_resubmit.py` was deleted.
 
 | # | Defect | Why it mattered |
 |---|---|---|
@@ -743,8 +830,10 @@ the fix. Recorded here because the reasoning is worth more than the diff.
 | **F6** | Resubmit could process one file twice | Its two status queries run at different instants; a file whose status changes between them appeared in both result sets |
 
 **Requirements conformance** is now asserted directly, clause by clause, in
-`tests/test_requirements.py` (31 tests) — including the four places the
-implementation deliberately departs from the literal text (R3, R5, R6, R17).
+`tests/test_requirements.py` (26 tests) — including the places the implementation
+deliberately departs from the literal text (R3, R5, R6). R12–R17 described the
+retired Resubmit endpoint; only R16 survives, and it is pinned harder than before
+because the retry schedule depends on it.
 
 ## 13. Reporting and observability
 
@@ -784,7 +873,7 @@ PRINT_EVENT  ep=submit item=42 from=PRINT_READY to=PRINT_PENDING job=1825
 ```
 
 `result` vocabulary — a closed set, so the counts are exhaustive:
-`submitted · resubmitted · failed · skipped · completed · completed_late · failed_terminal ·
+`submitted · failed · skipped · completed · failed_terminal · requeued · gave_up ·
 not_found · cancelled`
 
 Nine values, and every one of them is emitted somewhere — checked by grep, not assumed. Note what
@@ -828,10 +917,11 @@ traces
 | parse message with "PRINT_EVENT ep=" ep " item=" item " from=" fromStatus " to=" toStatus
                     " job=" job " printer=" printer " result=" result " ms=" ms:long " file=" file
 | summarize
-    submitted = countif(ep == "submit"   and result == "submitted"),
-    retried   = countif(ep == "resubmit" and result == "resubmitted"),
-    completed = countif(result == "completed" or result == "completed_late"),
-    failed    = countif(result == "failed"    or result == "failed_terminal"),
+    submitted = countif(ep == "submit" and result == "submitted"),
+    retried   = countif(ep == "poll"   and result == "requeued"),
+    completed = countif(result == "completed"),
+    failed    = countif(result == "failed" or result == "failed_terminal"),
+    gaveUp    = countif(result == "gave_up"),
     cancelled = countif(result == "cancelled"),
     filesTouched = dcount(item)
   by week = startofweek(timestamp)
@@ -854,7 +944,7 @@ traces
 | where timestamp > ago(30d) and message startswith "PRINT_EVENT"
 | parse message with "PRINT_EVENT ep=" ep " item=" item " from=" fromStatus " to=" toStatus
                     " job=" job " printer=" printer " result=" result " ms=" ms:long " file=" file
-| where ep == "resubmit" and result == "resubmitted"
+| where ep == "poll" and result == "requeued"
 | summarize retries = count(), lastTry = max(timestamp), any(file) by item
 | where retries > 1
 | order by retries desc
@@ -904,9 +994,12 @@ Also worth pinning, from Function App → **Metrics**: `Requests` (Sum), `Http 5
 For "how many are pending / failed / completed **right now**", the library answers directly and
 exactly:
 
-- **In SharePoint:** create a view grouped by `Print_Status`. Group headers show live counts. Add
-  a second view filtered to `Print_Status = PRINT_PENDING` **and** `Created < today-20` to surface
-  the G1/UC-10 stuck files.
+- **In SharePoint:** create a view grouped by `Print_Status`. Group headers show live counts.
+  The second view this used to recommend — `PRINT_PENDING` **and** `Created < today-20`, to surface
+  the G1/UC-10 stuck files — is **no longer needed**: past `giveUpDays` Poll writes `PRINT_FAILED`
+  itself, so those rows now appear under the `PRINT_FAILED` group with a reason in `Print_Message`.
+  A view worth keeping instead: `Print_JobId` is not empty **and** `Printer_Name` is empty, which is
+  the one row shape Poll reports every run but cannot resolve (**G3**).
 - **Flow D — Weekly digest** (Mondays 07:00): SharePoint **Get items** with
   `$filter=Print_Status eq 'PRINT_PENDING'` (repeat per status), take `length()` of each, and email
   the four counts plus a link to the workbook. Pure Power Automate — **no function code**.

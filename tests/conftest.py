@@ -39,8 +39,8 @@ def clean_env(monkeypatch):
     what the suite asserts; the two required settings are supplied so the
     resolve path works without each test repeating them.
     """
-    for name in ("PRINT_BATCH_SIZE", "PRINT_STATUS_WINDOW_DAYS",
-                 "PRINT_RESUBMIT_MIN_AGE_HOURS", "PRINT_BUDGET_SECONDS",
+    for name in ("PRINT_BATCH_SIZE", "PRINT_GIVE_UP_DAYS", "PRINT_STALL_MINUTES",
+                 "PRINT_MAX_RETRIES", "PRINT_BUDGET_SECONDS",
                  "PRINT_BUSINESS_TZ", "PRINT_REFRESH_TOKEN"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("SHAREPOINT_HOSTNAME", "contoso.sharepoint.com")

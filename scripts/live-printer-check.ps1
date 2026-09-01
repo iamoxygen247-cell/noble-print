@@ -358,7 +358,7 @@ switch ($state) {
     }
     { $_ -in @("canceled", "aborted") } {
         Write-Host "  The job ended as '$state' without printing." -ForegroundColor Red
-        Write-Host "  Poll would write PRINT_FAILED and Resubmit would retry after 72h."
+        Write-Host "  Poll would write PRINT_FAILED. That status is TERMINAL -- nothing retries it."
     }
     default {
         Write-Host "  Still '$state' after $PollSeconds seconds -- it has NOT printed." -ForegroundColor Red
@@ -369,7 +369,8 @@ switch ($state) {
         Write-Host "  the connector service, or that the printer itself is online." -ForegroundColor Yellow
         Write-Host ""
         Write-Host "  Note for the pipeline: a job stuck like this stays PRINT_PENDING." -ForegroundColor Yellow
-        Write-Host "  Poll writes nothing, and Resubmit cancels and retries it after 72h."
+        Write-Host "  Poll cancels this job and requeues the file on an exponential backoff,"
+        Write-Host "  first requeue about 10 min after the file was created (Poll runs every 10)."
     }
 }
 

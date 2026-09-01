@@ -6,10 +6,12 @@ test_review_findings.py so the two review passes stay separately legible.
 
   S1  A failure on the FINAL patch -- the one that records Print_JobId -- was
       unguarded. It aborted the whole batch with a 500 AND left the file at
-      PRINT_PENDING with an empty job id, which the design defines as "a crashed
-      submission Resubmit owns". So a document that printed perfectly well would
-      be reprinted 72 hours later: the exact silent double print the claim-first
-      ordering exists to prevent, reintroduced one line from the end.
+      PRINT_PENDING with an empty job id, which the design defines as a crashed
+      submission. So a document that printed perfectly well would be reprinted:
+      the exact silent double print the claim-first ordering exists to prevent,
+      reintroduced one line from the end. Retiring Resubmit SHARPENED this --
+      recovery moved from a 72-hour wait to Poll's next run, roughly ten minutes,
+      so the duplicate now arrives before anyone can read the log.
   S2  The "whole-invocation" wall-clock budget was started AFTER site resolution,
       the printer preflight and the SharePoint query. Time spent there did not
       count, so a slow query plus a full file loop could run well past Power
@@ -87,9 +89,10 @@ def test_a_lost_job_id_write_does_not_abort_the_batch(graph, monkeypatch):
 def test_a_lost_job_id_write_is_reported_as_a_duplicate_risk(graph, monkeypatch,
                                                              caplog):
     """The document IS printing -- the job was created and started. What is lost
-    is our record of it, and the consequence is specific: Resubmit will treat the
-    row as a crashed submission and print it again in 72 hours. That has to be
-    loud, because nothing else will ever say it."""
+    is our record of it, and the consequence is specific: Poll will read the row
+    as a crashed submission and requeue it within about ten minutes. That has to
+    be loud, because nothing else will ever say it -- and the window in which a
+    human could intervene is now minutes rather than days."""
     _break_the_job_id_write(monkeypatch)
     graph.add_item("1", status=print_policy.READY, created=iso(days=1))
 
@@ -235,23 +238,29 @@ def test_the_unauthenticated_calls_use_the_same_resolved_timeout(monkeypatch):
     assert seen["get"] == 45.0
 
 
-# --- S5: Poll must account for every row in the window ------------------------
+# --- S5: Poll must account for every pending row ------------------------------
 
 
-def test_poll_accounts_for_every_pending_row_in_the_window(graph, frozen_now):
+def test_poll_accounts_for_every_pending_row(graph, frozen_now):
     """A PRINT_PENDING row with no job id is normal, not an error (design §5.3):
-    Submit claimed it and crashed before creating the job, and Resubmit owns it.
-    Counting it nowhere made the one state the design tells you to expect the one
-    state the response cannot show."""
+    Submit claimed it and crashed before creating the job. Counting it nowhere
+    made the one state the design tells you to expect the one state the response
+    could not show, and the numbers did not add up.
+
+    The invariant survives the retirement of Resubmit; only the field names moved.
+    `awaitingResubmit` is gone because nothing is awaited any more -- Poll requeues
+    the crashed row itself, so it lands in `checked` like every other row.
+    """
     graph.add_item("1", status=print_policy.PENDING, job_id="",
                    printer=graph.SHARE_ID, created=iso(days=1))
     graph.add_item("2", status=print_policy.PENDING, job_id="1801",
                    printer=graph.SHARE_ID, created=iso(days=1))
-    graph.add_job("1801", state="completed")
+    graph.add_job("1801", state="completed", created=iso(days=1))
 
     payload = as_json(post(POLL, BODY))
 
-    assert payload["awaitingResubmit"] == 1
-    assert (payload["checked"] + payload["awaitingResubmit"]
-            + payload["uncheckedCount"]) == payload["pendingInWindow"], \
-        "the counts must add up to the rows in the window"
+    assert "awaitingResubmit" not in payload,         "nothing awaits Resubmit any more; the crashed row is handled here"
+    assert payload["requeued"] == 1, "the crashed submission was recovered"
+    assert payload["completed"] == 1
+    assert (payload["checked"] + payload["uncheckedCount"]
+            == payload["pendingFound"]),         "the counts must add up to the rows found"

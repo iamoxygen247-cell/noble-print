@@ -55,33 +55,62 @@ deliberate deviation (design R5) because the two orderings fail differently:
 
 | ordering | a crash means |
 |---|---|
-| claim first | the print is lost — Resubmit recovers it after 72 h |
+| claim first | the print is lost — Poll requeues it at the next boundary, ≈10 min in practice |
 | claim last | the document prints **twice** — nothing recovers that |
 
 A recoverable lost print beats a silent double print. `test_the_claim_precedes_
 the_print_job` pins the ordering; do not "tidy" it.
 
 Consequence: **a `PRINT_PENDING` row with an empty `Print_JobId` is normal**, not
-an error. Poll must skip it (but still count it — `awaitingResubmit`); Resubmit
-owns it.
+an error. It is a crashed submission, and **Poll requeues it** — sets it back to
+`PRINT_READY` so Submit picks it up again.
 
 Second consequence, and the one that already bit once (S1): **the PATCH that
 writes `Print_JobId` must never be allowed to raise.** By then the job is created
 *and* started — paper is on its way — so an unguarded failure leaves exactly the
-row shape above, and Resubmit prints the document again 72 h later. The write
-cannot be recovered; what it must do instead is keep going and say so, with a
-`warning` on the item and an `ERROR` line naming the coming duplicate.
+row shape above, and the document prints again. The write cannot be recovered;
+what it must do instead is keep going and say so, with a `warning` on the item and
+an `ERROR` line naming the coming duplicate. **Moving recovery into Poll made this
+sharper**: the duplicate used to arrive 72 h later, and now arrives in roughly ten
+minutes, before anyone reads the log.
 
 ### 2. A stalled job is cancelled before it is replaced
 
 Graph defines `stopped` as "an issue with the printer needs to be addressed
-**before the job can continue**" — the job is alive. Resubmitting without
-cancelling means the original and the replacement both print once someone clears
-the jam. Cancel is best-effort: a failure still resubmits, but it is logged,
-because that log line is the only warning a duplicate may appear.
+**before the job can continue**" — the job is alive. Requeuing without cancelling
+means the original and the replacement both print once someone clears the jam.
+Cancel is best-effort: a failure still requeues, but it is logged, because that
+log line is the only warning a duplicate may appear.
+
+The same applies when Poll **gives up**: the outstanding job is cancelled before
+`PRINT_FAILED` is written, or an abandoned job could print days later against a
+row claiming it failed.
 
 Cancel is documented **only** on `/print/printers/{id}/jobs/{id}/cancel`, so it
-needs the printer id, not the share id. The preflight captures it.
+needs the printer id, not the share id. `_cancel_outstanding` resolves it from the
+share named in `Printer_Name`.
+
+### 2a. Recovery is Poll's, on an exponential schedule
+
+There is **no Resubmit endpoint** — it was retired 2026-09-01 and its work folded
+into Poll, which runs every 10 minutes instead of daily.
+
+Retry `n` falls **due** at file age `stallMinutes × (2ⁿ − 1)` — 5, 15, 35, 75 …
+minutes by default. Poll acts on its next run, so observed requeues are quantised
+to Flow B's 10-minute cadence: the first one lands at ≈10 min, not ≈5, and nine
+events fire rather than ten. The count is **derived from the file's age, never
+stored**: the schema
+is four columns and no attempt counter. `retries_due` evaluated at the current
+job's creation time says how many retries preceded it, because every requeue makes
+a new job. Do not add a counter column to "simplify" this.
+
+Two bounds, doing different jobs: `maxRetries` (10) stops new jobs at ~3d 13h;
+`giveUpDays` (10) stops waiting. Between them is a **grace period** where the last
+job stays live and can still print.
+
+All three knobs, plus `batchSize`, are read from the **Power Automate request
+body** first, then app settings, then defaults — so pacing is retuned without a
+deploy.
 
 ### 3. Two calls must NOT carry an Authorization header
 
@@ -95,7 +124,7 @@ everywhere" will break both, one silently.
 
 ### 4. `print_policy.py` imports only the standard library
 
-That constraint is what keeps 353 tests offline and sub-second, and what makes the
+That constraint is what keeps 389 tests offline and sub-second, and what makes the
 utility reusable — another workflow keeps the adapters and replaces only the
 rules. `test_print_policy_imports_only_the_standard_library` enforces it.
 
@@ -107,10 +136,10 @@ in a route belongs in `print_policy`.
 ## Standard Commands
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest              # 353 tests, offline, ~0.3s
+.\.venv\Scripts\python.exe -m pytest              # 389 tests, offline, ~0.6s
 .\scripts\start-local.ps1                         # venv + TLS shim + func start
 .\.venv\Scripts\python.exe scripts\bootstrap_token.py
-.\.venv\Scripts\python.exe scripts\test.py dryrun --library "Documents" --folder "/Invoices/ToPrint" --printer-share-id <guid>
+.\.venv\Scripts\python.exe scripts\test.py dryrun --library "AI_DropBox_V2026" --folder "/Backup/Invoice" --printer-share-id <guid>
 ```
 
 If a command fails, find the failing layer before editing: command syntax →
@@ -126,12 +155,12 @@ Five tiers, all but the last offline (design §10):
 |---|---|---|
 | A | `test_print_policy.py` | the rules — windows, state mapping, formatting |
 | B | `test_adapters.py` | the adapters against `FakeGraph` |
-| C | `test_submit/poll/resubmit/auth.py` | the routes, end to end |
+| C | `test_submit/poll/auth.py` | the routes, end to end. **Poll carries the retry schedule, the cancel-first guard and the give-up path** |
 | C | `test_requirements.py` | **conformance, one test per requirement clause** |
 | C | `test_review_findings.py` | the six defects the first review found; each failed first |
 | C | `test_second_review.py` | the five the second review found (S1–S5); each failed first |
-| C | `test_acknowledged_time.py` | `printed on ...` uses the printer's `acknowledgedDateTime`, not our polling clock |
-| C | `test_real_printer.py` | the real Brother registration — share-id vs printer-id |
+| C | `test_acknowledged_time.py` | `printed on ...` uses the printer's `acknowledgedDateTime`, not our polling clock; and the stall clock reads `createdDateTime`, not it |
+| C | `test_dryrun.py` | the dry run, and that the 20-day strand (G1) is fixed rather than merely reported |
 | A | `test_make_test_pdf.py` | the live-test document is a structurally valid PDF |
 | D | `scripts/test.py` | the live host — **not** collected by pytest |
 | E | the deploy smoke sequence | design §11 |

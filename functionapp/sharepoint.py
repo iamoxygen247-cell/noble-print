@@ -88,8 +88,10 @@ class PrintFile:
     etag: Optional[str]
     created: Optional[datetime]
     # When SharePoint last wrote the row. OUR OWN patches bump it, which makes it
-    # a "last attempted" stamp -- the thing Resubmit orders on so a chronically
-    # failing file cannot monopolise every run (see print_policy.select_oldest).
+    # a "last attempted" stamp. Poll uses it as the start of the current attempt
+    # when there is no print job to read a createdDateTime from -- a crashed
+    # submission -- which is how the retry schedule places such a row without an
+    # attempt counter (see print_policy.poll_decision).
     modified: Optional[datetime]
     file_name: str
     folder: str

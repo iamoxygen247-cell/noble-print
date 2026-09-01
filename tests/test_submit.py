@@ -16,7 +16,8 @@ import pytest
 
 import print_policy
 import universal_print
-from helpers import SUBMIT, as_json, post, print_events, result_for, run_summaries
+from helpers import (POLL, SUBMIT, as_json, post, print_events, result_for,
+                     run_summaries)
 
 BODY = {"library": "Documents", "folder": "/Invoices/ToPrint",
         "printerShareId": "share-guid"}
@@ -52,7 +53,7 @@ def test_submits_a_ready_file_and_records_the_job(graph):
 def test_the_claim_precedes_the_print_job(graph):
     """THE ordering guarantee.
 
-    Claim first: a crash loses the print, and Resubmit recovers it after 72h.
+    Claim first: a crash loses the print, and Poll requeues it within minutes.
     Claim last: a crash prints the document twice, and nothing recovers that.
     A refactor that "tidies up" by writing the status at the end would pass every
     other test in this file.
@@ -80,15 +81,41 @@ def test_the_claim_is_etag_conditioned(graph):
     assert claim.headers.get("If-Match") == expected_etag
 
 
-def test_the_claim_clears_stale_job_id_and_message(graph):
-    """A file being re-queued must not carry the previous attempt's job id, or
-    Poll would go looking for a job that has nothing to do with it."""
+def test_the_claim_clears_the_stale_job_id_but_keeps_the_message(graph):
+    """Two halves that used to move together, and only one of them should.
+
+    The JOB ID must go: a stale id would send Poll looking up a job belonging to
+    a previous attempt.
+
+    The MESSAGE must stay. Poll writes the retry history on the way OUT of
+    PRINT_PENDING and this claim is the very next write, so clearing here erased
+    it within one Flow A cycle -- the append could never accumulate and a person
+    would essentially never see it. Nothing is lost by keeping it: every terminal
+    outcome replaces this column, so a stale entry is visible only while the row
+    is PRINT_PENDING, which is when it is worth reading.
+    """
     graph.add_item("1", status="PRINT_READY", job_id="OLD-999",
-                   message="previous failure")
+                   message="Job Id OLD-999 cancelled. Retry job (2)")
     post(SUBMIT, body())
 
     assert graph.field("1", "Print_JobId") != "OLD-999"
-    assert graph.field("1", "Print_Message") == ""
+    assert graph.field("1", "Print_Message") == \
+        "Job Id OLD-999 cancelled. Retry job (2)"
+
+
+def test_a_completion_replaces_the_retry_history(graph):
+    """The safety net that makes keeping the message safe: a terminal outcome
+    overwrites the column, so history never outlives the attempt it describes."""
+    graph.add_item("1", status="PRINT_READY", message="Job Id 7 cancelled. Retry job (1)")
+
+    post(SUBMIT, body())
+    assert "Retry job" in graph.field("1", "Print_Message")
+
+    graph.add_job(graph.field("1", "Print_JobId"), state="completed")
+    post(POLL, {"library": "Documents", "folder": "/Invoices/ToPrint"})
+
+    assert graph.field("1", "Print_Message").startswith("printed on ")
+    assert "Retry job" not in graph.field("1", "Print_Message")
 
 
 # --- selection ----------------------------------------------------------------

@@ -47,18 +47,20 @@ COLUMN_PRINTER = "Printer_Name"
 COLUMN_DISPLAY_NAMES = (COLUMN_STATUS, COLUMN_JOB_ID, COLUMN_MESSAGE, COLUMN_PRINTER)
 
 # --- Print status vocabulary --------------------------------------------------
-# PRINT_READY is set by an upstream process, never by this app.
+# PRINT_READY is set by an upstream process AND by Poll when it requeues a stalled
+# job. Everything else here is written only by this app.
 READY = "PRINT_READY"
 PENDING = "PRINT_PENDING"
 FAILED = "PRINT_FAILED"
 COMPLETED = "PRINT_COMPLETED"
 
-# The statuses Resubmit considers "outstanding". The requirement stated this two
-# ways -- "PRINT_PENDING or PRINT_FAILED" and "NOT EQUAL to PRINT_COMPLETED" --
-# which differ on PRINT_READY and on a blank status. The first reading is the one
-# in force (docs/design.md R17): PRINT_READY belongs to Submit, and a blank status
-# means the file was never queued at all.
-RESUBMIT_STATUSES = (PENDING, FAILED)
+# PRINT_FAILED is TERMINAL. Nothing retries it; a human resets the row. That is
+# why the give-up message has to be worth reading -- it is the only account of why
+# the document never printed.
+#
+# A status this app does not recognise (the live library uses NO_PRINT) is inert:
+# no route queries it, so those rows are never picked up. That is by design; do
+# not add handling for values the app does not own.
 
 # --- Tunables -----------------------------------------------------------------
 # Each has a constant default, an env override, and range validation. An
@@ -68,13 +70,26 @@ DEFAULT_BATCH_SIZE = 5
 MIN_BATCH_SIZE = 1
 MAX_BATCH_SIZE = 15  # the requirement's "oldest 15" is the ceiling, not the default
 
-DEFAULT_WINDOW_DAYS = 20
-MIN_WINDOW_DAYS = 1
-MAX_WINDOW_DAYS = 365
+# How long a file may stay PRINT_PENDING before Poll cancels the outstanding job
+# and writes PRINT_FAILED. Measured from the SharePoint creation time. This is the
+# outer bound on WAITING; MAX_RETRIES is the bound on WORK.
+DEFAULT_GIVE_UP_DAYS = 10
+MIN_GIVE_UP_DAYS = 1
+MAX_GIVE_UP_DAYS = 365
 
-DEFAULT_MIN_AGE_HOURS = 72
-MIN_MIN_AGE_HOURS = 1
-MAX_MIN_AGE_HOURS = 8760  # one year
+# How long a print job may sit without reaching a terminal state before it counts
+# as stalled. Measured from printJob.createdDateTime -- the job's own clock, not
+# ours, so a SharePoint edit cannot reset it. Doubles as the base of the retry
+# backoff below, so one number rescales the whole schedule coherently.
+DEFAULT_STALL_MINUTES = 5
+MIN_STALL_MINUTES = 1
+MAX_STALL_MINUTES = 1440  # one day
+
+# The most requeues one file may receive. Each costs a render, a conversion and an
+# upload, so this bounds the work an undeliverable document can consume.
+DEFAULT_MAX_RETRIES = 10
+MIN_MAX_RETRIES = 1
+MAX_MAX_RETRIES = 20
 
 BUSINESS_TZ = "America/Vancouver"
 MESSAGE_MAX_CHARS = 255
@@ -112,58 +127,144 @@ TERMINAL_JOB_STATES = (JOB_COMPLETED, JOB_CANCELED, JOB_ABORTED)
 # --- Poll actions -------------------------------------------------------------
 POLL_COMPLETE = "complete"   # write PRINT_COMPLETED + "printed on ..."
 POLL_FAIL = "fail"           # write PRINT_FAILED + the job's own description
-POLL_NONE = "none"           # still in flight -- write NOTHING
+POLL_NONE = "none"           # nothing to do -- write NOTHING
+POLL_REQUEUE = "requeue"     # cancel the job, then write PRINT_READY
+POLL_GIVE_UP = "give_up"     # cancel the job, then write PRINT_FAILED
 
 
-def poll_action(state: Optional[str]) -> str:
-    """What Poll should do about a job in `state`.
+def job_is_stalled(state: Optional[str], has_job: bool,
+                   job_age_minutes: Optional[float], stall_minutes: int) -> bool:
+    """True if this attempt has stopped making progress.
 
-    Only `completed` is in the written requirement. `canceled` and `aborted` are
-    terminal too and will never print, so they are marked failed immediately
-    rather than sitting in PRINT_PENDING for three days looking identical to a
-    job that is merely queued (docs/design.md, agreed decisions).
+    Two shapes of "stuck" and one deliberate abstention:
 
-    `stopped` is deliberately NOT a failure here: it means the printer needs
-    attention but the job can still continue once it gets it.
+    * NO JOB (`has_job` false) -- either a crashed submission, the PRINT_PENDING
+      row with an empty Print_JobId that claiming-before-printing deliberately
+      creates (rule 1), or a job Universal Print has purged. Nothing is coming;
+      stalled immediately, with no age to wait on.
+    * A LIVE JOB past the threshold in a non-terminal state.
+    * A live job whose age CANNOT BE DETERMINED is NOT stalled. Universal Print
+      returns createdDateTime, but if a job ever arrives without one, guessing
+      "stalled" would cancel a job that might be printing right now and queue a
+      second copy. Abstaining costs a delayed retry; guessing costs a duplicate.
+
+    A terminal state is never stalled -- the caller resolves those first.
+    """
+    normalized = (state or "").strip().lower()
+    if normalized in TERMINAL_JOB_STATES:
+        return False
+    if not has_job:
+        return True
+    if job_age_minutes is None:
+        return False
+    return job_age_minutes >= stall_minutes
+
+
+def retries_due(file_age_minutes: Optional[float], base_minutes: int,
+                max_retries: int) -> int:
+    """How many requeues the schedule says should have happened by this age.
+
+    Retry n falls due at `base * (2**n - 1)`: 5, 15, 35, 75, 155 ... minutes for
+    the default base of 5. Exponential, so a printer that is off for the weekend
+    is retried a handful of times rather than every ten minutes for sixty hours.
+
+    THIS IS WHAT MAKES THE RETRY COUNT STATELESS. The four-column schema has no
+    attempt counter and none was added; instead the count is a pure function of
+    age, and comparing this value at two instants tells the caller whether a new
+    retry has come due. See `poll_decision`.
+
+    Capped at `max_retries` so the arithmetic cannot run away on an ancient row.
+    """
+    if file_age_minutes is None or file_age_minutes < base_minutes:
+        return 0
+    count = 0
+    while count < max_retries:
+        if file_age_minutes < base_minutes * (2 ** (count + 1) - 1):
+            break
+        count += 1
+    return count
+
+
+def minutes_between(earlier: Optional[datetime],
+                    later: Optional[datetime]) -> Optional[float]:
+    """Elapsed minutes, or None if either end is unknown.
+
+    None propagates deliberately: an age that cannot be computed must not be
+    silently treated as zero, which would read as "brand new" and suppress every
+    retry the row was owed.
+    """
+    if earlier is None or later is None:
+        return None
+    return (later - earlier).total_seconds() / 60.0
+
+
+def poll_decision(state: Optional[str], *,
+                  file_created: Optional[datetime],
+                  has_job: bool,
+                  job_created: Optional[datetime],
+                  attempt_started: Optional[datetime],
+                  now: datetime,
+                  stall_minutes: int, give_up_days: int,
+                  max_retries: int) -> tuple:
+    """(action, retry_number) for one PRINT_PENDING row.
+
+    `attempt_started` is when the CURRENT attempt began -- the print job's own
+    createdDateTime, or the row's lastModifiedDateTime when there is no job.
+
+    THE RETRIES ALREADY SPENT ARE READ OFF THE CLOCK, NOT A COUNTER: they are
+    `retries_due` evaluated at the FILE'S AGE WHEN THIS ATTEMPT STARTED. Every
+    requeue creates a fresh job, so an attempt that began late in the schedule
+    proves the earlier retries happened. Note this is the file's age at that
+    moment, NOT the attempt's own age -- those coincide on the first attempt, and
+    using the latter would make `spent` equal `due` forever and no retry would
+    ever fire.
+
+    THE ORDER OF THESE CHECKS IS LOAD-BEARING:
+
+    1. `completed` wins over everything, INCLUDING the give-up deadline. A job
+       that finished a minute past the cut-off still put paper in the tray, and a
+       row reading PRINT_FAILED about a document that printed is worse than a late
+       success.
+    2. `canceled` / `aborted` are terminal and will never print.
+    3. Past the give-up threshold: stop waiting. The caller cancels whatever is
+       outstanding FIRST -- without that, an abandoned job could print days later
+       against a row that says PRINT_FAILED.
+    4. Stalled, retries left, and a new boundary crossed: requeue.
+    5. Anything else: leave it alone. That covers three situations which all want
+       silence -- a healthy job in flight, a stalled job inside the backoff gap,
+       and a stalled job whose retries are spent but which is still inside the
+       give-up window. The last is the GRACE PERIOD: no further work is spent, but
+       the final job stays live, so a printer that comes back still gets the
+       document out and check 1 records it.
+
+    A row whose creation time will not parse is left alone entirely. It cannot be
+    aged, so neither the give-up test nor the schedule means anything for it, and
+    guessing would either abandon a live document or retry one forever.
     """
     normalized = (state or "").strip().lower()
     if normalized == JOB_COMPLETED:
-        return POLL_COMPLETE
+        return POLL_COMPLETE, 0
     if normalized in (JOB_CANCELED, JOB_ABORTED):
-        return POLL_FAIL
-    return POLL_NONE
+        return POLL_FAIL, 0
 
+    spent = retries_due(minutes_between(file_created, attempt_started),
+                        stall_minutes, max_retries)
 
-# --- Resubmit actions ---------------------------------------------------------
-RESUBMIT_MARK_COMPLETED = "mark_completed"      # finished between runs; do NOT reprint
-RESUBMIT_SKIP = "skip"                          # genuinely in flight; leave alone
-RESUBMIT_CANCEL_THEN_RESUBMIT = "cancel_then_resubmit"
-RESUBMIT_RESUBMIT = "resubmit"                  # already terminal; nothing to cancel
+    if file_created is None:
+        return POLL_NONE, spent
+    if not within_window(file_created, give_up_days, now):
+        return POLL_GIVE_UP, spent
 
+    if not job_is_stalled(state, has_job, minutes_between(job_created, now),
+                          stall_minutes):
+        return POLL_NONE, spent
+    if spent >= max_retries:
+        return POLL_NONE, spent
 
-def resubmit_action(state: Optional[str]) -> str:
-    """What Resubmit should do about an existing job in `state`.
-
-    The cancel-first branch is a correctness requirement, not tidiness. Graph
-    defines `stopped` as "an issue with the printer needs to be addressed BEFORE
-    THE JOB CAN CONTINUE" -- the job is alive. Creating a replacement without
-    cancelling it means that when someone clears the paper jam, the original and
-    the replacement BOTH print. `paused` and `unknown` get the same treatment
-    because neither is documented as dead.
-
-    `canceled` and `aborted` are already terminal, so there is nothing to cancel
-    and a bare resubmit is safe. A 404 (job aged out of Universal Print) is the
-    caller's concern and also resolves to a bare resubmit.
-    """
-    normalized = (state or "").strip().lower()
-    if normalized == JOB_COMPLETED:
-        return RESUBMIT_MARK_COMPLETED
-    if normalized in (JOB_PENDING, JOB_PROCESSING):
-        return RESUBMIT_SKIP
-    if normalized in (JOB_CANCELED, JOB_ABORTED):
-        return RESUBMIT_RESUBMIT
-    # paused, stopped, unknown, and anything the service adds later.
-    return RESUBMIT_CANCEL_THEN_RESUBMIT
+    due = retries_due(minutes_between(file_created, now), stall_minutes, max_retries)
+    if due > spent:
+        return POLL_REQUEUE, due
+    return POLL_NONE, spent
 
 
 # --- Time ---------------------------------------------------------------------
@@ -211,18 +312,10 @@ def within_window(created: Optional[datetime], window_days: int,
     return created >= reference - timedelta(days=window_days)
 
 
-def older_than(created: Optional[datetime], min_age_hours: int,
-               now: Optional[datetime] = None) -> bool:
-    """True if `created` is at least `min_age_hours` old. UTC throughout.
-
-    The boundary is inclusive: a file created exactly 72 hours ago IS old enough,
-    which keeps a job from waiting an extra scheduling cycle for a rounding
-    difference.
-    """
-    if created is None:
-        return False
-    reference = now or now_utc()
-    return (reference - created) >= timedelta(hours=min_age_hours)
+# `older_than` used to live here: Resubmit would not touch a file until it was 72
+# hours old. Poll's exponential schedule replaced that single coarse gate, so the
+# helper went with the endpoint. `minutes_between` + `retries_due` cover the same
+# ground at every timescale from five minutes upward.
 
 
 def _business_zone(tz_name: Optional[str] = None):
@@ -310,6 +403,63 @@ def failure_message(stage: str, error: Any) -> str:
     return truncate_message(f"{stage}: {detail}" if detail else f"{stage}: failed")
 
 
+MESSAGE_SEPARATOR = " | "
+
+
+def append_message(existing: Any, addition: Any,
+                   limit: int = MESSAGE_MAX_CHARS) -> str:
+    """Add to Print_Message instead of replacing it, keeping the NEWEST entries.
+
+    The retry history is the one thing in this system a person can read to see
+    what happened to a document, so a requeue adds to it rather than overwriting
+    the reason the previous attempt failed.
+
+    When the column's 255 characters run out the OLDEST entries are dropped, not
+    the newest: the most recent attempt is what someone is looking at the row to
+    understand. Roughly six or seven entries fit.
+
+    Nothing reads this back for control flow -- `retries_due` derives the attempt
+    count from the file's age -- so truncation can never change behaviour. It is
+    for humans only.
+    """
+    tail = truncate_message(addition, limit)
+    head = " ".join(str(existing or "").split())
+    if not head:
+        return tail
+    if not tail:
+        return truncate_message(head, limit)
+
+    combined = head + MESSAGE_SEPARATOR + tail
+    if len(combined) <= limit:
+        return combined
+
+    # Drop whole entries off the front until it fits, so the column never holds
+    # half a message. The newest entry alone always survives.
+    parts = combined.split(MESSAGE_SEPARATOR)
+    while len(parts) > 1 and len(MESSAGE_SEPARATOR.join(parts)) > limit:
+        parts.pop(0)
+    return truncate_message(MESSAGE_SEPARATOR.join(parts), limit)
+
+
+def requeue_message(job_id: Any, attempt: int) -> str:
+    """The entry appended when Poll cancels a stalled job and requeues the file."""
+    label = str(job_id or "").strip() or "(none)"
+    return f"Job Id {label} cancelled. Retry job ({attempt})"
+
+
+def give_up_message(retries: int, give_up_days: int) -> str:
+    """The entry appended when Poll stops trying.
+
+    This is the last thing written to the row and PRINT_FAILED is terminal, so it
+    has to say enough for someone to act: how many retries were spent and how long
+    was allowed. `retries` counts REQUEUES, not attempts -- 0 is legitimate and
+    means the original submission was the only one, which is what a row that was
+    never seen to stall looks like.
+    """
+    return (f"gave up after {give_up_days} day(s) and {retries} retr"
+            f"{'y' if retries == 1 else 'ies'}; outstanding job cancelled")
+
+
 # --- Selection ----------------------------------------------------------------
 
 
@@ -335,20 +485,11 @@ def select_oldest(items: Iterable[Any], batch_size: int,
     return sorted(items, key=sort_key)[:batch_size]
 
 
-def select_least_recently_attempted(items: Iterable[Any], batch_size: int) -> list:
-    """The `batch_size` items least recently written to, oldest write first.
-
-    Resubmit uses this instead of select_oldest, and the difference is not
-    cosmetic. createdDateTime NEVER CHANGES, so ordering a retry queue by it
-    means a file that fails every time is chosen every time -- and everything
-    newer waits behind it forever. lastModifiedDateTime is bumped by our own
-    writes, so attempting a file sends it to the back of the queue and the whole
-    backlog rotates.
-
-    Submit deliberately still orders by creation time: the requirement asks for
-    "the oldest" files, and nothing there can loop.
-    """
-    return select_oldest(items, batch_size, key="modified")
+# `select_least_recently_attempted` used to live here, ordering Resubmit's retry
+# queue by lastModifiedDateTime so a chronically failing file could not monopolise
+# every run (defect F2). It went with the Resubmit endpoint: Poll has no batch
+# cap -- it visits every row in the window each run -- so that starvation cannot
+# occur and the rotation has nothing left to fix.
 
 
 def _item_id(item: Any) -> Any:
@@ -396,14 +537,23 @@ def resolve_batch_size(request_value: Any = None) -> int:
                         DEFAULT_BATCH_SIZE, MIN_BATCH_SIZE, MAX_BATCH_SIZE)
 
 
-def resolve_window_days(request_value: Any = None) -> int:
-    return _resolve_int("windowDays", request_value, "PRINT_STATUS_WINDOW_DAYS",
-                        DEFAULT_WINDOW_DAYS, MIN_WINDOW_DAYS, MAX_WINDOW_DAYS)
+# The three retry knobs below are read from the POWER AUTOMATE REQUEST BODY first,
+# then the app setting, then the default. That ordering is the point: the pacing
+# of the whole retry schedule can be retuned by editing a flow, with no deploy and
+# no app-setting change.
+def resolve_give_up_days(request_value: Any = None) -> int:
+    return _resolve_int("giveUpDays", request_value, "PRINT_GIVE_UP_DAYS",
+                        DEFAULT_GIVE_UP_DAYS, MIN_GIVE_UP_DAYS, MAX_GIVE_UP_DAYS)
 
 
-def resolve_min_age_hours(request_value: Any = None) -> int:
-    return _resolve_int("minAgeHours", request_value, "PRINT_RESUBMIT_MIN_AGE_HOURS",
-                        DEFAULT_MIN_AGE_HOURS, MIN_MIN_AGE_HOURS, MAX_MIN_AGE_HOURS)
+def resolve_stall_minutes(request_value: Any = None) -> int:
+    return _resolve_int("stallMinutes", request_value, "PRINT_STALL_MINUTES",
+                        DEFAULT_STALL_MINUTES, MIN_STALL_MINUTES, MAX_STALL_MINUTES)
+
+
+def resolve_max_retries(request_value: Any = None) -> int:
+    return _resolve_int("maxRetries", request_value, "PRINT_MAX_RETRIES",
+                        DEFAULT_MAX_RETRIES, MIN_MAX_RETRIES, MAX_MAX_RETRIES)
 
 
 def resolve_budget_seconds() -> float:

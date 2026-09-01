@@ -3,7 +3,7 @@ test_review_findings.py — regressions found during the post-implementation rev
 
 Each test here failed when it was written. They are kept separate from the
 endpoint suites so the findings stay legible as a set; the behaviours they pin
-belong to Poll and Resubmit.
+belong to Poll.
 
   F1  Poll silently ignored pending jobs beyond the first 15, and always took
       the OLDEST 15 -- so long-running jobs permanently starved newer ones.
@@ -13,12 +13,21 @@ belong to Poll and Resubmit.
   F3  Resubmit cancelled the old job on the WRONG printer when the request
       overrode the printer, got a 404, and counted that as a successful cancel --
       leaving the original job alive to print alongside its replacement.
+  F6  Resubmit's two status queries ran at different instants, so a file whose
+      status changed between them was processed twice in one run.
+
+F2, F3 and F6 were all properties of Resubmit's SHAPE, and Resubmit is gone. Each
+is now structurally impossible rather than merely fixed; the sections below say
+why, and name the Poll tests that carry whatever part of the guard still applies.
+Their original assertions could not survive the endpoint they exercised, but
+deleting a regression test without recording the reason is how a fixed defect
+comes back.
 """
 
 from __future__ import annotations
 
 import print_policy
-from helpers import POLL, RESUBMIT, SUBMIT as SUBMIT_ROUTE, as_json, iso, post
+from helpers import POLL, SUBMIT as SUBMIT_ROUTE, as_json, iso, post
 
 POLL_BODY = {"library": "Documents", "folder": "/Invoices/ToPrint"}
 
@@ -98,8 +107,10 @@ def test_poll_reports_anything_the_budget_left_unchecked(graph, frozen_now,
 
 
 def test_poll_skips_job_less_rows_without_consuming_the_run(graph, frozen_now):
-    """A PRINT_PENDING row with no job id is Resubmit's problem. It must not
-    displace a row that DOES have a job to check."""
+    """A crashed submission -- PRINT_PENDING with no job id -- is cheap to handle
+    (no Graph call for a job that does not exist). It must not displace a row that
+    DOES have a job to check. Poll now requeues these rather than skipping them,
+    but the ordering property this pins is unchanged."""
     for i in range(20):
         graph.add_item("nojob-{}".format(i), status=print_policy.PENDING,
                        job_id="", printer=graph.SHARE_ID, created=iso(days=10))
@@ -113,70 +124,31 @@ def test_poll_skips_job_less_rows_without_consuming_the_run(graph, frozen_now):
     assert graph.status_of("real") == print_policy.COMPLETED
 
 
-# --- F2: Resubmit must not starve newer files --------------------------------
-
-
-def test_resubmit_does_not_re_pick_the_same_failing_files_forever(graph, frozen_now):
-    """createdDateTime never changes, so ordering by it means a file that fails
-    every time is chosen every time, and nothing newer is ever reached.
-
-    Ordering by lastModifiedDateTime -- which OUR OWN writes bump -- makes the
-    queue rotate: a file just attempted goes to the back.
-    """
-    # Five old files that always fail, plus five newer ones behind them.
-    for i in range(5):
-        graph.add_item("chronic-{}".format(i), status=print_policy.FAILED,
-                       job_id="", printer=graph.SHARE_ID,
-                       created=iso(days=15), modified=iso(days=15))
-    for i in range(5):
-        graph.add_item("newer-{}".format(i), status=print_policy.FAILED,
-                       job_id="", printer=graph.SHARE_ID,
-                       created=iso(days=10), modified=iso(days=10))
-
-    graph.fail_next("GET", "/driveItem", status=500, times=100)
-
-    first = as_json(post(RESUBMIT, {"library": "Documents",
-                                    "folder": "/Invoices/ToPrint",
-                                    "printerShareId": graph.SHARE_ID}))
-    second = as_json(post(RESUBMIT, {"library": "Documents",
-                                     "folder": "/Invoices/ToPrint",
-                                     "printerShareId": graph.SHARE_ID}))
-
-    first_ids = {i["itemId"] for i in first["items"]}
-    second_ids = {i["itemId"] for i in second["items"]}
-
-    assert first_ids != second_ids, (
-        "the same files were retried twice in a row while others waited: "
-        "{}".format(sorted(first_ids)))
-
-
-# --- F3: cancel must target the printer the job actually lives on ------------
-
-
-def test_cancel_targets_the_original_printer_not_the_new_one(graph, frozen_now):
-    """When the request overrides the printer, the OLD job still lives on the OLD
-    printer. Cancelling against the new printer's id 404s -- and a 404 is
-    (correctly) treated as "already gone", so the code reported a successful
-    cancel while the original job stayed alive to print alongside its replacement.
-
-    This is the exact double-print the cancel exists to prevent.
-    """
-    other = graph.add_share("other-share", printer_id="other-printer")
-
-    graph.add_item("1", status=print_policy.PENDING, job_id="1825",
-                   printer=other["id"], created=iso(hours=100))
-    graph.add_job("1825", state="stopped", description="Out of paper")
-
-    payload = as_json(post(RESUBMIT, {
-        "library": "Documents", "folder": "/Invoices/ToPrint",
-        "printerShareId": graph.SHARE_ID,   # deliberately a DIFFERENT share
-    }))
-
-    assert payload["resubmitted"] == 1
-    cancels = graph.calls_to("/cancel", method="POST")
-    assert cancels, "the stalled job was never cancelled"
-    assert "other-printer" in cancels[0].url, (
-        "cancel went to the wrong printer: {}".format(cancels[0].url))
+# --- F2 and F3: retired with the Resubmit endpoint ---------------------------
+#
+# Both defects were properties of Resubmit's shape, and both are now structurally
+# impossible rather than merely fixed. Recorded here because deleting a regression
+# test needs a reason, not a shrug.
+#
+# F2 -- "Resubmit re-picked the same failing files forever". It took the oldest N
+# per run, so five chronic failures filled every slot and nothing newer was ever
+# reached; the fix was to order the retry queue by lastModifiedDateTime.
+# POLL HAS NO BATCH CAP. It visits every pending row each run
+# (`select_oldest(pending, len(pending))`), bounded only by the wall-clock budget
+# and reporting whatever it could not reach as `uncheckedCount`. With no slots to
+# compete for there is no starvation to order around, which is why
+# `select_least_recently_attempted` went too.
+#
+# F3 -- "cancel targeted the new printer, not the one the job lives on". Resubmit
+# accepted a `printerShareId` that could override the file's own Printer_Name, so
+# the cancel 404'd on the wrong printer, read as "already gone", and the original
+# stayed alive to print beside its replacement. POLL ACCEPTS NO PRINTER. It always
+# resolves the row's own Printer_Name, so the two can never diverge. The surviving
+# half of this guard -- that the cancel uses the PRINTER id behind that share, not
+# the share id -- lives in
+# test_poll.py::test_the_cancel_uses_the_printer_id_not_the_share_id, and the
+# multi-printer case in
+# test_poll.py::test_the_cancel_uses_the_printer_named_on_the_row.
 
 
 # --- F4: paging must not lose the filter -------------------------------------
@@ -230,36 +202,18 @@ def test_each_completion_is_stamped_when_it_was_observed(graph, monkeypatch):
     assert len(stamps) == 3, "all three completions share one timestamp: {}".format(stamps)
 
 
-# --- F6: a file must not be processed twice in one Resubmit run --------------
-
-
-def test_a_file_appearing_in_both_status_queries_is_handled_once(graph, frozen_now):
-    """The two equality queries run at different instants, so a file whose status
-    changes between them lands in both result sets."""
-    graph.add_item("1", status=print_policy.PENDING, job_id="",
-                   printer=graph.SHARE_ID, created=iso(hours=100))
-
-    real_get_items = graph._get_items
-    state = {"calls": 0}
-
-    def duplicating_get_items(rel, query, body, headers):
-        # Answer the PRINT_FAILED query with the same row the PENDING query gave.
-        state["calls"] += 1
-        if state["calls"] == 2:
-            graph.items["1"]["fields"][graph.columns["Print_Status"]] = \
-                print_policy.FAILED
-        return real_get_items(rel, query, body, headers)
-
-    graph._get_items = duplicating_get_items
-
-    payload = as_json(post(RESUBMIT, {"library": "Documents",
-                                      "folder": "/Invoices/ToPrint",
-                                      "printerShareId": graph.SHARE_ID}))
-
-    assert payload["candidatesFound"] == 1
-    assert len(payload["items"]) == 1
-    assert len(graph.created_jobs()) == 1, \
-        "the same file was submitted twice in one run"
+# --- F6: retired with the Resubmit endpoint ----------------------------------
+#
+# "A file appeared in both status queries and was processed twice." Resubmit ran
+# TWO equality queries -- one for PRINT_PENDING, one for PRINT_FAILED -- at
+# different instants, so a row whose status changed in between landed in both
+# result sets and was submitted twice in one run. The fix was to de-duplicate by
+# item id.
+#
+# POLL RUNS ONE QUERY. There is no second result set for a row to appear in, so
+# the overlap cannot occur. What replaced it as the concurrency guard is the
+# eTag-conditioned requeue -- two OVERLAPPING RUNS racing on one row -- pinned by
+# test_poll.py::test_a_lost_etag_skips_the_requeue.
 
 
 # --- remainingReady must never end the flow's loop early ---------------------
