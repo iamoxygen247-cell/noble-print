@@ -40,6 +40,7 @@ def _handler(name: str):
 
 SUBMIT = _handler("submit_print_jobs")
 POLL = _handler("poll_print_status")
+HEALTH = _handler("check_printer_health")
 
 
 def post(handler, payload: Any) -> func.HttpResponse:

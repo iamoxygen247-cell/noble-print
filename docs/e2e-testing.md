@@ -20,9 +20,10 @@ no deployment required. The deployed variant is the same commands plus two flags
 > a page that came out cropped, scaled or blank. Every "did it work?" in this
 > document means *look at the sheet*.
 
-> **The endpoint shape changed on 2026-09-01.** There are now **two** endpoints,
-> not three: `/api/print/resubmit` is gone and Poll absorbed its recovery work.
-> Part C is entirely new, and none of it can be tested by the old commands.
+> **The endpoint shape changed on 2026-09-01.** `/api/print/resubmit` is gone —
+> Poll absorbed its recovery work — and `/api/print/health` was added, so there
+> are **three**: Health, Submit, Poll. Part C is entirely new, and none of it can
+> be tested by the old commands.
 
 ---
 
@@ -62,7 +63,7 @@ Paper in the tray, printer awake.
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-Expect **435 passed** in about half a second. Red here means stop — do not spend
+Expect **487 passed** in about half a second. Red here means stop — do not spend
 paper diagnosing something the suite already knows about.
 
 ## A2. Is the printer reachable and still the printer we think?
@@ -133,10 +134,11 @@ Other flags: `-KeepRaster` keeps the `.pwg`, `-ShareId` targets another printer,
 
 # Part B — The app end to end, from your own PowerShell window
 
-The app has **two endpoints**, both HTTP `POST`:
+The app has **three endpoints**, all HTTP `POST`:
 
 | | Route | What it does |
 |---|---|---|
+| **Health** | `/api/print/health` | Can the pipeline work right now? Run it first — it writes nothing |
 | **Submit** | `/api/print/submit` | Claims the oldest `PRINT_READY` files and creates print jobs |
 | **Poll** | `/api/print/status` | Checks `PRINT_PENDING` jobs: marks the finished, **requeues the stalled**, **fails the hopeless** |
 
@@ -188,6 +190,85 @@ $PY scripts\bootstrap_token.py --print-only
 # 3. TLS, if Graph calls fail with CERTIFICATE_VERIFY_FAILED
 $PY -m pip install truststore
 ```
+
+## B0a. Health — run this before anything else
+
+One share read, **no writes anywhere**. It is what the flows call before Submit
+and Poll, so it is what you should call before the rest of Part B: if it is
+unhealthy, everything below fails for a reason it already told you.
+
+```powershell
+$PY scripts\test.py health --printer-share-id $SHARE --print-format image/pwg-raster
+```
+
+Expect exactly this on the real printer:
+
+```
+HTTP 200
+healthy      : True
+printer      : 4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5
+format       : image/pwg-raster
+summary      : printer <name> is ready; documents go through the pdf-to-pwg-raster profile
+  accepting  : True   state: idle
+  content    : image/pwg-raster
+  profile    : pdf-to-pwg-raster  (converts: True)
+```
+
+### The refusal — and why it is a 200
+
+```powershell
+# application/pdf on a printer that takes raster ONLY
+$PY scripts\test.py health --printer-share-id $SHARE --print-format application/pdf
+```
+
+```
+HTTP 200
+healthy      : False
+summary      : 1 problem: FORMAT_NOT_SUPPORTED
+  ERROR   FORMAT_NOT_SUPPORTED: the printer does not accept application/pdf (supports: image/pwg-raster)
+           -> send a printFormat the printer reports, or omit it and let the capabilities choose
+```
+
+**Still HTTP 200.** A sick printer is never a non-2xx — 400 means *your request*
+was malformed and 500 means Health itself broke. Prove that distinction:
+
+```powershell
+$PY scripts\test.py health --printer-share-id $SHARE --print-format image/png
+#   -> HTTP 400  printFormat 'image/png' is not supported
+#      no `healthy` key at all: this says nothing about the printer
+```
+
+### Switch the printer off — and **record what you see**
+
+```powershell
+# power the printer down, wait ~30s for Universal Print to notice, then:
+$PY scripts\test.py health --printer-share-id $SHARE --print-format image/pwg-raster
+```
+
+Expect `healthy : False` with `PRINTER_NOT_ACCEPTING_JOBS`:
+
+```
+  ERROR   PRINTER_NOT_ACCEPTING_JOBS: the printer share is not accepting jobs (state: idle)
+           -> wake or reconnect the printer, then re-run this check
+```
+
+> **This step has a second job: write down the `state` line.** `PRINTER_STOPPED`
+> is an error by decision, but `printerProcessingState` has **never been observed
+> in this tenant as anything but `idle`** — including, possibly, right now with the
+> printer off. Record the `accepting` and `state` values you actually get into the
+> `status.state` row of `docs/design.md` §4. That turns the one assumption in this
+> endpoint into evidence.
+
+Compare against Submit for the same state — this is the whole argument for the
+endpoint:
+
+```powershell
+$PY scripts\test.py submit --library $LIB --folder $FLD --printer-share-id $SHARE --batch-size 1
+#   -> HTTP 200, submitted: 0, failed: 0, printerAvailable: False
+#      A 200 with no failures. Health says False in one field instead.
+```
+
+Switch the printer back on before continuing.
 
 ## B1. The validation path — must 400, must touch nothing
 

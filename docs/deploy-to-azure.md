@@ -556,7 +556,7 @@ az functionapp config appsettings list --resource-group $RG --name $APP `
 ## 7. Deploy the code
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest        # 435 tests must be green FIRST
+.\.venv\Scripts\python.exe -m pytest        # 487 tests must be green FIRST
 
 # func shells out to the RAW az.cmd for an ARM token and cannot refresh it over
 # the network through the inspecting proxy. Pre-warm the cache through the
@@ -591,13 +591,14 @@ matters: it holds the local refresh token. Confirm what shipped:
 
 ```powershell
 az functionapp function list --resource-group $RG --name $APP --query "[].name" -o tsv
-# expect exactly two: submit_print_jobs, poll_print_status
+# expect exactly three:
+#   check_printer_health, poll_print_status, submit_print_jobs
 ```
 
-**Two, not three.** A `resubmit_print_jobs` in that list means an old build is
-still deployed. Fewer than two means the worker failed to index the app — usually
-a missing import or a `requirements.txt` problem — and the deploy will otherwise
-look like it succeeded.
+**Three.** A `resubmit_print_jobs` in that list means an old build is still
+deployed — that endpoint was retired on 2026-09-01. Fewer than three means the
+worker failed to index the app — usually a missing import or a `requirements.txt`
+problem — and the deploy will otherwise look like it succeeded.
 
 ### If publish misbehaves
 
@@ -726,13 +727,39 @@ or you get a race you will debug at 2 a.m.
 
 | Flow | Recurrence | Body |
 |---|---|---|
+| **Health** | *(a step inside A and B, not its own flow)* | `{"printerShareId":"4429bf4e-…"}` |
 | **A — Submit** | 15 min | `{"library":"AI_DropBox_V2026","folder":"/Backup/Invoice","printerShareId":"4429bf4e-…","batchSize":5}` |
 | **B — Poll** | 10 min | `{"library":"AI_DropBox_V2026","folder":"/Backup/Invoice","giveUpDays":10,"stallMinutes":5,"maxRetries":10}` |
 | **D — Digest** | Mon 07:00 | SharePoint *Get items* per status; email the counts |
 
 > **There is no Flow C.** A daily Resubmit flow used to exist; recovery moved into
 > Flow B on 2026-09-01. If you are working from an older copy of this runbook, do
-> not create it — `POST /api/print/resubmit` returns 404.
+> not create it — `POST /api/print/resubmit` returns 404. **Health is not its
+> replacement**: it is a step inside A and B, reads a printer, and writes nothing.
+
+### Call Health first in both flows
+
+`POST /api/print/health` is a step at the top of each flow, not a flow of its own.
+One share read, **no writes**, safe on every tick. The existing `$KEY` authorises
+it — `functionKeys.default` is a **host-level** key covering every function, so
+there is nothing new to capture.
+
+```
+Flow A:  health  →  Condition healthy == false  →  notify, TERMINATE
+                 →  else the Do Until / submit loop as before
+
+Flow B:  health  →  Condition healthy == false  →  notify, but CONTINUE
+                 →  poll anyway
+```
+
+**Flow A gates; Flow B does not.** Poll marks completions, appends retry history
+and gives up on rows past `giveUpDays` — none of which needs a working printer.
+Skipping Poll during an outage means rows reach no terminal status for exactly as
+long as the outage lasts, which is when recovery matters most.
+
+A sick printer is a **200 with `healthy: false`**, never a non-2xx, so the HTTP
+action succeeds and the flow keeps control of the branch. Read `healthy`;
+`errors[].code` says which of the ten conditions fired.
 
 > **Run B before A** if you ever put them in one flow. Poll's requeue writes
 > `PRINT_READY`, which Submit consumes, so Poll-first makes a recovery actionable
@@ -916,8 +943,9 @@ cause and verified the fix.
 [ ]  5  bootstrap_token.py run as the SERVICE ACCOUNT; secret exists in the vault
 [ ]  6  App settings set incl. PRINT_RASTER_*; PRINT_REFRESH_TOKEN absent;
         APPLICATIONINSIGHTS_CONNECTION_STRING present (from 3.4); sampling off
-[ ]  7  pytest green (435); token pre-warmed; publish --build remote; TWO functions
-        listed -- submit_print_jobs, poll_print_status (a third means an old build)
+[ ]  7  pytest green (487); token pre-warmed; publish --build remote; THREE
+        functions listed -- check_printer_health, poll_print_status,
+        submit_print_jobs (fewer means an old build)
 [ ]  8  Settings read BACK; defaultHostName captured; key captured
 [ ]  9  badpayload 400 · dryrun shows conversion=pdf-to-pwg-raster · one real file ·
         READ THE COLUMNS · READ THE PAPER · PRINT_EVENT in AI
@@ -926,8 +954,14 @@ cause and verified the fix.
 [ ]  9  e2e-testing.md B5a: dryrun --print-format image/pwg-raster echoes
         `requested fmt: image/pwg-raster`; --print-format application/pdf is a
         400 on THIS printer (raster only). Flow A carries NO printFormat
+[ ]  9  e2e-testing.md B0a: health is healthy:True; --print-format application/pdf
+        is a 200/unhealthy (NOT a 400); image/png IS a 400; printer OFF gives
+        PRINTER_NOT_ACCEPTING_JOBS -- and RECORD the observed `state` into
+        design.md's status.state row
 [ ] 10  Flows A, B, D created -- there is NO Flow C; A loops on remainingReady
         with an iteration cap; B carries stallMinutes/maxRetries/giveUpDays
+[ ] 10  BOTH flows call /api/print/health first: A TERMINATES on healthy==false,
+        B notifies but POLLS ANYWAY (Poll still marks completions and gives up)
 [ ] 10  If Flow B sends printerShareId: printerOverridden == 0 on a real run,
         and a Flow B condition notifies when it is not (F3-R)
 [ ] 11  Silence alert created

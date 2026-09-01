@@ -26,6 +26,7 @@ a runtime configuration engine — see §9. Volume/traffic scaling is explicitly
 
 | Name | Route | Responsibility |
 |---|---|---|
+| **Health** | `POST /api/print/health` | Report whether the printer can be used at all. Reads one share, writes nothing |
 | **Submit** | `POST /api/print/submit` | Claim the oldest `PRINT_READY` files and create print jobs |
 | **Poll** | `POST /api/print/status` | Check `PRINT_PENDING` jobs: mark the finished, requeue the stalled, fail the hopeless |
 
@@ -146,6 +147,9 @@ Any drift across this line is a bug.
 **Flow A — Print Submit** (every 15 min)
 ```
 Recurrence
+└─ HTTP POST {funcUrl}/api/print/health?code={key}
+         {"printerShareId":"<guid>"}          ← same printer keys Flow A sends
+└─ Condition: healthy == false  →  notify, TERMINATE (submit nothing)
 └─ Do Until  (remainingReady == 0)  OR  (iterations >= 10)      ← loop guard, never unbounded
    └─ HTTP POST {funcUrl}/api/print/submit?code={key}
             {"library":"Documents","folder":"/Invoices/ToPrint",
@@ -159,7 +163,11 @@ Recurrence
 
 **Flow B — Print Status Poll** (every 10 min)
 ```
-Recurrence → HTTP POST /api/print/status
+Recurrence → HTTP POST /api/print/health {"printerShareId":"<guid>"}
+          → Condition: healthy == false → notify, but CONTINUE. Poll marks
+            completions and gives up on old rows whether or not the printer
+            is well; skipping it during an outage is when recovery matters most
+          → HTTP POST /api/print/status
             {"library","folder","printerShareId":"<guid>",
              "giveUpDays":10,"stallMinutes":5,"maxRetries":10}
           → Condition: status != 200 → notify
@@ -245,7 +253,7 @@ Read from Microsoft's documentation, not recalled.
 | Is `Print_Status` indexed? | `--dry-run` checks it before the first real run |
 | ~~Does the printer accept `application/pdf`?~~ **CLOSED 2026-08-30, against the live API** | `live-printer-check.ps1` reads the capability list from Graph: `application/pdf` **and** `application/oxps`. PDFs go to the device as-is. Note the correction it forced: the fixture previously recorded `["application/pdf"]` alone, copied from the portal's *Properties > Printer defaults* page — which shows the **default** content type, not the capability list. Two different fields; the portal does not label which is which. |
 | ~~Are the share id and printer id really different?~~ **CLOSED 2026-08-30** | Confirmed live: the share id and the printer id are two different GUIDs. F3's whole premise, now evidenced rather than reasoned — see the current pair in `README.md`. **They also differ in lifetime.** Deleting and re-creating a share mints a new share id while the printer id and its `registeredDateTime` are untouched, so the id the caller supplies on every request is the perishable one and the id the app resolves for itself at preflight is the durable one. Every recorded copy of a share id (README, the docs, `live-printer-check.ps1`'s default, and **the Flow bodies in Power Automate**) goes stale at that moment, with a 404 reading `does not match any registered printers`. In the app it surfaces from `get_share` — the preflight — so it is a per-run 500 with `RUN_SUMMARY … http_status=500` and **nothing claimed and nothing printed**, which is the right shape. It is not yet one of the two failures `_server_error` gives a named remedy; if it recurs, that is where the remedy line belongs. **And the printer can be replaced too** — it happened on 2026-08-31, so both halves of the pair changed within hours. The durable identifier is neither GUID; it is the **display name** a human recognises, which is why every recorded id needs the printer named beside it. |
-| ~~What `status.state` does the share report?~~ **CLOSED 2026-08-30** | `idle`. The portal *displays* "Ready"; `printerProcessingState` is documented `unknown\|idle\|processing\|stopped` and has no `ready` member. The fixture and two tests had recorded the portal's display string as an API value. No code branches on it — it is reported, never compared — so nothing behaved wrongly, but the tests were pinning a fact that was false. |
+| ~~What `status.state` does the share report?~~ **CLOSED 2026-08-30** | `idle`. The portal *displays* "Ready"; `printerProcessingState` is documented `unknown\|idle\|processing\|stopped` and has no `ready` member. The fixture and two tests had recorded the portal's display string as an API value. **Health branches on it since 2026-09-01** — `PRINTER_STOPPED` is an error, by explicit decision. That is a deliberate bet on an enum this tenant has never reported as anything but `idle`, and the risk is that a transient fault which today queues work that prints on recovery (UC-8) will instead halt Flow A. **Still to be recorded: what the field actually reads with the printer switched off** — `e2e-testing.md` §B0a captures it. Everything else still only reports the value. |
 | ~~**Is a Universal Print connector required?**~~ **CLOSED 2026-08-30 — no** | The printer is **Universal Print ready and registered directly**. Settled by printing: `live-printer-check.ps1` submitted a job while the API reported 0 connectors on the printer and 0 tenant-wide, and a page came out — job `6`, `pending` → `processing` → `completed` in ~5 s. Two earlier answers were wrong: the Overview blade cannot decide it (a connector's heartbeat updates last-seen too), and neither can a connector count of 0 (that is what both cases look like). **Consequence: no Windows host in the path** — nothing to keep powered on, nothing to patch, no single point of failure. |
 | **How long does Universal Print keep a finished job readable?** STILL OPEN — but now cheap to measure | Sets Poll's cadence, and Poll's cadence is what prevents UC-9's double print. **Nothing has been measured on the current printer** — the one earlier reading was taken on a device since retired, so the count starts from zero. Once an invoice prints on the MFC-L5800DW, poll its job daily on the **printer** route (job ids are per-printer, and the printer id survives a re-share): <br>`GET /print/printers/{printerId}/jobs/{jobId}` <br>The **last day it still returns 200** is the retention window; set Poll's interval well inside it. A 404 is only evidence when the job was created on this printer through the current share — any other 404 says "that object is gone", not "retention expired". The first such job cannot exist until the PDF → PWG-raster conversion ships, because this device accepts `image/pwg-raster` only. Completion itself is fast — a page finishes in seconds — so the risk is never "Poll ran too early", only "Poll ran after the record was purged". |
 
@@ -593,6 +601,61 @@ the pacing of the whole retry schedule is a number in a flow, not a redeploy. An
 out-of-range *request* value is a 400; an out-of-range *app setting* warns and
 falls back, because a server misconfiguration must not fail every call.
 
+### 5.9 Health — sequence
+
+Numbered 5.9 rather than inserted after Poll because §5.7 is cross-referenced
+from §4 and §5.5; renumbering would silently break both.
+
+```
+POST /api/print/health {printerShareId, printFormat?}
+ ├─ 1 validate                        → 400 on any problem, ZERO Graph calls
+ │      an unknown printFormat is a 400 -- a malformed REQUEST is not an
+ │      unhealthy PRINTER, and answering 200/unhealthy would send somebody to
+ │      check a device over their own typo
+ ├─ 2 GET /print/shares/{id}?$select=…&$expand=printer($select=id)   ONE call
+ │      AuthBootstrapRequired → AUTH_BOOTSTRAP_REQUIRED ┐ terminal: one error,
+ │      GraphError 404        → PRINTER_NOT_FOUND       │ printer/conversion
+ │      GraphError otherwise  → PRINTER_UNREACHABLE     ┘ null, stop here
+ └─ 3 accumulate EVERY remaining finding -- never stop at the first, or a flow
+      learns one problem per cycle and takes an hour to hear six
+ ◄─ 200 {healthy, printerShareId, printFormat, printer, conversion,
+         errors[], warnings[], message}
+```
+
+**Always 200 when the check ran.** 400 = malformed request, 500 = Health itself
+broke; a non-200 never means "the printer is sick". Power Automate marks a
+non-2xx HTTP action as *failed*, which halts the branch unless every downstream
+action carries a run-after override — and the body, which is the whole diagnosis,
+becomes awkward to read exactly when it matters.
+
+`healthy`, `errors` and `warnings` are on **every** 200, so a flow condition
+needs no null check. That is the S3 lesson applied up front rather than after.
+
+| Errors (`healthy: false`) | Warnings (still healthy) |
+|---|---|
+| `AUTH_BOOTSTRAP_REQUIRED` · `PRINTER_NOT_FOUND` · `PRINTER_UNREACHABLE` · `PRINTER_NOT_ACCEPTING_JOBS` · `PRINTER_STOPPED` · `NO_PRINTER_ID` · `FORMAT_NOT_SUPPORTED` · `NO_PROFILE` · `JOB_CONFIGURATION_FAILED` · `CONVERTER_UNAVAILABLE` | `NO_CONTENT_TYPES` · `PRINTER_STATE_UNKNOWN` |
+
+The codes are a **closed, stable vocabulary** — a flow condition and a KQL query
+both key on them, so renaming one is a breaking change no Python would catch.
+`print_policy.ALL_HEALTH_CODES` is the list, and a test asserts they are unique.
+
+Three of these are what Health is *for* — the app either misses them entirely or
+notices far too late:
+
+- `NO_PRINTER_ID` — cancel is documented only on the printer route, so a share
+  with no printer id means Poll cannot cancel a stalled job before requeuing it,
+  and the original prints alongside its replacement (rule 2, D1). `cancel_job`
+  **does** notice, but only when the cancel is attempted: after a job has stalled,
+  as a `WARNING` line, with the duplicate already unavoidable.
+- `CONVERTER_UNAVAILABLE` — `pwg_converter` imports `pypdfium2` lazily inside
+  `convert_pdf`, so a wheel that failed to install is otherwise found one
+  document at a time, *after* each has been claimed.
+- `PRINTER_STOPPED` — see the `status.state` row in §4.
+
+`conversion` comes from the **same function the dry run uses**, so Health cannot
+describe a pipeline Submit would not run; `printer` comes from the same
+`_printer_report`. Both are pinned by parity tests against `dryRun`.
+
 ---
 
 ## 6. Cross-cutting design
@@ -903,6 +966,21 @@ reporting current state off logs alone is unreliable (a log gap becomes a wrong 
 | **Application Insights** | `RUN_SUMMARY` (per invocation), `PRINT_EVENT` (per file transition), `requests`, `exceptions` | "How many, how often, how long, what failed" |
 | **Power Automate run history** | each flow run and its retries (28 days) | "Did the schedule actually fire?" |
 | **Universal Print / printer** | job queue and printer status | "Is the printer itself healthy?" |
+
+**Health's `RUN_SUMMARY` reuses the existing fields rather than adding any**, so
+the KQL `parse` stays valid for all three endpoints:
+
+| Field | On `ep=health` |
+|---|---|
+| `printer` | the share id that was checked |
+| `ok` | `1` when healthy, `0` when not |
+| `failed` | number of **errors** |
+| `skipped` | number of **warnings** |
+| `lib` `folder` `found` `remaining` | sentinels — Health reads no library |
+
+**Health emits no `PRINT_EVENT`.** That line is one per *file* per outcome and
+Health touches no files, so its absence is correct rather than an oversight; a
+test pins it.
 
 ### 13.3 The two log lines
 

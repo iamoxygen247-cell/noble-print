@@ -1,12 +1,21 @@
 """
-function_app.py — the two HTTP endpoints Power Automate calls.
+function_app.py — the three HTTP endpoints Power Automate calls.
 
+    Health  POST /api/print/health   can this pipeline do any work right now?
+              {printerShareId, printFormat?}
     Submit  POST /api/print/submit   claim PRINT_READY files, create print jobs
               {library, folder, printerShareId, batchSize?, printFormat?, dryRun?}
     Poll    POST /api/print/status   check PRINT_PENDING jobs; mark the finished,
                                      requeue the stalled, fail the hopeless
               {library, folder, giveUpDays?, stallMinutes?, maxRetries?,
                printerShareId?}
+
+HEALTH RUNS FIRST AND WRITES NOTHING. Every failure this pipeline has was
+otherwise discovered mid-run, several only after files had been claimed: an
+offline printer is a Submit 200 with failed = 0 (S3); a dead refresh token 500s
+everything; a pypdfium2 wheel that did not install is found one document at a
+time, each row going PRINT_PENDING then PRINT_FAILED. One share read answers all
+of them while the queue is untouched.
 
 Everything marked `?` is optional and, where it is a threshold, resolves
 request > app setting > default -- so the retry pacing, the batch size and the
@@ -68,6 +77,17 @@ app = func.FunctionApp()
 
 EP_SUBMIT = "submit"
 EP_POLL = "poll"
+EP_HEALTH = "health"
+
+# The share id is the PERISHABLE half of the share/printer pair: deleting and
+# re-creating a share mints a new one while the printer id and its
+# registeredDateTime are untouched. So every recorded copy -- README, the docs,
+# live-printer-check.ps1's default, and the Flow bodies in Power Automate -- goes
+# stale at that moment, and the only symptom is a 404. Named here once because
+# both Health and _server_error hand it to whoever is reading.
+STALE_SHARE_REMEDY = ("the printer share id may be stale -- read the current one "
+                      "from Universal Print > Printers > the printer > Overview, "
+                      "then update the Power Automate flows")
 
 
 # --- responses and logging ----------------------------------------------------
@@ -297,6 +317,44 @@ class Budget:
     @property
     def exhausted(self) -> bool:
         return (time.monotonic() - self._started) >= self._limit
+
+
+def _printer_report(share: universal_print.ShareInfo) -> Dict[str, Any]:
+    """The printer block, in the one shape both the dry run and Health report.
+
+    Extracted from Submit's dryRun branch when Health arrived. Two endpoints
+    describing the same printer differently is the exact drift that made
+    printing/plan.py wrong once already, and the cost of preventing it is this
+    function. test_dryrun.py pins these key names.
+    """
+    return {
+        "shareId": share.share_id,
+        "printerId": share.printer_id,
+        "displayName": share.display_name,
+        "acceptingJobs": share.accepting_jobs,
+        "state": share.state,
+        "contentTypes": share.content_types,
+        "dpis": share.dpis,
+    }
+
+
+def _converter_available() -> bool:
+    """Whether the PDF renderer can actually be loaded.
+
+    A module-level function for two reasons. pwg_converter imports pypdfium2
+    LAZILY, inside convert_pdf, so a wheel that failed to install is otherwise
+    discovered per file AFTER the row has been claimed -- PRINT_PENDING, then
+    PRINT_FAILED, once per document. And it is the only seam a test can patch:
+    the package is a hard requirement and is genuinely installed in the venv, so
+    the failure cannot be provoked any other way.
+    """
+    try:
+        import pypdfium2  # noqa: F401
+    except Exception:
+        logging.warning("pypdfium2 could not be imported; documents needing "
+                        "conversion cannot be printed", exc_info=True)
+        return False
+    return True
 
 
 def _dry_run_conversion(share: universal_print.ShareInfo,
@@ -586,15 +644,7 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
                 "library": context.list_title, "folder": folder,
                 "resolvedColumns": {display: context.internal(display)
                                     for display in print_policy.COLUMN_DISPLAY_NAMES},
-                "printer": {
-                    "shareId": share.share_id,
-                    "printerId": share.printer_id,
-                    "displayName": share.display_name,
-                    "acceptingJobs": share.accepting_jobs,
-                    "state": share.state,
-                    "contentTypes": share.content_types,
-                    "dpis": share.dpis,
-                },
+                "printer": _printer_report(share),
                 "printFormat": print_format or None,
                 # Which profile would run, and what it would upload. This is how
                 # you find out a printer needs conversion WITHOUT printing -- and,
@@ -953,6 +1003,136 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
         return _server_error(EP_POLL, exc, library, folder, "-", started)
 
 
+# --- Health -------------------------------------------------------------------
+
+
+def _health_response(started: float, printer_share_id: str, print_format: str,
+                     errors: List[Dict[str, Any]],
+                     warnings: List[Dict[str, Any]],
+                     printer: Optional[Dict[str, Any]] = None,
+                     conversion: Optional[Dict[str, Any]] = None,
+                     printer_name: str = "",
+                     profile_name: str = "") -> func.HttpResponse:
+    """One shape for every Health answer, healthy or not.
+
+    ALWAYS a 200 when the check itself ran: 400 means the request was malformed
+    and 500 means Health broke, so a non-200 never means "the printer is sick".
+    That is deliberate. Power Automate marks a non-2xx HTTP action as FAILED,
+    which halts the branch unless every downstream action carries a
+    run-after override -- and the body, which is the entire diagnosis, becomes
+    awkward to read at exactly the moment it matters.
+
+    `healthy`, `errors` and `warnings` are present on every one of these, so a
+    flow condition never needs a null check. That is the S3 lesson: an offline
+    printer used to be a 200 that matched no condition at all.
+    """
+    healthy = not errors
+    _run_summary(EP_HEALTH, printer=printer_share_id or "-",
+                 ok=1 if healthy else 0, failed=len(errors),
+                 skipped=len(warnings), http_status=200, started=started)
+    return _json_response(200, {
+        "healthy": healthy,
+        "printerShareId": printer_share_id,
+        "printFormat": print_format or None,
+        "printer": printer,
+        "conversion": conversion,
+        "errors": errors,
+        "warnings": warnings,
+        "message": print_policy.health_message(errors, warnings,
+                                               printer_name, profile_name),
+    })
+
+
+@app.route(route="print/health", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def check_printer_health(req: func.HttpRequest) -> func.HttpResponse:
+    """Can this pipeline do any work right now? One Graph call, no writes.
+
+    Called by Power Automate BEFORE Submit and Poll, so that the failures which
+    are otherwise discovered mid-run -- an offline printer, a dead refresh token,
+    a renderer that did not install -- are discovered while the queue is still
+    untouched and nothing has been claimed.
+
+    This route writes NOTHING, to SharePoint or to Universal Print. It is safe to
+    call as often as a flow likes.
+    """
+    started = time.monotonic()
+    printer_share_id = "-"
+    print_format = ""
+    try:
+        body = _body(req)
+        printer_share_id = _required_str(body, "printerShareId")
+        # Reused verbatim from Submit, so an unknown format is a 400 here too. A
+        # malformed REQUEST is not an unhealthy PRINTER, and conflating them would
+        # have a flow notifying about a broken device over its own typo.
+        print_format = _print_format(body)
+
+        client = _client()
+
+        # --- terminal stage --------------------------------------------------
+        # Without a share there is nothing else to evaluate, so these answer with
+        # one error and null blocks rather than a misleadingly partial picture.
+        # The token provider is called lazily inside the first request, so a dead
+        # refresh token surfaces HERE rather than from _client().
+        try:
+            share = universal_print.get_share(client, printer_share_id)
+        except graph_auth.AuthBootstrapRequired as exc:
+            return _health_response(
+                started, printer_share_id, print_format,
+                [print_policy.health_finding(
+                    print_policy.HEALTH_AUTH_BOOTSTRAP_REQUIRED, str(exc),
+                    "run scripts/bootstrap_token.py")], [])
+        except graph_client.GraphError as exc:
+            # A 404 is the perishable share id: deleting and re-creating a share
+            # mints a new one while the printer id is untouched, so every recorded
+            # copy -- including the Flow bodies -- goes stale at that moment.
+            not_found = exc.status_code == 404
+            return _health_response(
+                started, printer_share_id, print_format,
+                [print_policy.health_finding(
+                    print_policy.HEALTH_PRINTER_NOT_FOUND if not_found
+                    else print_policy.HEALTH_PRINTER_UNREACHABLE,
+                    str(exc),
+                    STALE_SHARE_REMEDY if not_found else "")], [])
+
+        # --- accumulate every remaining finding ------------------------------
+        # The conversion block comes from the SAME function the dry run uses, so
+        # Health cannot describe a pipeline Submit would not run -- and the
+        # profile, the conversion flag and any configuration error are read back
+        # out of it rather than recomputed.
+        conversion = _dry_run_conversion(share, print_format)
+        profile_name = conversion.get("profile")
+        conversion_required = bool(conversion.get("conversionRequired"))
+
+        errors, warnings = print_policy.health_findings(
+            accepting_jobs=share.accepting_jobs,
+            state=share.state,
+            content_types=share.content_types,
+            printer_id=share.printer_id,
+            print_format=print_format,
+            # ShareInfo.supports owns "does this printer accept X" -- the same
+            # call Submit's preflight makes. None means nothing was asked for.
+            format_supported=share.supports(print_format) if print_format else None,
+            profile_name=profile_name,
+            conversion_required=conversion_required,
+            # Only load the renderer when a profile would actually need it.
+            converter_available=_converter_available() if conversion_required else True,
+            configuration_error=conversion.get("configurationError") or "",
+        )
+
+        return _health_response(
+            started, printer_share_id, print_format, errors, warnings,
+            printer=_printer_report(share), conversion=conversion,
+            printer_name=share.display_name or printer_share_id,
+            profile_name=profile_name or "")
+
+    except BadRequest as exc:
+        _run_summary(EP_HEALTH, printer=printer_share_id,
+                     http_status=400, started=started)
+        return _json_response(400, {"error": str(exc)})
+    except Exception as exc:
+        return _server_error(EP_HEALTH, exc, "-", "-", printer_share_id, started)
+
+
 # --- shared error handling ----------------------------------------------------
 
 
@@ -960,9 +1140,16 @@ def _server_error(endpoint: str, exc: Exception, library: str, folder: str,
                   printer: str, started: float) -> func.HttpResponse:
     """500 for anything unexpected.
 
-    Two failures get a specific message because they have a specific fix and
+    Three failures get a specific message because they have a specific fix and
     would otherwise cost an hour of diagnosis each: a dead refresh token (re-run
-    the bootstrap script) and a missing column (fix the library).
+    the bootstrap script), a missing column (fix the library), and a stale
+    printer share id (read the current one and update the flows).
+
+    The third was recorded as missing in docs/design.md long before it was
+    written: a re-created share 404s on Submit's preflight, and without this the
+    answer is a bare `GraphError: ... (HTTP 404)` that names no action. Health
+    reports the same condition as PRINTER_NOT_FOUND; this is for whoever calls
+    Submit without checking first.
     """
     if isinstance(exc, graph_auth.AuthBootstrapRequired):
         logging.error("delegated auth is broken: %s", exc)
@@ -971,6 +1158,13 @@ def _server_error(endpoint: str, exc: Exception, library: str, folder: str,
         logging.error("library schema problem: %s", exc)
         payload = {"error": str(exc),
                    "remedy": "add the missing column(s) to the SharePoint library"}
+    elif (isinstance(exc, graph_client.GraphError) and exc.status_code == 404
+            and "/print/shares/" in (exc.url or "")):
+        # Scoped to the SHARE route on purpose. A 404 from a job lookup is
+        # ordinary -- finished jobs age out, and get_job already absorbs it -- so
+        # only the preflight's 404 earns this remedy.
+        logging.error("printer share not found: %s", exc)
+        payload = {"error": str(exc), "remedy": STALE_SHARE_REMEDY}
     else:
         logging.exception("%s failed", endpoint)
         payload = {"error": f"{type(exc).__name__}: {exc}"}

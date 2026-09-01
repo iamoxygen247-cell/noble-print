@@ -53,7 +53,12 @@ ROUTES = {
     "submit": "/api/print/submit",
     "dryrun": "/api/print/submit",
     "status": "/api/print/status",
+    "health": "/api/print/health",
 }
+
+# Endpoints that address a printer rather than the library. `health` takes ONLY
+# the printer, so sending library/folder would be noise the endpoint ignores.
+PRINTER_ONLY = ("health",)
 
 # Windows redirects stdout as cp1252, so a file name with an accent raises
 # UnicodeEncodeError and buries the real output under a traceback (playbook §5.3).
@@ -153,6 +158,40 @@ def summarise(command: str, status: int, payload: dict) -> None:
                   "would submit nothing.")
         return
 
+    if command == "health":
+        # `healthy` is on every 200 by contract, so this never needs a guard --
+        # the same reason a Power Automate condition does not.
+        print("healthy      : {}".format(payload.get("healthy")))
+        print("printer      : {}".format(payload.get("printerShareId")))
+        print("format       : {}".format(
+            payload.get("printFormat") or "(none -- capabilities choose)"))
+        if payload.get("message"):
+            print("summary      : {}".format(payload["message"]))
+
+        for label, key in (("ERROR  ", "errors"), ("warning", "warnings")):
+            for finding in payload.get(key) or []:
+                print("  {} {}: {}".format(label, finding.get("code"),
+                                           finding.get("message")))
+                if finding.get("remedy"):
+                    print("           -> {}".format(finding["remedy"]))
+
+        printer = payload.get("printer") or {}
+        if printer:
+            print("  accepting  : {}   state: {}".format(
+                printer.get("acceptingJobs"), printer.get("state") or "(none)"))
+            print("  content    : {}".format(
+                ", ".join(printer.get("contentTypes") or []) or "(none reported)"))
+        conversion = payload.get("conversion") or {}
+        if conversion.get("profile"):
+            print("  profile    : {}  (converts: {})".format(
+                conversion["profile"], conversion.get("conversionRequired")))
+
+        if not payload.get("healthy"):
+            print("\nFlow A should NOT submit while this is false. Flow B may "
+                  "still poll -- Poll marks completions and gives up on old rows "
+                  "whether or not the printer is well.")
+        return
+
     if command == "status" and "stallMinutes" in payload:
         # Echoed by the endpoint, so this shows what was ACTUALLY in force rather
         # than what the caller believes it sent -- the difference matters once the
@@ -226,7 +265,7 @@ def main() -> int:
     parser.add_argument("--max-retries", type=int,
                         help="status: most requeues one file may receive")
     parser.add_argument("--print-format",
-                        help="submit/dryrun: the format to UPLOAD, e.g. "
+                        help="submit/dryrun/health: the format to UPLOAD, e.g. "
                              "application/pdf (no conversion -- the invoice "
                              "already is one) or image/pwg-raster (runs the "
                              "converter). Omit to let the printer's capabilities "
@@ -247,7 +286,8 @@ def main() -> int:
         print("\nOK: rejected without touching the queue.")
         return 0
 
-    body = {"library": args.library, "folder": args.folder}
+    body = ({} if args.command in PRINTER_ONLY
+            else {"library": args.library, "folder": args.folder})
     # Sent for status as well, where it is an OPTIONAL HARD OVERRIDE: every
     # lookup and cancel in the run addresses this share instead of each row's
     # own Printer_Name. Omit it and every row follows its own column.
@@ -266,7 +306,7 @@ def main() -> int:
     if args.print_format:
         body["printFormat"] = args.print_format
 
-    if args.command in ("submit", "dryrun") and not args.printer_share_id:
+    if args.command in ("submit", "dryrun", "health") and not args.printer_share_id:
         parser.error("--printer-share-id is required for {}".format(args.command))
 
     status, payload = call(args.base_url, ROUTES[args.command], args.key, body)

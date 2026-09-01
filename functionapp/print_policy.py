@@ -124,6 +124,23 @@ ALL_JOB_STATES = (
 # States that will never make progress on their own.
 TERMINAL_JOB_STATES = (JOB_COMPLETED, JOB_CANCELED, JOB_ABORTED)
 
+# --- Universal Print PRINTER states -------------------------------------------
+# printerProcessingState, on the SHARE. A DIFFERENT ENUM from the job states
+# above, and the trap is that both spell "stopped".
+#
+#   JOB_STOPPED         one print job is blocked; the job CAN still continue
+#   PRINTER_STATE_STOPPED   the device itself reports a fault
+#
+# Never substitute one for the other, and never compare a job state to a printer
+# state. test_health.py pins that they stay distinct constants.
+PRINTER_STATE_UNKNOWN = "unknown"
+PRINTER_STATE_IDLE = "idle"
+PRINTER_STATE_PROCESSING = "processing"
+PRINTER_STATE_STOPPED = "stopped"
+
+ALL_PRINTER_STATES = (PRINTER_STATE_UNKNOWN, PRINTER_STATE_IDLE,
+                      PRINTER_STATE_PROCESSING, PRINTER_STATE_STOPPED)
+
 # --- Poll actions -------------------------------------------------------------
 POLL_COMPLETE = "complete"   # write PRINT_COMPLETED + "printed on ..."
 POLL_FAIL = "fail"           # write PRINT_FAILED + the job's own description
@@ -265,6 +282,175 @@ def poll_decision(state: Optional[str], *,
     if due > spent:
         return POLL_REQUEUE, due
     return POLL_NONE, spent
+
+
+# --- Printer health -----------------------------------------------------------
+# The codes the Health endpoint reports. They are a CLOSED, STABLE vocabulary: a
+# Power Automate condition and a KQL query both key on them, so renaming one is a
+# breaking change even though nothing in Python would fail.
+HEALTH_AUTH_BOOTSTRAP_REQUIRED = "AUTH_BOOTSTRAP_REQUIRED"
+HEALTH_PRINTER_NOT_FOUND = "PRINTER_NOT_FOUND"
+HEALTH_PRINTER_UNREACHABLE = "PRINTER_UNREACHABLE"
+HEALTH_PRINTER_NOT_ACCEPTING_JOBS = "PRINTER_NOT_ACCEPTING_JOBS"
+HEALTH_PRINTER_STOPPED = "PRINTER_STOPPED"
+HEALTH_NO_PRINTER_ID = "NO_PRINTER_ID"
+HEALTH_FORMAT_NOT_SUPPORTED = "FORMAT_NOT_SUPPORTED"
+HEALTH_NO_PROFILE = "NO_PROFILE"
+HEALTH_JOB_CONFIGURATION_FAILED = "JOB_CONFIGURATION_FAILED"
+HEALTH_CONVERTER_UNAVAILABLE = "CONVERTER_UNAVAILABLE"
+
+HEALTH_NO_CONTENT_TYPES = "NO_CONTENT_TYPES"
+HEALTH_PRINTER_STATE_UNKNOWN = "PRINTER_STATE_UNKNOWN"
+
+# Every code this module can emit, errors and warnings alike. Used by the docs and
+# by a test that they are unique -- two constants sharing a string would make one
+# of them permanently unreportable.
+ALL_HEALTH_CODES = (
+    HEALTH_AUTH_BOOTSTRAP_REQUIRED, HEALTH_PRINTER_NOT_FOUND,
+    HEALTH_PRINTER_UNREACHABLE, HEALTH_PRINTER_NOT_ACCEPTING_JOBS,
+    HEALTH_PRINTER_STOPPED, HEALTH_NO_PRINTER_ID,
+    HEALTH_FORMAT_NOT_SUPPORTED, HEALTH_NO_PROFILE,
+    HEALTH_JOB_CONFIGURATION_FAILED, HEALTH_CONVERTER_UNAVAILABLE,
+    HEALTH_NO_CONTENT_TYPES, HEALTH_PRINTER_STATE_UNKNOWN,
+)
+
+
+def health_finding(code: str, message: str, remedy: str = "") -> dict:
+    """One finding. `remedy` is omitted entirely rather than sent as an empty
+    string, so a flow can test for its presence."""
+    finding = {"code": code, "message": message}
+    if remedy:
+        finding["remedy"] = remedy
+    return finding
+
+
+def health_findings(*, accepting_jobs: bool, state: Optional[str],
+                    content_types: Sequence[Any], printer_id: str,
+                    print_format: str, format_supported: Optional[bool],
+                    profile_name: Optional[str],
+                    conversion_required: bool,
+                    converter_available: bool,
+                    configuration_error: str = "") -> tuple:
+    """(errors, warnings) for one printer share. Pure -- primitives only.
+
+    Called once, AFTER the share has been read. Everything that makes the share
+    unreadable at all -- a dead token, a 404, an unreachable service -- is decided
+    by the caller and short-circuits before this function is reached, because
+    without a share there is nothing here to evaluate.
+
+    EVERY finding is collected; nothing short-circuits. A flow that is told one
+    problem per ten-minute cycle takes an hour to learn about six.
+
+    `format_supported` IS PASSED IN RATHER THAN COMPUTED HERE, and that is
+    deliberate. "Does this printer accept X" already has exactly one definition --
+    universal_print.ShareInfo.supports -- and Submit's preflight uses it. A second
+    implementation in this module would be free to disagree with the endpoint it
+    is supposed to be predicting, which is the whole failure mode Health exists to
+    prevent. None means the caller named no format, so there is nothing to check.
+    """
+    errors = []
+    warnings = []
+    normalized_state = (state or "").strip().lower()
+
+    # -- can the service take work at all? ------------------------------------
+    if not accepting_jobs:
+        errors.append(health_finding(
+            HEALTH_PRINTER_NOT_ACCEPTING_JOBS,
+            "the printer share is not accepting jobs "
+            f"(state: {normalized_state or 'unknown'})",
+            "wake or reconnect the printer, then re-run this check"))
+
+    if normalized_state == PRINTER_STATE_STOPPED:
+        # Note this is printerProcessingState, NOT printJobStatus.state -- see the
+        # constants above. Treated as fatal by explicit decision: a stopped device
+        # may still queue work that prints on recovery, so this deliberately stops
+        # Flow A rather than letting documents pile up against a faulty printer.
+        errors.append(health_finding(
+            HEALTH_PRINTER_STOPPED,
+            "the printer reports a fault (printerProcessingState: stopped)",
+            "clear the fault at the device -- paper, toner, covers, jams"))
+    elif normalized_state in ("", PRINTER_STATE_UNKNOWN):
+        warnings.append(health_finding(
+            HEALTH_PRINTER_STATE_UNKNOWN,
+            "the printer does not report a processing state; "
+            "it cannot be checked, only tried"))
+
+    # -- can a stalled job be cancelled later? --------------------------------
+    if not printer_id:
+        # Cancel is documented ONLY on /print/printers/{id}/jobs/{id}/cancel. With
+        # no printer id behind the share, Poll cannot cancel a stalled job before
+        # requeuing it, and the original prints alongside its replacement (rule 2,
+        # defect D1). Nothing else in the app checks this.
+        errors.append(health_finding(
+            HEALTH_NO_PRINTER_ID,
+            "the share reports no printer id, so a stalled job could not be "
+            "cancelled before being retried -- risking a duplicate print",
+            "re-create the printer share, then update the flows with the new "
+            "share id"))
+
+    # -- can we produce what this printer takes? ------------------------------
+    if not content_types:
+        # ShareInfo.supports gives an under-reporting device the benefit of the
+        # doubt, so this is a warning: we cannot verify the format, and the app
+        # will attempt it anyway rather than refuse to print.
+        warnings.append(health_finding(
+            HEALTH_NO_CONTENT_TYPES,
+            "the printer reports no content types, so the upload format cannot "
+            "be verified in advance"))
+
+    if format_supported is False:
+        offered = ", ".join(str(t) for t in content_types) or "unknown"
+        errors.append(health_finding(
+            HEALTH_FORMAT_NOT_SUPPORTED,
+            f"the printer does not accept {print_format} (supports: {offered})",
+            "send a printFormat the printer reports, or omit it and let the "
+            "capabilities choose"))
+
+    # `not profile_name` rather than `is None`: the caller reads this out of the
+    # conversion report, where "no profile" is None today -- but an empty name
+    # would sail through an identity check and report a healthy printer with no
+    # way to print, which is the worst answer this endpoint could give.
+    if not profile_name:
+        errors.append(health_finding(
+            HEALTH_NO_PROFILE,
+            "no conversion profile can produce anything this printer accepts "
+            "from a PDF"))
+
+    if configuration_error:
+        errors.append(health_finding(
+            HEALTH_JOB_CONFIGURATION_FAILED,
+            f"the job configuration for this printer could not be built: "
+            f"{truncate_message(configuration_error)}"))
+
+    # -- can we run the conversion the profile needs? -------------------------
+    # Only when a conversion is actually required. A passthrough printer never
+    # loads the renderer, so a missing one is not its problem.
+    if conversion_required and not converter_available:
+        errors.append(health_finding(
+            HEALTH_CONVERTER_UNAVAILABLE,
+            "the PDF renderer is not installed, so every document needing "
+            "conversion would fail after being claimed",
+            'python -m pip install "pypdfium2>=5,<6" and redeploy'))
+
+    return errors, warnings
+
+
+def health_message(errors: Sequence[Any], warnings: Sequence[Any],
+                   printer_name: str = "", profile_name: str = "") -> str:
+    """One line a human can read without opening the arrays."""
+    if errors:
+        codes = ", ".join(str(e.get("code", "?")) for e in errors)
+        plural = "problem" if len(errors) == 1 else "problems"
+        return f"{len(errors)} {plural}: {codes}"
+
+    ready = f"printer {printer_name or 'share'} is ready"
+    if profile_name:
+        ready += f"; documents go through the {profile_name} profile"
+    if warnings:
+        codes = ", ".join(str(w.get("code", "?")) for w in warnings)
+        plural = "warning" if len(warnings) == 1 else "warnings"
+        ready += f" ({len(warnings)} {plural}: {codes})"
+    return ready
 
 
 # --- Time ---------------------------------------------------------------------

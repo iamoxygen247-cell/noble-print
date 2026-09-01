@@ -61,10 +61,11 @@ cd "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"
 **Then open the library and read the four columns.** A 200 response is not proof
 the write landed.
 
-## The two endpoints
+## The three endpoints
 
 | Name | Route | What it does |
 |---|---|---|
+| **Health** | `POST /api/print/health` | Can the pipeline work right now? One share read, **no writes**. Called before the other two |
 | **Submit** | `POST /api/print/submit` | Claims the oldest `PRINT_READY` files and creates print jobs |
 | **Poll** | `POST /api/print/status` | Checks `PRINT_PENDING` jobs: marks the finished, requeues the stalled, fails the hopeless |
 
@@ -76,8 +77,10 @@ first requeue is observed at ≈10 min rather than ≈5. The pacing lives
 in the Power Automate request body (`stallMinutes`, `maxRetries`, `giveUpDays`),
 so it is retuned without a deploy.
 
-> A third endpoint, `POST /api/print/resubmit`, ran daily and would not touch a
-> file until it was 72 hours old. It was retired on 2026-09-01.
+> **`POST /api/print/resubmit` is gone.** It ran daily and would not touch a file
+> until it was 72 hours old; it was retired on 2026-09-01 and its recovery work
+> folded into Poll. Health is not its replacement — it reads a printer and writes
+> nothing.
 
 ## The columns
 

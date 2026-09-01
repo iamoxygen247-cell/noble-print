@@ -142,6 +142,28 @@ Two refusals, deliberately different: a format **the printer** does not report i
 produce is a per-file `PRINT_FAILED`. Do not collapse them — the first is a broken
 flow, the second is one bad file among good ones.
 
+### 2c. Health runs first and writes nothing
+
+`POST /api/print/health` is a pre-flight: one share read, **no writes anywhere**,
+safe to call on every flow tick. It exists because every failure here was
+otherwise found mid-run and several only after files were claimed.
+
+It answers **200 with `healthy: false`** for a sick printer — never a non-2xx.
+400 means the request was malformed, 500 means Health itself broke. Power Automate
+marks a non-2xx as a failed action and halts the branch, which is precisely when
+the diagnosis in the body is needed. `healthy`, `errors` and `warnings` are on
+every 200 so a flow condition needs no null check (the S3 lesson).
+
+Three conditions are what it is *for*. `PRINTER_STOPPED` is checked nowhere else
+at all. The other two are noticed only too late to help: `NO_PRINTER_ID` by
+`cancel_job`, as a WARNING at the moment a cancel is attempted — by which point
+the duplicate is unavoidable (rule 2); and `CONVERTER_UNAVAILABLE` one claimed
+file at a time, because `pypdfium2` is imported lazily inside `convert_pdf`.
+
+The codes in `print_policy.ALL_HEALTH_CODES` are a **closed, stable vocabulary** —
+a flow condition and a KQL query key on them, so renaming one is a breaking change
+that no Python would catch.
+
 ### 3. Two calls must NOT carry an Authorization header
 
 * the SharePoint pre-authenticated download URL
@@ -154,7 +176,7 @@ everywhere" will break both, one silently.
 
 ### 4. `print_policy.py` imports only the standard library
 
-That constraint is what keeps 435 tests offline and sub-second, and what makes the
+That constraint is what keeps 487 tests offline and sub-second, and what makes the
 utility reusable — another workflow keeps the adapters and replaces only the
 rules. `test_print_policy_imports_only_the_standard_library` enforces it.
 
@@ -166,7 +188,7 @@ in a route belongs in `print_policy`.
 ## Standard Commands
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest              # 435 tests, offline, ~0.7s
+.\.venv\Scripts\python.exe -m pytest              # 487 tests, offline, ~0.7s
 .\scripts\start-local.ps1                         # venv + TLS shim + func start
 .\.venv\Scripts\python.exe scripts\bootstrap_token.py
 .\.venv\Scripts\python.exe scripts\test.py dryrun --library "AI_DropBox_V2026" --folder "/Backup/Invoice" --printer-share-id <guid>
@@ -187,6 +209,7 @@ Five tiers, all but the last offline (design §10):
 | B | `test_adapters.py` | the adapters against `FakeGraph` |
 | C | `test_submit/poll/auth.py` | the routes, end to end. **Poll carries the retry schedule, the cancel-first guard, the give-up path and the `printerShareId` override (F3-R)** |
 | A+C | `test_printing.py` | the PWG encoder (byte-pinned), profile selection, and Submit against a raster-only printer |
+| A+C | `test_health.py` | the pre-flight endpoint — the finding matrix as pure rules, the route, and **parity with Submit's dryRun** so Health cannot describe a pipeline Submit would not run |
 | A+C | `test_print_format.py` | `printFormat` — the `matches`/`produces` split, the two refusals, and that the requested format reaches the wire |
 | C | `test_requirements.py` | **conformance, one test per requirement clause** |
 | C | `test_review_findings.py` | the six defects the first review found; each failed first |
