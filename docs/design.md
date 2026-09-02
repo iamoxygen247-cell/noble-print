@@ -9,9 +9,10 @@
 
 ## 1. Context
 
-Noble Homes has a SharePoint document library whose files carry four columns:
-`Print_Status`, `Print_JobId`, `Print_Message`, `Printer_Name`. An upstream process drops files
-in with `Print_Status = "PRINT_READY"`. They must reach a physical printer through Microsoft
+Noble Homes has a SharePoint document library whose files carry five columns:
+`Print_Status`, `Print_JobId`, `Print_Message`, `Printer_Name` and `Print_Time`. The first four
+are the requirement's; `Print_Time` was added on 2026-09-02 to make the retry backoff visible
+(R21). An upstream process drops files in with `Print_Status = "PRINT_READY"`. They must reach a physical printer through Microsoft
 Universal Print, with the outcome written back onto each file so **the library is both the work
 queue and the audit trail** — no separate database.
 
@@ -27,7 +28,7 @@ a runtime configuration engine — see §9. Volume/traffic scaling is explicitly
 | Name | Route | Responsibility |
 |---|---|---|
 | **Health** | `POST /api/print/health` | Report whether the printer can be used at all. Reads one share, writes nothing |
-| **Submit** | `POST /api/print/submit` | Claim the oldest `PRINT_READY` files and create print jobs |
+| **Submit** | `POST /api/print/submit` | Claim the oldest `PRINT_READY` files **that are due** (`Print_Time` empty or past) and create print jobs |
 | **Poll** | `POST /api/print/status` | Check `PRINT_PENDING` jobs: mark the finished, requeue the stalled, fail the hopeless |
 
 Referred to by name throughout — never "endpoint 1/2/3".
@@ -56,13 +57,13 @@ Referred to by name throughout — never "endpoint 1/2/3".
 
 | # | Requirement | Where | Notes |
 |---|---|---|---|
-| R1 | Four columns exist | §5.4 write matrix | Internal names resolved at runtime by `displayName` (§6.2) |
+| R1 | Four columns exist | §5.4 write matrix | Internal names resolved at runtime by `displayName` (§6.2). ⚠️ **A fifth was added:** `Print_Time`, see R21 |
 | R2 | An endpoint Power Automate can call | **Submit**, §3 | Function-key auth |
 | R3 | Retrieve the **oldest 15** `PRINT_READY` files from a library | **Submit** step 4 | ⚠️ **Deviation:** default batch **5**, range 1–15, per the agreed loop model. `"batchSize": 15` reproduces the literal wording |
 | R4 | Call Universal Print to create a print job | **Submit** 5.3–5.6 | 4 calls: create → upload session → upload → start |
 | R5 | On success → `PRINT_PENDING`, `Printer_Name` = printer id, `Print_JobId` = job id | §5.4 | ⚠️ **Ordering change:** status+printer written *before* submission as an atomic claim; job id after. End state identical. Rationale §5.3 |
 | R6 | On failure → `PRINT_FAILED`, `Printer_Name`, `Print_Message` = the error | §5.4 | ⚠️ Message carries the error from **whichever step failed**, not only Universal Print's text — a SharePoint-side failure must not be reported as a printer fault |
-| R7 | Inputs: folder, library, PrinterId | **Submit** request | Plus optional `batchSize` |
+| R7 | Inputs: folder, library, PrinterId | **Submit** request | Plus optional `batchSize`, and — since R23 — the required `sharepointHostname` / `sharepointSitePath` |
 | R8 | A second endpoint to check job status | **Poll** | |
 | R9 | Query the folder, **last 20 days**, `PRINT_STATUS = "PRINT_PENDING"` | **Poll** step 1 | Window on `createdDateTime`, consistent with R16 |
 | R10 | `COMPLETED` → `PRINT_COMPLETED` | **Poll** step 3 | |
@@ -76,6 +77,9 @@ Referred to by name throughout — never "endpoint 1/2/3".
 | R18 | Python | throughout | Azure Functions Python v2 model |
 | R19 | Reuse learnings/structure from `noble-invoice-process` | §8, §9, §13 | Playbook §§2.1–2.8, 5–7 applied |
 | R20 | Testing in the design | §10 | Five tiers |
+| **R21** | A stalled `PRINT_PENDING` job records **when** it will be retried, in `Print_Time`, and still returns to `PRINT_READY` | **Poll** check 4, §5.4, §5.7 | The retry time is the existing ladder, `stallMinutes × (2ⁿ − 1)` from `createdDateTime`, clamped to the give-up deadline. Written in the business zone **with its UTC offset** — see §5.7 |
+| **R22** | Submit processes only files where `Print_Status = PRINT_READY` **and** `Print_Time <= Now` | **Submit** step 4 | Compared in Python, not `$filter` (one indexed field at a time). ⚠️ **A blank or unreadable `Print_Time` means DUE NOW** — upstream files carry none, and a human resetting a terminal row leaves none either; fail-closed would stop the queue dead |
+| **R23** | The site is named by the caller, not the deployment | **Submit** / **Poll** request | `sharepointHostname` + `sharepointSitePath` replace two app settings. Missing → **400**, previously a 500. Widens blast radius by design: §5.8 |
 
 > **R11 revised 2026-08-30, after reading a real job back.** The original note said Universal Print
 > "returns no completion timestamp" and used that to justify stamping `Print_Message` with the moment
@@ -132,13 +136,13 @@ Any drift across this line is a bug.
 | Microsoft Graph calls (SharePoint *and* Universal Print) | **Function App** |
 | Token acquisition, caching, refresh-token rotation | **Function App** |
 | Deciding any `Print_Status` value | **Function App** |
-| Writing any of the four columns | **Function App** — *exclusively* |
+| Writing any of the five columns | **Function App** — *exclusively* |
 | Claiming / idempotency / double-print prevention | **Function App** |
 | Retry, throttling, `Retry-After` | **Function App** |
 | Date windows, 72-hour rule, oldest-first ordering | **Function App** |
 | Batch sizing and the wall-clock budget | **Function App** |
 
-> **Single-writer rule (§P-2.4).** The flow must **never** patch the four columns itself, even for
+> **Single-writer rule (§P-2.4).** The flow must **never** patch the five columns itself, even for
 > a quick fix. Two writers to one field is a race debugged at 2 a.m. If the flow needs a state
 > changed, it calls an endpoint.
 
@@ -152,7 +156,9 @@ Recurrence
 └─ Condition: healthy == false  →  notify, TERMINATE (submit nothing)
 └─ Do Until  (remainingReady == 0)  OR  (iterations >= 10)      ← loop guard, never unbounded
    └─ HTTP POST {funcUrl}/api/print/submit?code={key}
-            {"library":"Documents","folder":"/Invoices/ToPrint",
+            {"sharepointHostname":"<tenant>.sharepoint.com",
+             "sharepointSitePath":"/sites/<site>",
+             "library":"Documents","folder":"/Invoices/ToPrint",
              "printerShareId":"<guid>","batchSize":5}
    (printFormat is optional and omitted here on purpose: the live printer takes
     image/pwg-raster ONLY, so naming application/pdf would 400 every run)
@@ -168,8 +174,8 @@ Recurrence → HTTP POST /api/print/health {"printerShareId":"<guid>"}
             completions and gives up on old rows whether or not the printer
             is well; skipping it during an outage is when recovery matters most
           → HTTP POST /api/print/status
-            {"library","folder","printerShareId":"<guid>",
-             "giveUpDays":10,"stallMinutes":5,"maxRetries":10}
+            {"sharepointHostname","sharepointSitePath","library","folder",
+             "printerShareId":"<guid>","giveUpDays":10,"stallMinutes":5}
           → Condition: status != 200 → notify
           → Condition: printerOverridden > 0 → notify  (see F3-R, docs/ai/open-defects.md)
 ```
@@ -251,6 +257,7 @@ Read from Microsoft's documentation, not recalled.
 | Does cancel also work on the `/print/shares/...` path? | Use the documented printers path with the printer id from the share's `printer` relationship |
 | ~~Is content approval on?~~ **CLOSED 2026-08-31 — No** | Read from *Library settings → Versioning settings*: content approval **off**, require check-out **off**, major versions only. So Graph returns every item, no `_ModerationStatus` filter is needed, and `Sites.Manage.All` (the row above) does not apply. Both settings that could have broken this pipeline are off; re-check if anyone changes versioning later. |
 | Is `Print_Status` indexed? | `--dry-run` checks it before the first real run |
+| ~~What type is `Print_Time`?~~ **CLOSED 2026-09-02 — `Date and Time`** | Created with *Include Time* on and *Friendly format* off; **not** indexed, and it does not need to be (§5.4). Still to prove against the live list: that Graph accepts the offset-bearing ISO string, returns the same instant, and that `null` empties the column — `scripts/verify_print_time.py` does all three on one nominated row. FakeGraph cannot answer it, because the fake stores whatever it is handed. Fallback if any of the three fails: a single-line-of-text column, with no code change — every comparison already happens in Python. |
 | ~~Does the printer accept `application/pdf`?~~ **CLOSED 2026-08-30, against the live API** | `live-printer-check.ps1` reads the capability list from Graph: `application/pdf` **and** `application/oxps`. PDFs go to the device as-is. Note the correction it forced: the fixture previously recorded `["application/pdf"]` alone, copied from the portal's *Properties > Printer defaults* page — which shows the **default** content type, not the capability list. Two different fields; the portal does not label which is which. |
 | ~~Are the share id and printer id really different?~~ **CLOSED 2026-08-30** | Confirmed live: the share id and the printer id are two different GUIDs. F3's whole premise, now evidenced rather than reasoned — see the current pair in `README.md`. **They also differ in lifetime.** Deleting and re-creating a share mints a new share id while the printer id and its `registeredDateTime` are untouched, so the id the caller supplies on every request is the perishable one and the id the app resolves for itself at preflight is the durable one. Every recorded copy of a share id (README, the docs, `live-printer-check.ps1`'s default, and **the Flow bodies in Power Automate**) goes stale at that moment, with a 404 reading `does not match any registered printers`. In the app it surfaces from `get_share` — the preflight — so it is a per-run 500 with `RUN_SUMMARY … http_status=500` and **nothing claimed and nothing printed**, which is the right shape. It is not yet one of the two failures `_server_error` gives a named remedy; if it recurs, that is where the remedy line belongs. **And the printer can be replaced too** — it happened on 2026-08-31, so both halves of the pair changed within hours. The durable identifier is neither GUID; it is the **display name** a human recognises, which is why every recorded id needs the printer named beside it. |
 | ~~What `status.state` does the share report?~~ **CLOSED 2026-08-30** | `idle`. The portal *displays* "Ready"; `printerProcessingState` is documented `unknown\|idle\|processing\|stopped` and has no `ready` member. The fixture and two tests had recorded the portal's display string as an API value. **Health branches on it since 2026-09-01** — `PRINTER_STOPPED` is an error, by explicit decision. That is a deliberate bet on an enum this tenant has never reported as anything but `idle`, and the risk is that a transient fault which today queues work that prints on recovery (UC-8) will instead halt Flow A. **Still to be recorded: what the field actually reads with the printer switched off** — `e2e-testing.md` §B0a captures it. Everything else still only reports the value. |
@@ -329,11 +336,16 @@ message. Mixing the two is how DST bugs get in; a test asserts both behaviours.
         (upstream process sets PRINT_READY — not this app, see G4)
                             │
                             ▼
-                   ┌─────────────────┐
-                   │   PRINT_READY   │
-                   └────────┬────────┘
-                            │  Submit: claim, If-Match on eTag
-                            │  writes STATUS=PENDING, PRINTER=shareId, clears JOBID+MESSAGE
+                   ┌──────────────────────────────────┐
+                   │           PRINT_READY            │
+                   │  Print_Time empty or past = DUE  │
+                   │  Print_Time in the future = the  │
+                   │    row is WAITING out its backoff│
+                   │    (Poll cannot see it here)     │
+                   └────────┬─────────────────────────┘
+                            │  Submit: only when DUE. Claim, If-Match on eTag,
+                            │  writes STATUS=PENDING, PRINTER=shareId,
+                            │  clears JOBID + PRINT_TIME, keeps MESSAGE
                             ▼
               ┌──────────────────────────────┐
        ┌─────►│        PRINT_PENDING         │
@@ -350,8 +362,8 @@ message. Mixing the two is how DST bugs get in; a test asserts both behaviours.
        │  │ PRINT_FAILED  │ │PRINT_COMPLETED│
        │  └───────┬───────┘ │  (terminal)   │
        │          │         └───────────────┘
-       └──────────┴──  Poll: stalled past stallMinutes AND a new retry
-                       boundary crossed → cancel old job, back to PRINT_READY
+       └──────────┴──  Poll: stalled past stallMinutes → cancel old job, back to
+                       PRINT_READY with Print_Time = when the next retry falls due
 ```
 
 **Why the claim precedes submission (deviation at R5).** A crash after the claim leaves
@@ -370,21 +382,49 @@ uses the pair, and so does every log correlation (§13.3).
 
 `—` means the column is not touched.
 
-| Event | `Print_Status` | `Printer_Name` | `Print_JobId` | `Print_Message` |
-|---|---|---|---|---|
-| Submit — claim | `PRINT_PENDING` | share id | cleared | **preserved** |
-| Submit — job started | — | — | job id | — |
-| Submit — failed (download/create/upload/start) | `PRINT_FAILED` | share id | — (stays empty) | error text, truncated |
-| Submit — claim lost (412) | — | — | — | — |
-| Poll — `completed` | `PRINT_COMPLETED` | — | — | `printed on YYYY-MM-DD HH:MM:SS` |
-| Poll — `canceled` / `aborted` | `PRINT_FAILED` | — | — | job `description` + `details` |
-| Poll — in flight, inside the stall threshold | — | — | — | — |
-| Poll — stalled, inside the backoff gap | — | — | — | — |
-| Poll — stalled, retries exhausted, inside give-up | — | — | — | — |
-| **Poll — stalled, retry due** | `PRINT_READY` | — | **cleared** | **append** `Job Id N cancelled. Retry job` |
-| **Poll — past the give-up threshold** | `PRINT_FAILED` | — | — | **append** the give-up reason |
+| Event | `Print_Status` | `Printer_Name` | `Print_JobId` | `Print_Message` | `Print_Time` |
+|---|---|---|---|---|---|
+| Submit — claim | `PRINT_PENDING` | share id | cleared | **preserved** | **cleared** |
+| Submit — job started | — | — | job id | — | — |
+| Submit — failed (download/create/upload/start) | `PRINT_FAILED` | share id | — (stays empty) | error text, truncated | **cleared** |
+| Submit — claim lost (412) | — | — | — | — | — |
+| Submit — not yet due (`Print_Time` in the future) | — | — | — | — | — |
+| Poll — `completed` | `PRINT_COMPLETED` | — | — | `printed on YYYY-MM-DD HH:MM:SS` | **cleared** |
+| Poll — `canceled` / `aborted` | `PRINT_FAILED` | — | — | job `description` + `details` | **cleared** |
+| Poll — in flight, inside the stall threshold | — | — | — | — | — |
+| **Poll — stalled** | `PRINT_READY` | — | **cleared** | **append** `Job Id N cancelled. Retry job` | **next due time** |
+| **Poll — past the give-up threshold** | `PRINT_FAILED` | — | — | **append** the give-up reason | **cleared** |
 
 This table **is** the Tier C test suite: one assertion per row.
+
+**`Print_Time` is only ever set on a `PRINT_READY` row.** That invariant is why it is
+cleared on the claim and on every terminal write, and it is asserted directly. Without
+it a human resetting a terminal row to `PRINT_READY` — the documented recovery for
+`PRINT_FAILED`, which is terminal — would inherit a stale future due time, and Submit
+would silently decline to print it. The reset would appear to do nothing at all.
+
+Two rows disappeared when the retry ladder moved into the column. *"Stalled, inside
+the backoff gap"* and *"stalled, retries exhausted, inside give-up"* both used to
+write nothing: the wait was a comparison Poll made privately on every run. Poll now
+requeues the moment a job is stalled and records **when** the next attempt falls due,
+so the waiting happens in Submit against a value anyone can read.
+
+**`Print_Time` is a `Date and Time` column** — created 2026-09-02 with *Include
+Time* **on** and *Friendly format* **off**, so it sorts as a moment and renders as
+an absolute timestamp rather than "in 2 days". It is deliberately **not indexed**:
+SharePoint honours one indexed field per `$filter` and `Print_Status` holds that
+slot, which is why Submit compares the due time in Python (§5.5).
+
+Because the column is typed, SharePoint parses our ISO string to an instant and
+displays it in the **site's** regional settings. Writing it in the business zone is
+therefore what makes the value correct *on the wire* — see §5.7 — not what the
+reader sees; the two happen to be the same clock here.
+
+**It should carry no SharePoint default value.** A default such as `Today's date`
+would stamp every new row, and the column would stop meaning *"a retry is scheduled
+for exactly then"*, which is the only reason it exists. This is legibility, not
+correctness: a default in the past still reads as due, so the pipeline works either
+way. Empty means nothing is scheduled, and `is_due` treats that as *print now*.
 
 **The last two rows are the only places the app appends to `Print_Message`**
 rather than replacing it. Everywhere else the column is overwritten wholesale.
@@ -409,10 +449,11 @@ trail is not lost.
 ### 5.5 Submit — sequence
 
 ```
-POST /api/print/submit {library, folder, printerShareId,
-                        batchSize?=5, printFormat?, dryRun?}
+POST /api/print/submit {sharepointHostname, sharepointSitePath, library, folder,
+                        printerShareId, batchSize?=5, printFormat?, dryRun?}
  ├─ 1 validate                              → 400 on any problem, ZERO writes (§P-2.4)
- ├─ 2 resolve site → list (title|id) + the 4 column internal names   [cached per list]
+ ├─ 2 resolve site → list (title|id) + the 5 column internal names   [cached per list]
+ │      the site comes from the REQUEST, not app settings (§5.8)
  ├─ 3 PREFLIGHT  GET /print/shares/{id}?$select=id,displayName,isAcceptingJobs,
  │                 capabilities,status&$expand=printer($select=id)
  │      reject early: share missing · not accepting jobs · contentTypes lacks the file type
@@ -421,9 +462,16 @@ POST /api/print/submit {library, folder, printerShareId,
  ├─ 4 GET items  $filter=fields/<status> eq 'PRINT_READY'  $expand=fields
  │               Prefer: HonorNonIndexedQueriesWarningMayFailRandomly
  │               follow @odata.nextLink to a page cap
- │      then IN PYTHON: scope to folder → sort by createdDateTime asc → take batchSize
+ │      then IN PYTHON: scope to folder → DROP rows whose Print_Time is still in
+ │                     the future → sort by createdDateTime asc → take batchSize
  │      (client-side: $orderby on fields/* is unreliable, and only one indexed
- │       field may be filtered at a time)
+ │       field may be filtered at a time -- Print_Status holds that slot, which is
+ │       why the due-time comparison happens here and Print_Time needs no index)
+ │      THE DUE FILTER RUNS BEFORE THE BATCH IS TAKEN. A repeatedly-requeued file
+ │      has the OLDEST creation time, so it sorts to the front and is also the one
+ │      most likely to be waiting; filtering afterwards would let waiting files
+ │      fill every slot while printable ones sat behind them.
+ │      A blank or unreadable Print_Time means DUE NOW (§5.4).
  └─ 5 per file, sequentially. THE BUDGET IS CHECKED BEFORE STARTING A FILE, NEVER MID-FILE,
       so the 90 s cap can never strand a claimed row:
       5.1 PATCH items/{id}/fields  If-Match: <eTag>          → CLAIM
@@ -444,9 +492,16 @@ POST /api/print/submit {library, folder, printerShareId,
       5.7 PATCH fields {Print_JobId: jobId}   ← GUARDED: see below
       ──  any failure in 5.2–5.6 → PATCH {PRINT_FAILED, printer, message}
 
- ◄─ 200 {candidatesFound, remainingReady, submitted, failed, skipped,
+ ◄─ 200 {candidatesFound, remainingReady, submitted, failed, skipped, notYetDue,
          printerAvailable, budgetExhausted, batchSize, printFormat,
          items:[{itemId, fileName, result, jobId, message, warning?}]}
+
+      candidatesFound and remainingReady count only what is DUE. notYetDue is
+      separate and NOT folded in: Flow A runs `Do Until remainingReady = 0`, and a
+      file waiting on a future Print_Time can never be submitted this cycle, so
+      counting it there would spin the loop to its iteration cap every recurrence.
+      Reported rather than dropped, because "nothing to print" and "nothing due
+      yet" are different situations.
 
       printFormat is null when the caller named none and the printer's
       capabilities chose the profile -- the pre-parameter behaviour.
@@ -476,8 +531,8 @@ POST /api/print/submit {library, folder, printerShareId,
 > `PRINT_PENDING` row.
 
 ```
-POST /api/print/status {library, folder, printerShareId?,
-                        giveUpDays?=10, stallMinutes?=5, maxRetries?=10}
+POST /api/print/status {sharepointHostname, sharepointSitePath, library, folder,
+                        printerShareId?, giveUpDays?=10, stallMinutes?=5}
  ├─ validate → resolve list + columns
  ├─ GET items $filter=fields/<status> eq 'PRINT_PENDING'
  │     NO window pre-filter. Every pending row reaches the loop -- an old one is
@@ -498,9 +553,15 @@ POST /api/print/status {library, folder, printerShareId?,
                                   minute late still put paper in the tray
         2. canceled | aborted   → PRINT_FAILED + description/details
         3. past giveUpDays      → ***CANCEL***, then PRINT_FAILED + reason
-        4. stalled AND retries left AND a NEW boundary crossed
-                                → ***CANCEL***, then PRINT_READY + appended note
-        5. otherwise            → write NOTHING
+        4. stalled              → ***CANCEL***, then PRINT_READY + appended note
+                                  + Print_Time = when retry (spent+1) falls due,
+                                    CLAMPED to created + giveUpDays
+        5. otherwise            → write NOTHING (a healthy job in flight)
+
+      Check 4 used to carry two more conditions -- "retries left" and "a NEW
+      boundary crossed" -- and a row failing either waited at PRINT_PENDING while
+      every run re-derived the same silence. The waiting is Print_Time's job now,
+      so a stalled row leaves PRINT_PENDING at once and waits where it can be seen.
 
       "stalled" = no job at all (crashed submission or 404), or a live
       non-terminal job whose own createdDateTime is older than stallMinutes.
@@ -509,8 +570,10 @@ POST /api/print/status {library, folder, printerShareId?,
 
  ◄─ 200 {checked, completed, failed, requeued, gaveUp, stillRunning, notFound,
          malformed, pendingFound, uncheckedCount, budgetExhausted,
-         giveUpDays, stallMinutes, maxRetries, printerShareId,
+         giveUpDays, stallMinutes, printerShareId,
          printerOverridden, items:[…]}
+      Each requeued item also carries `retry` and `printTime`, so a run says
+      which attempt it scheduled and for when.
 
       printerOverridden is NOT an error count. It counts CONFIGURATION
       divergence: every row whose Printer_Name disagreed with the override,
@@ -535,50 +598,100 @@ Retry `n` falls due at file age **`stallMinutes × (2ⁿ − 1)`**. With the def
 
 | Retry | Due at | | Retry | Due at |
 |---|---|---|---|---|
-| 1 | 5 min | | 6 | 5h 15m |
-| 2 | 15 min | | 7 | 10h 35m |
-| 3 | 35 min | | 8 | 21h 15m |
-| 4 | 1h 15m | | 9 | 1d 18h 35m |
-| 5 | 2h 35m | | 10 | 3d 13h 15m |
+| 1 | 5 min | | 7 | 10h 35m |
+| 2 | 15 min | | 8 | 21h 15m |
+| 3 | 35 min | | 9 | 1d 18h 35m |
+| 4 | 1h 15m | | 10 | 3d 13h 15m |
+| 5 | 2h 35m | | 11 | 7d 2h 35m |
+| 6 | 5h 15m | | 12 | *14d 5h — clamped to 10d* |
 
-**The count is derived, never stored.** The schema is four columns and there is no
-attempt counter. Because every requeue creates a *new* print job, the current
-job's creation time says how far into the schedule this attempt began:
+**The count is derived, never stored.** There is no attempt counter. Because every
+requeue creates a *new* print job, the current job's creation time says how far
+into the schedule this attempt began:
 
-> A requeue is due iff the job is stalled **and**
-> `retries_due(now) > retries_due(the file's age when this attempt started)`.
+> `spent` = `retries_due(the file's age when this attempt started)`.
+> A stalled job is requeued at once, scheduling retry `spent + 1` for
+> `min(created + stallMinutes × (2^(spent+1) − 1), created + giveUpDays)`.
 
 ```
-T+0    file created, job J1                retries_due(0)  = 0
-T+5    J1 stalled                          retries_due(5)  = 1 > 0  -> REQUEUE
-T+12   Submit creates J2                   retries_due(12) = 1
-T+17   J2 stalled                          retries_due(17) = 2 > 1  -> REQUEUE
-T+27   Submit creates J3                   retries_due(27) = 2
-T+32   J3 stalled                          retries_due(32) = 2      -> wait
-T+40   J3 still stalled                    retries_due(40) = 3 > 2  -> REQUEUE
+T+0    file created, job J1        spent 0  -> REQUEUE, Print_Time = T+5  (past)
+T+10   Submit creates J2           spent 1  (retries_due(10) = 1)
+T+15   J2 stalled                  spent 1  -> REQUEUE, Print_Time = T+15 (now)
+T+20   Submit creates J3           spent 2
+T+25   J3 stalled                  spent 2  -> REQUEUE, Print_Time = T+35 (FUTURE)
+       ...row sits at PRINT_READY, Submit declines it...
+T+35   Submit creates J4                     the wait was a value, not a decision
 ```
 
-The T+32→T+40 gap **is** the backoff. Without it an offline printer would be
-retried every ten minutes all night, each round costing a render, a PDF→PWG
-conversion and an upload.
+**The wait moved from Poll to Submit.** Poll used to hold a stalled row at
+`PRINT_PENDING`, re-deriving the same "not yet" on every run; the backoff was a
+comparison nobody could see. Now the row is requeued immediately and carries the
+due time with it, and Submit is what honours it. Same ladder, same instants —
+written down. The offline printer is still guarded: the expensive work (render,
+conversion, upload) happens when Submit acts, and Submit will not act early.
 
-> **A boundary is when a retry becomes DUE, not when it happens.** Poll acts on
-> its next run, so the observed times are quantised to Flow B's ten-minute
-> cadence — and the first two boundaries, 5 and 15 minutes, fall inside a single
-> interval. Simulated against the real `poll_decision` with the shipped defaults,
-> a permanently stalled file produces **nine requeue events**, at roughly 10, 40,
-> 80, 160, 320, 640, 1280, 2560 and 5120 minutes, carrying retry numbers 1 and
-> 3–10; number 2 is consumed by the cadence. Give-up then lands at 10.01 days.
+> **A due time in the past means "print now".** The early boundaries have usually
+> gone by before Poll first notices a stall, so the first requeues are effectively
+> immediate — which is what reproduces the pre-`Print_Time` timing.
 >
-> This matters when reading a live run: expect the first requeue at ≈10 minutes,
-> not ≈5. Lowering `stallMinutes` below the polling interval does not make the
-> early retries faster — only shortening Flow B's recurrence does.
+> **The quantisation moved from Flow B to Flow A.** The old note here said retry 2
+> was "consumed by Flow B's cadence". Half of that is fixed and half of it simply
+> changed hands, and the difference matters when reading a live run.
+>
+> *Fixed:* once a row is requeued, `Print_Time` pins the exact instant and Submit
+> acts at the next Flow A tick at or after it, so no mid-schedule boundary is lost
+> to the polling interval any more. Simulated against the real `poll_decision`,
+> Flow B at 10 minutes and at 1 minute produce **identical** retry sequences.
+>
+> *Changed hands:* the **front** of the ladder is still skipped, and now it is
+> **Flow A's** recurrence that decides how much. `spent` is read off the file's age
+> when the *first* job is created, and a new file is not submitted the instant it
+> appears — so a file first claimed at 15 minutes already counts two retries as
+> spent, and its schedule opens at retry 3.
+>
+> | Flow A recurrence | first job at | schedule opens at |
+> |---|---|---|
+> | 1 min | 1 min | retry 1 |
+> | 5 min | 5 min | retry 2 |
+> | 15 min | 15 min | retry 3 |
+> | 30 min | 30 min | retry 3 |
+>
+> **Lowering `stallMinutes` does not fix this and can make it worse.** It
+> compresses the ladder, so more of it falls behind the first submission: with
+> Flow A at 15 minutes, `stallMinutes = 1` opens at retry **5** rather than retry 3.
+> Shortening Flow A's recurrence is the only thing that recovers the early retries.
+>
+> None of this changes the outer bound. Every configuration above gives up at
+> **10.00 days**, because that is a property of `giveUpDays` and the clamp, not of
+> either cadence.
 
-**Two bounds doing different jobs.** `maxRetries` bounds the *work* and stops new
-jobs at about 3d 13h. `giveUpDays` bounds the *waiting* and fails the row at 10
-days. Between them sits a **grace period** of roughly 6½ days in which no further
-work is spent but the final job stays live — so a printer that comes back still
-gets the document out, and check 1 records it as printed.
+**One bound, not two.** `giveUpDays` fails the row at 10 days and is the only
+limit. `maxRetries` used to bound the *work* separately, stopping new jobs at about
+3d 13h and leaving a grace period until day 10 — but the retry count is derived
+from the file's age anyway, so a count and a deadline were two answers to one
+question. With the cap gone the ladder reaches retry 11 at 7.11 days, and retry 12
+(14.22 days) is **clamped to the deadline**.
+
+> **Why the clamp is load-bearing.** A row waiting on a future `Print_Time` sits at
+> `PRINT_READY`, and Poll queries `PRINT_PENDING` only — so a retry scheduled past
+> the deadline would be invisible at the exact moment the row was due to be failed,
+> and would print days late against a row that then reads `PRINT_FAILED`. Clamped,
+> the last attempt lands *on* the deadline: it gets `stallMinutes` of life, and the
+> next run finds the file out of window and fails it.
+>
+> **The grace period is gone with it.** Work now continues to the cutoff: twelve
+> renders for an undeliverable document instead of eleven. And because a requeue
+> cancels the outstanding job (rule 2), a row that is *waiting* has no live job —
+> so a printer fixed mid-wait no longer prints immediately, as it did when the last
+> job was left alive. Expect that during a live stall test; it looks like nothing
+> is happening.
+
+**Unbounded, and safely so.** `retries_due` no longer takes a cap. The ladder
+doubles, so the loop is logarithmic — 32 iterations for a year-9999 timestamp at a
+one-minute base — and `poll_decision` only consults it after `within_window` has
+passed, which bounds the file's age at `giveUpDays`. Swept over every legal pair of
+knobs, it returns at most **19** (`stallMinutes` 1, `giveUpDays` 365), so the
+highest retry number ever scheduled is **20**.
 
 > **Why cancel first.** `stopped` means "an issue with the printer needs to be
 > addressed **before the job can continue**" — the job is alive. Requeue without
@@ -595,11 +708,30 @@ gets the document out, and check 1 records it as printed.
 
 ### 5.8 Tuning without a deploy
 
-`batchSize`, `giveUpDays`, `stallMinutes` and `maxRetries` resolve **request body
-→ app setting → default**. The request body is how Power Automate sets them, so
-the pacing of the whole retry schedule is a number in a flow, not a redeploy. An
-out-of-range *request* value is a 400; an out-of-range *app setting* warns and
-falls back, because a server misconfiguration must not fail every call.
+`batchSize`, `giveUpDays` and `stallMinutes` resolve **request body → default**.
+The request body is how Power Automate sets them, so the pacing of the whole retry
+schedule is a number in a flow, not a redeploy. An out-of-range *request* value is
+a 400.
+
+**The app-setting layer is gone, deliberately.** Each of these used to fall back to
+a `PRINT_*` setting, on the reasoning that a server should be able to retune itself.
+In practice it split the answer to *"why is the pacing wrong?"* across a flow and an
+app setting, with the flow silently winning — so a setting could be read, believed,
+and be doing nothing at all. A leftover value in the environment now changes
+nothing, which is what makes the deploy sequence in §5.10 safe: the settings can be
+deleted after the flows are confirmed green rather than before.
+
+`PRINT_BUDGET_SECONDS` and `PRINT_BUSINESS_TZ` keep their settings on purpose.
+Neither is something a flow sets: one is a property of the host's connector
+timeout, the other of the office reading the library.
+
+**The site is request input too.** `sharepointHostname` and `sharepointSitePath`
+were `SHAREPOINT_HOSTNAME` / `SHAREPOINT_SITE_PATH` in app settings. One Function
+App now serves any site a flow names, and everything that shaped a run is visible in
+the flow that made it. The trade is real and is recorded in CLAUDE.md: whoever holds
+the function key chooses the site, bounded only by what the delegated service
+account can reach. A missing value is a **400**, not the 500 the old `RuntimeError`
+produced — it is the caller's error, and is now answered as one.
 
 ### 5.9 Health — sequence
 
@@ -683,13 +815,26 @@ notifies. Pinned by `test_the_budget_covers_the_whole_invocation_not_just_the_fi
 token written back to Key Vault every time. No lease (§4 correction 2). A revoked token surfaces
 as a 500 naming `scripts/bootstrap_token.py`.
 
-**6.5 Configuration (§P-2.7).** Values that **name an environment** get no default and raise when
-missing: `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `KEY_VAULT_URI`, `SHAREPOINT_HOSTNAME`,
-`SHAREPOINT_SITE_PATH`. **Tunables** get a constant default + env override + **range validation**:
-`PRINT_BATCH_SIZE`, `PRINT_GIVE_UP_DAYS`, `PRINT_STALL_MINUTES`, `PRINT_MAX_RETRIES`,
-`PRINT_BUSINESS_TZ`, `GRAPH_TIMEOUT_SECONDS`, `PRINT_RASTER_DPI`,
-`PRINT_RASTER_MAX_BYTES`. Out-of-range **request** → 400; out-of-range **env**
-→ warn and fall back, because server misconfiguration must not fail every request.
+**6.5 Configuration (§P-2.7).** Three kinds now, not two.
+
+**Values that name the AZURE environment** get no default and raise when missing:
+`GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `KEY_VAULT_URI`. These are properties of the
+deployment and stay in app settings.
+
+**Values that name the SHAREPOINT environment** are **request input**:
+`sharepointHostname` and `sharepointSitePath`. They were `SHAREPOINT_HOSTNAME` /
+`SHAREPOINT_SITE_PATH`; a missing one is a **400**, not the 500 the old
+`RuntimeError` produced. See §5.8 for the trade this makes.
+
+**Flow-facing tunables** get a constant default + **range validation**, and no env
+override at all: `batchSize`, `giveUpDays`, `stallMinutes`. Out-of-range **request**
+→ 400. A leftover `PRINT_BATCH_SIZE`, `PRINT_GIVE_UP_DAYS`, `PRINT_STALL_MINUTES` or
+`PRINT_MAX_RETRIES` in app settings now does nothing whatsoever.
+
+**Host tunables** keep the constant + env override, because no flow sets them:
+`PRINT_BUSINESS_TZ`, `PRINT_BUDGET_SECONDS`, `GRAPH_TIMEOUT_SECONDS`,
+`PRINT_RASTER_DPI`, `PRINT_RASTER_MAX_BYTES`. An out-of-range value there warns and
+falls back, because server misconfiguration must not fail every request.
 
 **Two request-only inputs have no env fallback**, because neither is a threshold
 that could sensibly have a server-wide value:
@@ -830,14 +975,17 @@ token provider. **The §5.4 write matrix is the specification: one test per row.
 - Poll — completion and failure: `completed` → exact regex, and it wins even past the give-up
   deadline; `canceled`/`aborted` → `PRINT_FAILED`; a job inside `stallMinutes` writes nothing;
   empty `Printer_Name` reported as malformed
-- Poll — the retry schedule: every boundary pinned literally (5/15/35/…/5115 min); a stalled job
-  **inside the backoff gap writes nothing**; a crashed submission (empty `Print_JobId`, UC-6) and a
-  404 are both requeued; a job whose age cannot be determined is left alone
+- Poll — the retry schedule: every boundary pinned literally (5/15/35/…/5115 min), and
+  `next_retry_time` agreeing with `retries_due` at each one; a stalled job is **requeued at once
+  with the next boundary written into `Print_Time`**, clamped to the give-up deadline; a crashed
+  submission (empty `Print_JobId`, UC-6) and a 404 are both requeued; a job whose age cannot be
+  determined is left alone
 - Poll — **a stalled job is CANCELLED before the requeue** (D1/UC-8), the cancel uses the PRINTER id
   from the row's own `Printer_Name`, and a failed cancel still requeues but is logged
 - Poll — giving up: past `giveUpDays` the outstanding job is cancelled and the row written
-  `PRINT_FAILED` with a reason; exhausted retries open the **grace period** instead of failing
-- Poll — tunables: `giveUpDays`/`stallMinutes`/`maxRetries` honoured from the request body, echoed
+  `PRINT_FAILED` with a reason; the clamped final attempt lands ON the deadline and the run after
+  it fails the row rather than leaving it stranded at `PRINT_READY`
+- Poll — tunables: `giveUpDays`/`stallMinutes` honoured from the request body, echoed
   in the response, and an out-of-range one is a 400 that writes nothing
 - auth: live token reused; near-expiry triggers exactly one refresh; rotated token written back;
   a revoked token surfaces the bootstrap message (UC-12)
@@ -865,7 +1013,7 @@ token provider. **The §5.4 write matrix is the specification: one test per row.
 Subcommands `submit` / `status`, plus `dryrun` (resolve site, list, **the four
 internal column names**, index and content-approval state, printer capabilities and printer id —
 print them, print nothing on paper) and `badpayload` (must 400 with no writes). The retry knobs
-`--stall-minutes` / `--give-up-days` / `--max-retries` go into the body exactly as a flow sends
+`--stall-minutes` / `--give-up-days`, and the required `--hostname` / `--site-path`, go into the body exactly as a flow sends
 them, so a value can be proved here before it is pasted into Power Automate.
 
 **Tier E — deploy smoke sequence** (§P-7.6): bad payload → 400 · `--dry-run` → resolved names ·
@@ -884,10 +1032,10 @@ py -m venv .venv
 .\.venv\Scripts\python.exe scripts\bootstrap_token.py      # one-time device-code sign-in
 .\scripts\start-local.ps1                                  # venv + TLS shim + func start
 .\.venv\Scripts\python.exe scripts\test.py --dry-run --library "Documents" --folder "/Invoices/ToPrint"
-.\.venv\Scripts\python.exe scripts\test.py submit --library "Documents" --folder "/Invoices/ToPrint" --printer-share-id "<guid>" --batch-size 1
+.\.venv\Scripts\python.exe scripts\test.py submit --hostname "<tenant>.sharepoint.com" --site-path "/sites/<site>" --library "Documents" --folder "/Invoices/ToPrint" --printer-share-id "<guid>" --batch-size 1
 ```
 
-Then open the library and confirm the four columns match §5.4.
+Then open the library and confirm the five columns match §5.4.
 
 ## 12. Deploy order (§P-7.1)
 
@@ -954,7 +1102,7 @@ because the retry schedule depends on it.
 
 | Question | Answered by | Why |
 |---|---|---|
-| **"What is the state *right now*?"** — how many files are pending / failed / completed today | **SharePoint** (the library itself) | The four columns *are* the state. Exact, live, zero code |
+| **"What is the state *right now*?"** — how many files are pending / failed / completed today | **SharePoint** (the library itself) | The five columns *are* the state. Exact, live, zero code |
 | **"What *happened* over time?"** — how many were submitted, retried, or completed each week | **Application Insights** | The columns hold only the **latest** state. A file retried three times looks identical to one retried once. Only an event log can count activity |
 
 This is why both halves are needed. Reporting weekly counts off SharePoint alone is impossible;
@@ -964,7 +1112,7 @@ reporting current state off logs alone is unreliable (a log gap becomes a wrong 
 
 | Store | Holds | Questions it answers |
 |---|---|---|
-| **SharePoint library** | the four columns per file | "What is the business state of file X?" — the source of truth |
+| **SharePoint library** | the five columns per file | "What is the business state of file X?" — the source of truth |
 | **Application Insights** | `RUN_SUMMARY` (per invocation), `PRINT_EVENT` (per file transition), `requests`, `exceptions` | "How many, how often, how long, what failed" |
 | **Power Automate run history** | each flow run and its retries (28 days) | "Did the schedule actually fire?" |
 | **Universal Print / printer** | job queue and printer status | "Is the printer itself healthy?" |
@@ -996,6 +1144,14 @@ RUN_SUMMARY  ep=submit lib=Documents printer=<shareId> found=23 ok=4 failed=1
 PRINT_EVENT  ep=submit item=42 from=PRINT_READY to=PRINT_PENDING job=1825
              printer=<shareId> result=submitted ms=1420 file=Invoice 2026-08 Acme.pdf
 ```
+
+> **`found=` on Submit now counts only what is DUE.** The line's shape is unchanged
+> — no field was added, because free text must stay last or the KQL `parse` breaks —
+> but its meaning narrowed when `Print_Time` arrived: a `PRINT_READY` row waiting on
+> a future retry time is no longer counted here. Expect `found` to drop for any
+> library with files in backoff, and read `notYetDue` in the response (not the log)
+> for the difference. A workbook comparing `found` across the change will show a
+> step that is not a fall in volume.
 
 `result` vocabulary — a closed set, so the counts are exhaustive:
 `submitted · failed · skipped · completed · failed_terminal · requeued · gave_up ·

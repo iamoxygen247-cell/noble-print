@@ -10,7 +10,7 @@ Behavioural guidelines for this project. Platform: **Windows 11 · PowerShell ·
 
 Azure Function App that prints SharePoint documents through Microsoft Universal
 Print, driven by Power Automate. The SharePoint library is the queue and the
-audit trail; four columns per file carry the state.
+audit trail; five columns per file carry the state.
 
 Use the project virtual environment, always by explicit path:
 
@@ -55,7 +55,7 @@ deliberate deviation (design R5) because the two orderings fail differently:
 
 | ordering | a crash means |
 |---|---|
-| claim first | the print is lost — Poll requeues it at the next boundary, ≈10 min in practice |
+| claim first | the print is lost — Poll requeues it and stamps the next boundary the file is owed; 15–30 min on a first attempt, longer for a file already deep in its backoff |
 | claim last | the document prints **twice** — nothing recovers that |
 
 A recoverable lost print beats a silent double print. `test_the_claim_precedes_
@@ -71,8 +71,9 @@ writes `Print_JobId` must never be allowed to raise.** By then the job is create
 row shape above, and the document prints again. The write cannot be recovered;
 what it must do instead is keep going and say so, with a `warning` on the item and
 an `ERROR` line naming the coming duplicate. **Moving recovery into Poll made this
-sharper**: the duplicate used to arrive 72 h later, and now arrives in roughly ten
-minutes, before anyone reads the log.
+sharper**: the duplicate used to arrive 72 h later, and now arrives within the
+file's next retry boundary — 15–30 minutes on a first attempt, before anyone reads
+the log.
 
 ### 2. A stalled job is cancelled before it is replaced
 
@@ -106,21 +107,41 @@ There is **no Resubmit endpoint** — it was retired 2026-09-01 and its work fol
 into Poll, which runs every 10 minutes instead of daily.
 
 Retry `n` falls **due** at file age `stallMinutes × (2ⁿ − 1)` — 5, 15, 35, 75 …
-minutes by default. Poll acts on its next run, so observed requeues are quantised
-to Flow B's 10-minute cadence: the first one lands at ≈10 min, not ≈5, and nine
-events fire rather than ten. The count is **derived from the file's age, never
-stored**: the schema
-is four columns and no attempt counter. `retries_due` evaluated at the current
-job's creation time says how many retries preceded it, because every requeue makes
-a new job. Do not add a counter column to "simplify" this.
+minutes by default. The count is **derived from the file's age, never stored**:
+there is no attempt counter. `retries_due` evaluated at the current job's creation
+time says how many retries preceded it, because every requeue makes a new job. Do
+not add a counter column to "simplify" this.
 
-Two bounds, doing different jobs: `maxRetries` (10) stops new jobs at ~3d 13h;
-`giveUpDays` (10) stops waiting. Between them is a **grace period** where the last
-job stays live and can still print.
+**The waiting happens in Submit, not Poll.** A stalled job is requeued *immediately*
+and the row carries `Print_Time` — when retry `spent + 1` falls due. Submit refuses
+to claim a file until that moment passes. Poll used to hold the row at
+`PRINT_PENDING` and re-derive the same "not yet" on every run, which made the
+backoff invisible; the schedule is identical, but now it is written down. A due
+time in the **past** is normal and means "print now".
 
-All three knobs, plus `batchSize`, are read from the **Power Automate request
-body** first, then app settings, then defaults — so pacing is retuned without a
-deploy.
+Consequence worth knowing before reading a live run: **the cadence that costs you
+retries is Flow A's, not Flow B's.** Flow B at 10 min and at 1 min produce identical
+retry sequences, because `Print_Time` pins the instant. But `spent` is read off the
+file's age when the *first* job is created, so Flow A every 15 min opens the
+schedule at retry 3, every 5 min at retry 2, every minute at retry 1. Lowering
+`stallMinutes` compresses the ladder and makes this worse, not better.
+
+**One bound: `giveUpDays`.** `maxRetries` is gone — it bounded the *work* while
+`giveUpDays` bounded the *waiting*, which was two answers to one question, since the
+count is derived from age anyway. `next_retry_time` **clamps** to
+`created + giveUpDays`, and that clamp is load-bearing: a waiting row sits at
+`PRINT_READY`, where Poll (which queries `PRINT_PENDING` only) cannot see it, so
+anything scheduled past the deadline would print days late against a row that then
+reads `PRINT_FAILED`. There is no grace period any more.
+
+Both knobs, plus `batchSize`, are read from the **Power Automate request body** and
+nowhere else — no app-setting fallback, so there is exactly one place to look when
+the pacing is not what someone expected.
+
+`retries_due` is uncapped and that is safe: the ladder doubles, so the loop is
+logarithmic, and `poll_decision` only reaches it after `within_window` has bounded
+the file's age. Across every legal pair of knobs it returns at most **19** — so the
+highest retry number ever scheduled is 20.
 
 ### 2b. The upload format is chosen, not only inferred
 
@@ -176,7 +197,7 @@ everywhere" will break both, one silently.
 
 ### 4. `print_policy.py` imports only the standard library
 
-That constraint is what keeps 492 tests offline and sub-second, and what makes the
+That constraint is what keeps 543 tests offline and sub-second, and what makes the
 utility reusable — another workflow keeps the adapters and replaces only the
 rules. `test_print_policy_imports_only_the_standard_library` enforces it.
 
@@ -188,11 +209,15 @@ in a route belongs in `print_policy`.
 ## Standard Commands
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest              # 492 tests, offline, ~0.7s
+.\.venv\Scripts\python.exe -m pytest              # 543 tests, offline, ~1.0s
 .\scripts\start-local.ps1                         # venv + TLS shim + func start
 .\.venv\Scripts\python.exe scripts\bootstrap_token.py
-.\.venv\Scripts\python.exe scripts\test.py dryrun --library "AI_DropBox_V2026" --folder "/Backup/Invoice" --printer-share-id <guid>
+.\.venv\Scripts\python.exe scripts\test.py dryrun --hostname noblehomes.sharepoint.com --site-path /sites/PM --library "AI_DropBox_V2026" --folder "/Backup/Invoice" --printer-share-id <guid>
 ```
+
+`--hostname` and `--site-path` are **required** for `submit`, `dryrun` and
+`status`: the site is request input now, not an app setting. `health` needs
+neither.
 
 If a command fails, find the failing layer before editing: command syntax →
 working directory → interpreter → venv → dependency → env var → path → external
@@ -207,7 +232,7 @@ Five tiers, all but the last offline (design §10):
 |---|---|---|
 | A | `test_print_policy.py` | the rules — windows, state mapping, formatting |
 | B | `test_adapters.py` | the adapters against `FakeGraph` |
-| C | `test_submit/poll/auth.py` | the routes, end to end. **Poll carries the retry schedule, the cancel-first guard, the give-up path and the `printerShareId` override (F3-R)** |
+| C | `test_submit/poll/auth.py` | the routes, end to end. **Poll carries the retry schedule, the cancel-first guard, the give-up path, the `Print_Time` clamp and the `printerShareId` override (F3-R). Submit carries the due filter** |
 | A+C | `test_printing.py` | the PWG encoder (byte-pinned), profile selection, and Submit against a raster-only printer |
 | A+C | `test_health.py` | the pre-flight endpoint — the finding matrix as pure rules, the route, and **parity with Submit's dryRun** so Health cannot describe a pipeline Submit would not run |
 | A+C | `test_print_format.py` | `printFormat` — the `matches`/`produces` split, the two refusals, and that the requested format reaches the wire |
@@ -258,10 +283,27 @@ secrets; the real `local.settings.json` is gitignored and never deployed.
 `PRINT_REFRESH_TOKEN` is a local-development escape hatch. It logs a warning on
 every use so that if it ever reaches Azure the evidence is in App Insights.
 
-Config that **names an environment** gets no default and raises when missing.
-Config that is a **tunable** gets a default, an env override, and range
-validation: an out-of-range *request* value is a 400; an out-of-range *env* value
-warns and falls back.
+Config comes in three kinds now:
+
+* **Names the Azure environment** — `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`,
+  `KEY_VAULT_URI`. App settings, no default, raise when missing.
+* **Names the SharePoint environment** — `sharepointHostname`,
+  `sharepointSitePath`. **Request input**, required, **400** when missing. These
+  were app settings; moving them means one Function App serves any site a flow
+  names, and it also means **whoever holds the function key chooses the site**,
+  bounded only by what the delegated service account can reach. That widening is
+  deliberate and is the reason this paragraph exists — do not "restore" the app
+  settings without deciding that trade again.
+* **Flow-facing tunables** — `batchSize`, `giveUpDays`, `stallMinutes`. Request
+  body → default, with range validation and **no env override**. An out-of-range
+  request value is a 400. A leftover `PRINT_BATCH_SIZE`, `PRINT_GIVE_UP_DAYS`,
+  `PRINT_STALL_MINUTES` or `PRINT_MAX_RETRIES` app setting does nothing at all.
+
+**Host tunables** keep the old shape — default, env override, range validation,
+with a bad value warning and falling back: `PRINT_BUSINESS_TZ`,
+`PRINT_BUDGET_SECONDS`, `GRAPH_TIMEOUT_SECONDS`, `PRINT_RASTER_*`. No flow sets
+these. `PRINT_BUSINESS_TZ` matters more than it used to: `Print_Time` is written in
+that zone.
 
 ## Observability
 

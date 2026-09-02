@@ -166,7 +166,7 @@ documented `Application: Not supported`.
 
    | Permission | For |
    |---|---|
-   | `Sites.ReadWrite.All` | read the queue, write the four columns |
+   | `Sites.ReadWrite.All` | read the queue, write the five columns |
    | `PrintJob.ReadWriteBasic` | create the job, start it **and cancel** it |
    | `PrintJob.Create` | **createUploadSession** — it refuses `ReadWriteBasic`, so without this the pipeline 403s *after* claiming a row (defect L3) |
    | `Printer.Read.All` | resolve the printer behind a share |
@@ -225,13 +225,25 @@ query fails.
 2. **Indexed columns → Create a new index**
 3. Primary column: **`Print_Status`** → **Create**
 
-While you are there, confirm the four columns exist with these **exact** display
-names — `Print_Status`, `Print_JobId`, `Print_Message`, `Printer_Name`.
+While you are there, confirm the **five** columns exist with these exact display
+names — `Print_Status`, `Print_JobId`, `Print_Message`, `Printer_Name`, and
+`Print_Time`.
+
+> **`Print_Time` must exist BEFORE the code is deployed.** It is a **Date and
+> Time** column, and it does **not** need indexing — the due-time comparison happens
+> in Python, because SharePoint honours only one indexed field in a `$filter` and
+> `Print_Status` holds that slot.
+>
+> Unlike the two silent ordering traps elsewhere in this runbook, this one fails
+> loudly: every Submit and Poll returns 500 naming the missing column until it
+> exists. Health keeps working, because it resolves no list.
 
 **Index confirmed 2026-08-31** — `Print_Status`, 1 of a maximum 20 indices, on
 list `{6B19AB5B-2823-4073-8B8F-33C3DB52F3E6}` in site
 `https://noblehomes.sharepoint.com/sites/PM` ("Noble - Properties"). Those two
-values are `SHAREPOINT_HOSTNAME` and `SHAREPOINT_SITE_PATH` in step 6.
+values go in the **Power Automate flow bodies** as `sharepointHostname` and
+`sharepointSitePath` (step 10). They were app settings until 2026-09-02; a leftover
+`SHAREPOINT_HOSTNAME` or `SHAREPOINT_SITE_PATH` now does nothing.
 
 **The queue — confirmed 2026-08-31** from the library's own URL, and used verbatim
 by every `test.py` command below and by the Power Automate flows in step 10:
@@ -247,7 +259,7 @@ path (`print_policy.folder_matches`), so `/Backup/Invoice` matches
 library prefix is neither needed nor wanted, and renaming either will not break the
 match.
 
-All four columns confirmed present on this library.
+All five columns confirmed present on this library.
 
 > **`NO_PRINT` is in live use as a `Print_Status` value** and appears nowhere in
 > this codebase — something upstream writes it. That is harmless, and arguably
@@ -511,12 +523,6 @@ az functionapp config appsettings set --resource-group $RG --name $APP --setting
     "GRAPH_CLIENT_ID=$CLIENT_ID" `
     "KEY_VAULT_URI=https://$VAULT.vault.azure.net/" `
     "PRINT_REFRESH_TOKEN_SECRET=$SECRET" `
-    "SHAREPOINT_HOSTNAME=noblehomes.sharepoint.com" `
-    "SHAREPOINT_SITE_PATH=/sites/PM" `
-    "PRINT_BATCH_SIZE=5" `
-    "PRINT_GIVE_UP_DAYS=10" `
-    "PRINT_STALL_MINUTES=5" `
-    "PRINT_MAX_RETRIES=10" `
     "PRINT_BUSINESS_TZ=America/Vancouver" `
     "PRINT_BUDGET_SECONDS=90" `
     "GRAPH_TIMEOUT_SECONDS=30" `
@@ -557,7 +563,7 @@ az functionapp config appsettings list --resource-group $RG --name $APP `
 ## 7. Deploy the code
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest        # 492 tests must be green FIRST
+.\.venv\Scripts\python.exe -m pytest        # 543 tests must be green FIRST
 
 # func shells out to the RAW az.cmd for an ARM token and cannot refresh it over
 # the network through the inspecting proxy. Pre-warm the cache through the
@@ -635,11 +641,6 @@ Expected:
 |---|---|
 | `GRAPH_TENANT_ID` / `GRAPH_CLIENT_ID` | your registration |
 | `KEY_VAULT_URI` | `https://kv-noble-print.vault.azure.net/` |
-| `SHAREPOINT_HOSTNAME` / `SHAREPOINT_SITE_PATH` | your site |
-| `PRINT_BATCH_SIZE` | `5` |
-| `PRINT_GIVE_UP_DAYS` | `10` |
-| `PRINT_STALL_MINUTES` | `5` |
-| `PRINT_MAX_RETRIES` | `10` |
 | `PRINT_BUSINESS_TZ` | `America/Vancouver` |
 | `PRINT_RASTER_DPI` | `300` |
 | `PRINT_RASTER_MAX_BYTES` | `33554432` |
@@ -689,16 +690,19 @@ Same harness as local, just pointed at the deployed app.
 #    printer's real capabilities, and WHICH CONVERSION PROFILE would run.
 #    Prints nothing on paper.
 .\.venv\Scripts\python.exe scripts\test.py dryrun --base-url $BASE --key $KEY `
+    --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
     --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
 
 # 3. Exactly one real file.
 .\.venv\Scripts\python.exe scripts\test.py submit --base-url $BASE --key $KEY `
+    --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
     --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5" --batch-size 1
 
 # 4. Once the page is out, mark it complete.
 .\.venv\Scripts\python.exe scripts\test.py status --base-url $BASE --key $KEY `
+    --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "AI_DropBox_V2026" --folder "/Backup/Invoice"
 ```
 
@@ -707,7 +711,7 @@ printer. `NONE` means no profile matched and every file would fail at preflight.
 The `job config` line should match what
 [`e2e-testing.md`](e2e-testing.md) Part A printed with.
 
-**5. Open the library and read the four columns back.** This is the step people
+**5. Open the library and read the five columns back.** This is the step people
 skip, and it is the one that catches a silent write failure — the response can
 look perfect while the PATCH is failing.
 
@@ -731,14 +735,14 @@ traces
 ## 10. Power Automate flows
 
 **Three flows.** Each calls the app with the function key in the `code` query
-parameter. **No flow may ever write the four columns itself** — one writer only,
+parameter. **No flow may ever write the five columns itself** — one writer only,
 or you get a race you will debug at 2 a.m.
 
 | Flow | Recurrence | Body |
 |---|---|---|
 | **Health** | *(a step inside A and B, not its own flow)* | `{"printerShareId":"4429bf4e-…"}` |
-| **A — Submit** | 15 min | `{"library":"AI_DropBox_V2026","folder":"/Backup/Invoice","printerShareId":"4429bf4e-…","batchSize":5}` |
-| **B — Poll** | 10 min | `{"library":"AI_DropBox_V2026","folder":"/Backup/Invoice","giveUpDays":10,"stallMinutes":5,"maxRetries":10}` |
+| **A — Submit** | 15 min | `{"sharepointHostname":"noblehomes.sharepoint.com","sharepointSitePath":"/sites/PM","library":"AI_DropBox_V2026","folder":"/Backup/Invoice","printerShareId":"4429bf4e-…","batchSize":5}` |
+| **B — Poll** | 10 min | `{"sharepointHostname":"noblehomes.sharepoint.com","sharepointSitePath":"/sites/PM","library":"AI_DropBox_V2026","folder":"/Backup/Invoice","giveUpDays":10,"stallMinutes":5}` |
 | **D — Digest** | Mon 07:00 | SharePoint *Get items* per status; email the counts |
 
 > **There is no Flow C.** A daily Resubmit flow used to exist; recovery moved into
@@ -806,17 +810,19 @@ wrong value cannot strand files — it just means nothing prints until you fix i
 
 They are the whole reason the retry pacing lives in the flow rather than in app
 settings: **changing them needs no deploy and no app restart.** Each falls back to
-its app setting, then its built-in default, so omitting them is safe.
+its built-in default, so omitting them is safe. There is **no app-setting
+fallback** any more — the flow body is the only place either can be set.
 
 | Key | Default | What it does |
 |---|---|---|
 | `stallMinutes` | 5 | How long a print job may sit before it counts as stalled. Also the base of the retry schedule: retry *n* falls due at `stallMinutes × (2ⁿ − 1)` |
-| `maxRetries` | 10 | Most requeues one file may get. Stops **new work** at about 3d 13h |
-| `giveUpDays` | 10 | When to stop waiting: cancel the outstanding job and write `PRINT_FAILED`. Stops **waiting** |
+| `giveUpDays` | 10 | When to stop: cancel the outstanding job and write `PRINT_FAILED`. **The only bound** |
 
-Between the two bounds is a grace period of roughly 6½ days: no more jobs are
-created, but the last one stays live, so a printer that comes back still prints
-the document.
+`maxRetries` was retired on 2026-09-02, along with the grace period. It bounded the
+*work* while `giveUpDays` bounded the *waiting*, but the retry count is derived from
+the file's age anyway, so the two were one quantity in different units. A flow still
+sending `maxRetries` is accepted and ignored — which is what lets the code deploy
+before the flows are edited.
 
 An out-of-range value is a **400** — the response names the key and its range.
 The response also echoes all three back, so what was actually in force is visible
@@ -968,7 +974,9 @@ cause and verified the fix.
         PRINTER_NOT_ACCEPTING_JOBS -- and RECORD the observed `state` into
         design.md's status.state row
 [ ] 10  Flows A, B, D created -- there is NO Flow C; A loops on remainingReady
-        with an iteration cap; B carries stallMinutes/maxRetries/giveUpDays
+        with an iteration cap; B carries stallMinutes/giveUpDays (NOT maxRetries)
+[ ] 10  BOTH flow bodies carry sharepointHostname + sharepointSitePath -- without
+        them Submit and Poll are 400. Health is the signal during the cutover
 [ ] 10  BOTH flows call /api/print/health first: A TERMINATES on healthy==false,
         B notifies but POLLS ANYWAY (Poll still marks completions and gives up)
 [ ] 10  If Flow B sends printerShareId: printerOverridden == 0 on a real run,

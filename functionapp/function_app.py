@@ -3,12 +3,21 @@ function_app.py — the three HTTP endpoints Power Automate calls.
 
     Health  POST /api/print/health   can this pipeline do any work right now?
               {printerShareId, printFormat?}
-    Submit  POST /api/print/submit   claim PRINT_READY files, create print jobs
-              {library, folder, printerShareId, batchSize?, printFormat?, dryRun?}
+    Submit  POST /api/print/submit   claim PRINT_READY files that are DUE, create
+                                     print jobs
+              {sharepointHostname, sharepointSitePath, library, folder,
+               printerShareId, batchSize?, printFormat?, dryRun?}
     Poll    POST /api/print/status   check PRINT_PENDING jobs; mark the finished,
                                      requeue the stalled, fail the hopeless
-              {library, folder, giveUpDays?, stallMinutes?, maxRetries?,
-               printerShareId?}
+              {sharepointHostname, sharepointSitePath, library, folder,
+               giveUpDays?, stallMinutes?, printerShareId?}
+
+THE REQUEST CARRIES THE WHOLE ENVIRONMENT. The site used to come from app settings
+and the tunables used to fall back to them; both now come from the flow body alone.
+One Function App therefore serves any site a flow names, and everything that shaped
+a run is visible in the flow that made it rather than split across two places with
+the flow silently winning. The trade is in CLAUDE.md: whoever holds the function key
+chooses the site, bounded only by what the service account can reach.
 
 HEALTH RUNS FIRST AND WRITES NOTHING. Every failure this pipeline has was
 otherwise discovered mid-run, several only after files had been claimed: an
@@ -32,8 +41,12 @@ setting PRINT_PENDING -- BEFORE its print job is created. The requirement writes
 the status afterwards; this is a deliberate deviation, recorded at R5, because
 the two orderings fail differently:
 
-    claim first   a crash loses the print; Poll requeues it at the next retry
-                  boundary -- about ten minutes, given Flow B's cadence
+    claim first   a crash loses the print; Poll sees a row with no job, requeues
+                  it on its next run, and stamps Print_Time with the next boundary
+                  the file is owed. A file crashing on its FIRST attempt reprints
+                  in 15-30 minutes; one already deep in its backoff waits out the
+                  rest of that boundary, which is the intended behaviour rather
+                  than a delay -- it has been failing for a while.
     claim last    a crash prints the document twice; nothing recovers that
 
 A recoverable lost print beats a silent double print. The consequence, which
@@ -220,16 +233,38 @@ def _tunable(resolver, value):
         raise BadRequest(str(exc))
 
 
-def _resolve_list(client: GraphClient, library: str) -> ListContext:
-    """Resolve the site and library, and with them the four column internal names."""
-    import os
-    hostname = os.getenv("SHAREPOINT_HOSTNAME")
-    site_path = os.getenv("SHAREPOINT_SITE_PATH")
-    if not hostname:
-        raise RuntimeError("SHAREPOINT_HOSTNAME is not set; it names this "
-                           "environment and has no safe default")
+def _required_site_path(body: dict) -> str:
+    """`sharepointSitePath` -- required key, but "" is a legitimate value.
 
-    site_id = sharepoint.resolve_site(client, hostname, site_path or "")
+    Exactly the shape `folder` has, and for the same reason: "" addresses the root
+    site, which is a real answer, so an absent key cannot be read as a default. The
+    caller has to say which site they mean, even when the answer is "the root one".
+    """
+    if "sharepointSitePath" not in body:
+        raise BadRequest('sharepointSitePath is required (use "" or "/" for the '
+                         'root site)')
+    value = body.get("sharepointSitePath")
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise BadRequest("sharepointSitePath must be a string")
+    return value.strip()
+
+
+def _resolve_list(client: GraphClient, hostname: str, site_path: str,
+                  library: str) -> ListContext:
+    """Resolve the site and library, and with them the five column internal names.
+
+    THE SITE COMES FROM THE REQUEST, NOT THE ENVIRONMENT. It used to be
+    SHAREPOINT_HOSTNAME / SHAREPOINT_SITE_PATH in app settings, on the principle
+    that config naming an environment should not be caller-supplied. That principle
+    was traded deliberately: one Function App now serves any site a flow names,
+    and every input to a run is visible in the flow that made it.
+
+    The cost is real and is recorded in CLAUDE.md -- whoever holds the function key
+    chooses the site, bounded only by what the delegated service account can reach.
+    """
+    site_id = sharepoint.resolve_site(client, hostname, site_path)
     return sharepoint.resolve_list(client, site_id, library)
 
 
@@ -441,10 +476,17 @@ def _submit_one(client: GraphClient, context: ListContext, share: universal_prin
     # ("printed on ..." on success, the error text on failure), so a stale entry is
     # visible only while the row is PRINT_PENDING, which is exactly when someone
     # asking "why is this taking so long?" wants to read it.
+    # Print_Time IS cleared, and that half matters as much as the job id. The column
+    # means "when the next attempt falls due", which is only a question worth asking
+    # of a PRINT_READY row; leaving a schedule on a row that is printing right now
+    # would be noise at best. The invariant it preserves -- Print_Time is only ever
+    # set on PRINT_READY -- is what stops a stale future time surviving into a
+    # terminal row and silently suppressing a human's reset (design §5.4).
     claimed = sharepoint.patch_fields(client, context, item.item_id, {
         print_policy.COLUMN_STATUS: print_policy.PENDING,
         print_policy.COLUMN_PRINTER: share_id,
         print_policy.COLUMN_JOB_ID: "",
+        print_policy.COLUMN_PRINT_TIME: None,
     }, etag=item.etag)
 
     if not claimed:
@@ -503,6 +545,7 @@ def _submit_one(client: GraphClient, context: ListContext, share: universal_prin
                 print_policy.COLUMN_STATUS: print_policy.FAILED,
                 print_policy.COLUMN_PRINTER: share_id,
                 print_policy.COLUMN_MESSAGE: message,
+                print_policy.COLUMN_PRINT_TIME: None,
             })
         except Exception:
             # The file is left at PRINT_PENDING with no job id, which Poll reads
@@ -532,8 +575,10 @@ def _submit_one(client: GraphClient, context: ListContext, share: universal_prin
     #
     # MOVING RECOVERY INTO POLL MADE THIS WORSE, NOT BETTER. Resubmit would have
     # reprinted after 72 hours, which left a working day to notice. Poll requeues
-    # at the first retry boundary -- about FIVE MINUTES -- so the duplicate is
-    # already in the tray before anyone reads the log.
+    # on its very next run, and stamps the next boundary the file is owed -- which
+    # on a first attempt has already passed, so Submit takes it at the next tick.
+    # Measured at Flow A 15 min / Flow B 10 min: 15-30 minutes. The duplicate is in
+    # the tray before anyone reads the log.
     #
     # We cannot recover the write, so we do the two things we can: keep going,
     # and say so loudly. The log line is the ONLY warning that a reprint is
@@ -544,10 +589,17 @@ def _submit_one(client: GraphClient, context: ListContext, share: universal_prin
         sharepoint.patch_fields(client, context, item.item_id,
                                 {print_policy.COLUMN_JOB_ID: job_id})
     except Exception:
+        # No number here on purpose. Submit does not know Poll's `stallMinutes` --
+        # it is a Poll knob and arrives on Poll's request, not this one -- and it
+        # cannot know how far into its backoff the file already is, which is what
+        # actually decides when the reprint lands. This used to quote
+        # DEFAULT_STALL_MINUTES as "roughly 5 minutes", which was wrong twice over:
+        # the wrong knob, and measured recovery is 15-30 minutes on a first attempt
+        # and longer for a file already retrying.
         warning = (f"possible duplicate print: job {job_id} was started but its id "
-                   f"could not be written to SharePoint, so Poll will treat this "
-                   f"row as a crashed submission and requeue it within roughly "
-                   f"{print_policy.DEFAULT_STALL_MINUTES} minutes")
+                   f"could not be written to SharePoint, so Poll will read this row "
+                   f"as a crashed submission, requeue it, and the document will "
+                   f"print a second time at its next retry boundary")
         logging.error("%s (item %s, printer %s)",
                       warning, item.item_id, share_id, exc_info=True)
 
@@ -576,13 +628,18 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
         library = _required_str(body, "library")
         folder = _required_folder(body)
         printer_share_id = _required_str(body, "printerShareId")
+        # The site, checked AFTER the older inputs on purpose: placement only
+        # decides which message a body missing several fields gets back, and
+        # appending leaves every pre-existing 400 saying what it always said.
+        hostname = _required_str(body, "sharepointHostname")
+        site_path = _required_site_path(body)
         batch_size = _tunable(print_policy.resolve_batch_size, body.get("batchSize"))
         # "" means "let the printer's capabilities decide", which is what every
         # caller did before this parameter existed.
         print_format = _print_format(body)
 
         client = _client()
-        context = _resolve_list(client, library)
+        context = _resolve_list(client, hostname, site_path, library)
 
         # Preflight BEFORE anything is claimed: an offline printer or an
         # unsupported document type must be discovered while the queue is
@@ -617,7 +674,8 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
                 # cycle, which is what 0 means to the flow: stop looping.
                 "printFormat": print_format or None,
                 "candidatesFound": 0, "remainingReady": 0, "submitted": 0,
-                "failed": 0, "skipped": 0, "budgetExhausted": False,
+                "failed": 0, "skipped": 0, "notYetDue": 0,
+                "budgetExhausted": False,
                 # ...and the flow needs SOMETHING to notify on. This run is a 200
                 # with failed = 0, which matches no error condition, so without an
                 # explicit flag an offline printer is completely silent.
@@ -626,8 +684,21 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
                            f"is not accepting jobs (state: {share.state or 'unknown'})",
             })
 
-        candidates = sharepoint.query_by_status(
+        all_ready = sharepoint.query_by_status(
             client, context, print_policy.READY, folder)
+        # THE DUE FILTER RUNS BEFORE THE BATCH IS TAKEN, NEVER AFTER. select_oldest
+        # sorts by creation time, and a file that has been requeued several times
+        # has the OLDEST creation time in the queue -- so it sorts to the front and
+        # is also the one most likely to be waiting on a future Print_Time. Filter
+        # afterwards and a batch of five could be five not-yet-due files, doing no
+        # work while genuinely due documents sat behind them.
+        #
+        # Filtered in Python, not in $filter: SharePoint honours one indexed field
+        # at a time and Print_Status already holds that slot (sharepoint.py). The
+        # rows have all been paged in regardless, so this costs nothing.
+        now = print_policy.now_utc()
+        candidates = [f for f in all_ready if print_policy.is_due(f.print_time, now)]
+        not_yet_due = len(all_ready) - len(candidates)
         selected = print_policy.select_oldest(candidates, batch_size)
 
         # Dry run: prove the wiring without printing anything. Deliberately a
@@ -651,9 +722,15 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
                 # with printFormat set, how you confirm the format you asked for
                 # is the one that would actually be sent.
                 "conversion": _dry_run_conversion(share, print_format),
+                # candidatesFound counts what is DUE. A file waiting on a future
+                # Print_Time is reported separately rather than folded in, so a dry
+                # run against a queue that looks empty says which of the two empties
+                # it is: nothing to print, or nothing due yet.
                 "candidatesFound": len(candidates),
+                "notYetDue": not_yet_due,
                 "wouldSubmit": [{"itemId": f.item_id, "fileName": f.file_name,
-                                 "created": f.created} for f in selected],
+                                 "created": f.created,
+                                 "printTime": f.print_time} for f in selected],
             })
 
         budget = Budget(started=started)
@@ -669,9 +746,13 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
         submitted = sum(1 for i in items if i["result"] == RESULT_SUBMITTED)
         failed = sum(1 for i in items if i["result"] == RESULT_FAILED)
         skipped = sum(1 for i in items if i["result"] == RESULT_SKIPPED)
-        # Everything still PRINT_READY: the candidates we did not take, plus the
-        # ones we skipped because another run claimed them. The flow loops while
-        # this is > 0, so it must never overcount or the Do-Until never ends.
+        # Everything still PRINT_READY AND DUE: the candidates we did not take, plus
+        # the ones we skipped because another run claimed them. The flow loops while
+        # this is > 0, so it must never overcount or the Do-Until never ends -- which
+        # is exactly why `candidates` is the due-only list and not-yet-due rows are
+        # counted separately. A file waiting on a future Print_Time can never be
+        # submitted this cycle, so including it here would spin the loop to its
+        # iteration cap on every recurrence.
         remaining = max(0, len(candidates) - submitted - failed)
 
         _run_summary(EP_SUBMIT, library=library, folder=folder, printer=printer_share_id,
@@ -686,7 +767,13 @@ def submit_print_jobs(req: func.HttpRequest) -> func.HttpResponse:
             "printFormat": print_format or None,
             "batchSize": batch_size, "candidatesFound": len(candidates),
             "remainingReady": remaining, "submitted": submitted, "failed": failed,
-            "skipped": skipped, "budgetExhausted": budget.exhausted,
+            "skipped": skipped,
+            # PRINT_READY rows held back by a future Print_Time. Deliberately NOT
+            # part of remainingReady -- see there -- but reported, because "nothing
+            # to print" and "nothing due yet" are different situations and a flow
+            # that cannot tell them apart cannot say which one it is in.
+            "notYetDue": not_yet_due,
+            "budgetExhausted": budget.exhausted,
             # Present on EVERY response, not just the failing one, so the flow can
             # test it without a null check.
             "printerAvailable": True, "items": items,
@@ -711,15 +798,22 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
         body = _body(req)
         library = _required_str(body, "library")
         folder = _required_folder(body)
-        # All three retry knobs come from the flow body first, then the app
-        # setting, then the default -- so the pacing of the whole retry schedule
-        # can be retuned by editing Power Automate, with no deploy.
+        hostname = _required_str(body, "sharepointHostname")
+        site_path = _required_site_path(body)
+        # Both knobs come from the flow body, then the built-in default. There is
+        # no app-setting layer any more: the pacing of the whole retry schedule is
+        # a number in Power Automate and nowhere else, so there is one place to
+        # look when it is not what someone expected.
+        #
+        # `maxRetries` used to be here too. It bounded the NUMBER of requeues while
+        # giveUpDays bounded the WAITING, which was two answers to one question --
+        # the count is derived from the file's age anyway. A body still sending it
+        # is accepted and ignored; there is no strict schema, and 400-ing would
+        # break every deployed flow the moment this shipped.
         give_up_days = _tunable(print_policy.resolve_give_up_days,
                                 body.get("giveUpDays"))
         stall_minutes = _tunable(print_policy.resolve_stall_minutes,
                                  body.get("stallMinutes"))
-        max_retries = _tunable(print_policy.resolve_max_retries,
-                               body.get("maxRetries"))
         # OPTIONAL, and a HARD OVERRIDE when supplied: every job lookup and every
         # cancel in this run addresses this share instead of the one named on the
         # row. Omit it and Poll behaves exactly as before, following each row's
@@ -735,7 +829,7 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
         printer_override = _optional_share_id(body, "printerShareId")
 
         client = _client()
-        context = _resolve_list(client, library)
+        context = _resolve_list(client, hostname, site_path, library)
 
         pending = sharepoint.query_by_status(
             client, context, print_policy.PENDING, folder)
@@ -847,7 +941,6 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                 now=now,
                 stall_minutes=stall_minutes,
                 give_up_days=give_up_days,
-                max_retries=max_retries,
             )
 
             if action == print_policy.POLL_COMPLETE:
@@ -865,6 +958,7 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                 sharepoint.patch_fields(client, context, item.item_id, {
                     print_policy.COLUMN_STATUS: print_policy.COMPLETED,
                     print_policy.COLUMN_MESSAGE: message,
+                    print_policy.COLUMN_PRINT_TIME: None,
                 })
                 completed += 1
                 items.append({"itemId": item.item_id, "fileName": item.file_name,
@@ -881,6 +975,7 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                 sharepoint.patch_fields(client, context, item.item_id, {
                     print_policy.COLUMN_STATUS: print_policy.FAILED,
                     print_policy.COLUMN_MESSAGE: message,
+                    print_policy.COLUMN_PRINT_TIME: None,
                 })
                 failed += 1
                 items.append({"itemId": item.item_id, "fileName": item.file_name,
@@ -908,12 +1003,21 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                 message = print_policy.append_message(
                     item.message,
                     print_policy.requeue_message(item.job_id, attempt))
+                # WHEN THE NEXT ATTEMPT FALLS DUE -- the backoff, written down.
+                # Clamped to the give-up deadline, so the last attempt always lands
+                # inside the window rather than against a row that will already
+                # have been failed. A time in the past means "print immediately",
+                # which is the ordinary case for the early boundaries.
+                due_at = print_policy.next_retry_time(
+                    item.created, stall_minutes, attempt, give_up_days)
                 # eTag-conditioned like the claim: two overlapping Poll runs must
                 # not both cancel and both append.
                 written = sharepoint.patch_fields(client, context, item.item_id, {
                     print_policy.COLUMN_STATUS: print_policy.READY,
                     print_policy.COLUMN_JOB_ID: "",
                     print_policy.COLUMN_MESSAGE: message,
+                    print_policy.COLUMN_PRINT_TIME:
+                        print_policy.format_business_datetime(due_at),
                 }, etag=item.etag)
                 if not written:
                     still_running += 1
@@ -925,6 +1029,7 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                 requeued += 1
                 items.append({"itemId": item.item_id, "fileName": item.file_name,
                               "result": "requeued", "jobId": item.job_id,
+                              "retry": attempt, "printTime": due_at,
                               "message": message})
                 _print_event(EP_POLL, item.item_id, from_status=item.status,
                              to_status=print_policy.READY, job=item.job_id,
@@ -944,6 +1049,7 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                 sharepoint.patch_fields(client, context, item.item_id, {
                     print_policy.COLUMN_STATUS: print_policy.FAILED,
                     print_policy.COLUMN_MESSAGE: message,
+                    print_policy.COLUMN_PRINT_TIME: None,
                 })
                 gave_up += 1
                 items.append({"itemId": item.item_id, "fileName": item.file_name,
@@ -955,12 +1061,13 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                              file_name=item.file_name)
 
             else:
-                # Three situations reach here and all want silence: a healthy job
-                # in flight, a stalled job inside the backoff gap, and a stalled
-                # job whose retries are spent but which is still inside the
-                # give-up window. The last is the grace period -- no more work is
-                # spent on it, but its final job stays live, so a printer that
-                # comes back still gets the document out.
+                # One situation reaches here now: a healthy job in flight, inside
+                # the stall threshold. There used to be two more -- a stalled job
+                # inside the backoff gap, and one whose retries were spent -- and
+                # both were rows quietly waiting while Poll declined them run after
+                # run. Waiting is `Print_Time`'s job now, so a stalled row leaves
+                # PRINT_PENDING immediately and does its waiting where it can be
+                # seen.
                 still_running += 1
                 items.append({"itemId": item.item_id, "fileName": item.file_name,
                               "result": "still_running", "jobId": item.job_id,
@@ -975,7 +1082,6 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
             # Echoed back so a flow's own tuning is visible in the response and in
             # the App Insights trace, not just in whatever the flow meant to send.
             "giveUpDays": give_up_days, "stallMinutes": stall_minutes,
-            "maxRetries": max_retries,
             # null means no override was sent and each row followed its own
             # Printer_Name.
             "printerShareId": printer_override or None,

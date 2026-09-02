@@ -63,7 +63,7 @@ Paper in the tray, printer awake.
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-Expect **492 passed** in about half a second. Red here means stop — do not spend
+Expect **543 passed** in about a second. Red here means stop — do not spend
 paper diagnosing something the suite already knows about.
 
 ## A2. Is the printer reachable and still the printer we think?
@@ -139,7 +139,7 @@ The app has **three endpoints**, all HTTP `POST`:
 | | Route | What it does |
 |---|---|---|
 | **Health** | `/api/print/health` | Can the pipeline work right now? Run it first — it writes nothing |
-| **Submit** | `/api/print/submit` | Claims the oldest `PRINT_READY` files and creates print jobs |
+| **Submit** | `/api/print/submit` | Claims the oldest `PRINT_READY` files **that are due** (`Print_Time` empty or past) and creates print jobs |
 | **Poll** | `/api/print/status` | Checks `PRINT_PENDING` jobs: marks the finished, **requeues the stalled**, **fails the hopeless** |
 
 > There is **no** `/api/print/resubmit`. It was retired on 2026-09-01 and its
@@ -182,6 +182,11 @@ foreach ($RequiredFile in @($Python, $TestScript, $BootstrapScript)) {
     }
 }
 
+# The site, splatted into every call that resolves a library. It was two app
+# settings (SHAREPOINT_HOSTNAME / SHAREPOINT_SITE_PATH) until 2026-09-02 and is
+# request input now, so the script has to name it exactly as a flow does.
+# NOT $Host -- that is a PowerShell automatic variable.
+$Site = @("--hostname", "noblehomes.sharepoint.com", "--site-path", "/sites/PM")
 $LIB = "AI_DropBox_V2026"
 $FLD = "/Backup/Invoice"
 $SHARE = "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
@@ -201,8 +206,9 @@ if (-not (Test-Path -LiteralPath ".\functionapp\local.settings.json")) {
     Copy-Item ".\functionapp\local.settings.json.template" `
         ".\functionapp\local.settings.json"
 }
-#    then set GRAPH_TENANT_ID, GRAPH_CLIENT_ID, SHAREPOINT_HOSTNAME,
-#    SHAREPOINT_SITE_PATH -- see docs/deploy-to-azure.md steps 1 and 6
+#    then set GRAPH_TENANT_ID and GRAPH_CLIENT_ID -- see deploy-to-azure.md
+#    step 1. The SITE is NOT a setting: pass --hostname and --site-path to
+#    scripts/test.py, the same way a Power Automate flow sends them.
 
 # 2. a refresh token. Locally you may use PRINT_REFRESH_TOKEN instead of a vault:
 & $Python $BootstrapScript --print-only
@@ -286,7 +292,7 @@ Compare against Submit for the same state — this is the whole argument for the
 endpoint:
 
 ```powershell
-& $Python $TestScript submit --library $LIB --folder $FLD --printer-share-id $SHARE --batch-size 1
+& $Python $TestScript submit @Site --library $LIB --folder $FLD --printer-share-id $SHARE --batch-size 1
 #   -> HTTP 200, submitted: 0, failed: 0, printerAvailable: False
 #      A 200 with no failures. Health says False in one field instead.
 ```
@@ -306,7 +312,7 @@ would lock files out until its own retry.
 ## B2. Dry run — resolves everything, prints nothing
 
 ```powershell
-& $Python $TestScript dryrun --library $LIB --folder $FLD --printer-share-id $SHARE
+& $Python $TestScript dryrun @Site --library $LIB --folder $FLD --printer-share-id $SHARE
 ```
 
 The highest-value call here. Expected shape:
@@ -341,14 +347,14 @@ Check four things:
 ## B3. One real file
 
 ```powershell
-& $Python $TestScript submit --library $LIB --folder $FLD `
+& $Python $TestScript submit @Site --library $LIB --folder $FLD `
     --printer-share-id $SHARE --batch-size 1
 ```
 
 `--batch-size 1` is not caution for its own sake: if the configuration is wrong
 you have wasted one sheet rather than five.
 
-Then **open the SharePoint library** and read the four columns back. This is the
+Then **open the SharePoint library** and read the five columns back. This is the
 step people skip, and the one that catches a silent write failure:
 
 | Column | Expect |
@@ -361,7 +367,7 @@ step people skip, and the one that catches a silent write failure:
 ## B4. Mark it complete once the page is out
 
 ```powershell
-& $Python $TestScript status --library $LIB --folder $FLD
+& $Python $TestScript status @Site --library $LIB --folder $FLD
 ```
 
 New output shape. The `settings` line is new, and so are `requeued`, `gaveUp` and
@@ -369,7 +375,7 @@ New output shape. The `settings` line is new, and so are `requeued`, `gaveUp` an
 
 ```
 HTTP 200
-settings        : stall=5min giveUp=10d maxRetries=10
+settings        : stall=5min giveUp=10d
 failed          : 0
 checked         : 1
 completed       : 1
@@ -398,16 +404,25 @@ This is the point of the change, so test it explicitly:
 
 ```powershell
 # out of range -> 400, and nothing is written
-& $Python $TestScript status --library $LIB --folder $FLD --stall-minutes 0
-& $Python $TestScript status --library $LIB --folder $FLD --give-up-days 400
+& $Python $TestScript status @Site --library $LIB --folder $FLD --stall-minutes 0
+& $Python $TestScript status @Site --library $LIB --folder $FLD --give-up-days 400
 
 # in range -> echoed back in the `settings` line
-& $Python $TestScript status --library $LIB --folder $FLD `
-    --stall-minutes 1 --give-up-days 2 --max-retries 3
+& $Python $TestScript status @Site --library $LIB --folder $FLD `
+    --stall-minutes 1 --give-up-days 2
+
+# a flow still carrying the retired knob is accepted and ignored, not rejected --
+# which is what lets the code deploy before the flows are edited
+& $Python $TestScript status @Site --library $LIB --folder $FLD --json   # no maxRetries key
 ```
 
 The `settings` line must show what you sent, not the defaults. That line is how
 you confirm a Power Automate flow is actually sending what you think it is.
+
+**There is no app-setting fallback to fall back to.** These used to resolve
+request → app setting → default, and the app setting is now ignored entirely, so
+this test is the only thing standing between a flow and silently running on the
+defaults.
 
 ## B5a. Choose the upload format explicitly (`printFormat`)
 
@@ -425,7 +440,7 @@ it, **you** choose, and the printer's preference does not get a vote.
 
 ```powershell
 # 1. What WOULD be uploaded. Prints nothing.
-& $Python $TestScript dryrun --library $LIB --folder $FLD `
+& $Python $TestScript dryrun @Site --library $LIB --folder $FLD `
     --printer-share-id $SHARE --print-format image/pwg-raster
 ```
 
@@ -452,14 +467,14 @@ reaching the endpoint** — fix that before believing anything else here.
 # 2. Refusals. Both must 400 and claim nothing.
 
 # 2a. a format this app cannot produce at all
-& $Python $TestScript dryrun --library $LIB --folder $FLD `
+& $Python $TestScript dryrun @Site --library $LIB --folder $FLD `
     --printer-share-id $SHARE --print-format image/png
 #   -> 400  printFormat 'image/png' is not supported
 #           (expected one of: application/pdf, image/pwg-raster)
 
 # 2b. a supported format THIS PRINTER does not report. On the Brother that is
 #     application/pdf -- it takes raster only, so asking for PDF is refused.
-& $Python $TestScript dryrun --library $LIB --folder $FLD `
+& $Python $TestScript dryrun @Site --library $LIB --folder $FLD `
     --printer-share-id $SHARE --print-format application/pdf
 #   -> 400  printer <share display name> does not accept application/pdf
 #           (supports: image/pwg-raster)
@@ -474,7 +489,7 @@ misconfigured flow and a damaged queue.
 
 ```powershell
 # 3. For real, one file, naming the format explicitly.
-& $Python $TestScript submit --library $LIB --folder $FLD `
+& $Python $TestScript submit @Site --library $LIB --folder $FLD `
     --printer-share-id $SHARE --batch-size 1 --print-format image/pwg-raster
 ```
 
@@ -498,7 +513,7 @@ Optional on `status`, and a **hard override** when sent: every job lookup and
 every cancel addresses that share instead of each row's own `Printer_Name`.
 
 ```powershell
-& $Python $TestScript status --library $LIB --folder $FLD --printer-share-id $SHARE
+& $Python $TestScript status @Site --library $LIB --folder $FLD --printer-share-id $SHARE
 ```
 
 Expect two lines:
@@ -523,7 +538,7 @@ flag or pass the share those rows actually name.
 ## B6. Other flags
 
 ```powershell
-& $Python $TestScript status --library $LIB --folder $FLD --json   # raw response
+& $Python $TestScript status @Site --library $LIB --folder $FLD --json   # raw response
 ```
 
 ## B7. Against the deployed app instead
@@ -537,7 +552,7 @@ $BASE = "https://$HOST_NAME"
 $KEY  = az functionapp keys list --resource-group rg-noble-print `
     --name func-noble-print --query "functionKeys.default" -o tsv
 
-& $Python $TestScript dryrun --base-url $BASE --key $KEY `
+& $Python $TestScript dryrun @Site --base-url $BASE --key $KEY `
     --library $LIB --folder $FLD --printer-share-id $SHARE
 ```
 
@@ -562,7 +577,7 @@ or cold start. See `README.md`, "What a local run cannot prove".
 | `could not reach http://localhost:7071` | `start-local.ps1` is not running, or it failed to start. Check the first window |
 | `HTTP 401` (deployed only) | Missing or wrong `--key` |
 | `remedy: run scripts/bootstrap_token.py` | The delegated refresh token is dead. A password change or reset revokes it; expiry alone does not |
-| `remedy: add the missing column(s)` | The four columns are missing or renamed |
+| `remedy: add the missing column(s)` | One of the five columns is missing or renamed — `Print_Time` is the newest, and the likeliest |
 | Every query fails | `Print_Status` is not indexed. A non-indexed column cannot be used in a Graph `$filter` at all |
 | `printerAvailable: false` | The printer is not accepting jobs. HTTP 200 with `failed=0`, so only that flag reveals it |
 | `budgetExhausted: true` | The 90 s budget ran out mid-batch. The remainder is picked up next run — expected under load, not an error |
@@ -585,18 +600,27 @@ and how many retries are already "spent" is read off **when the current attempt
 started** — the print job's own `createdDateTime`, or the row's `Modified` stamp
 when there is no job.
 
-That has a consequence worth knowing before you start:
+That has a consequence worth knowing before you start, and **it is the opposite of
+what this section said before 2026-09-02.**
 
-> **A row you have just hand-edited will not requeue.** Editing it sets `Modified`
-> to now, which reads as "this attempt started now", so no new boundary has been
-> crossed since. Verified: at *every* file age and *every* stall setting, a row
-> edited this second stays put.
+> **A row you hand-edit to `PRINT_PENDING` with no job id requeues on the very next
+> `status` run** — at every file age and every stall setting. It has no job, so it
+> is stalled by definition, and Poll no longer waits for a boundary before acting.
+>
+> What waits is the **reprint**. The requeue writes `Print_Time`, and Submit will
+> not claim the row until then. Verified against the real `poll_decision` with
+> `--stall-minutes 1`: a 3-minute-old file gets a due time 4 minutes out, a
+> **day-old file gets one about ten hours out**.
 
-So: edit the row, then **wait for the next boundary**, then run `status`. On a
-fresh file with `--stall-minutes 1` the boundaries are 1, 3, 7, 15, 31 minutes
-from the file's creation, so the wait is a minute or two. On a day-old file the
-next boundary can be eighteen hours away — which is why every test below starts
-with a **freshly uploaded** PDF.
+So the row moving straight back to `PRINT_READY` is *not* evidence the document is
+about to print — read `Print_Time` before you conclude anything. This is why every
+test below starts with a **freshly uploaded** PDF: on a fresh file the due times are
+minutes away, on an old one they are hours.
+
+(The old caveat here claimed such a row "will not requeue", because editing it bumps
+`Modified` and no new boundary had been crossed. That reasoning applied to the
+`due > spent` gate, which no longer exists — `Modified` now only influences *which*
+retry number is scheduled, not *whether* one is.)
 
 ## C1. A stalled job is cancelled and requeued
 
@@ -607,7 +631,7 @@ The cleanest test, and the one that pins the double-print guard. No hand editing
 3. Submit it:
 
 ```powershell
-& $Python $TestScript submit --library $LIB --folder $FLD `
+& $Python $TestScript submit @Site --library $LIB --folder $FLD `
     --printer-share-id $SHARE --batch-size 1
 ```
 
@@ -616,7 +640,7 @@ Note the `Print_JobId` SharePoint now shows. The job is queued and going nowhere
 4. Wait about two minutes, then poll with a one-minute stall threshold:
 
 ```powershell
-& $Python $TestScript status --library $LIB --folder $FLD --stall-minutes 1
+& $Python $TestScript status @Site --library $LIB --folder $FLD --stall-minutes 1
 ```
 
 Expect `requeued : 1`, and in SharePoint:
@@ -627,6 +651,12 @@ Expect `requeued : 1`, and in SharePoint:
 | `Print_JobId` | **empty** — the job it named was cancelled |
 | `Print_Message` | `Job Id <the id from step 3> cancelled. Retry job (n)` |
 | `Printer_Name` | unchanged |
+| `Print_Time` | **a timestamp, in local time** — when the next attempt falls due. This is the new column, and the point of the whole change: the backoff is now something you read rather than infer |
+
+**Check `Print_Time` before assuming the reprint is imminent.** The row is
+`PRINT_READY` again, but Submit will decline it until that moment passes — so a
+`submit` run right now can legitimately report `submitted : 0` with
+`notYetDue : 1`, and that is the feature working, not a failure.
 
 In the host window you should see **two** `PRINT_EVENT` lines, in this order:
 
@@ -669,17 +699,23 @@ owns it.
 1. Upload a fresh PDF. **Immediately** set, by hand in SharePoint:
    `Print_Status` = `PRINT_PENDING`, `Printer_Name` = the share id,
    `Print_JobId` = empty.
-2. **Wait two minutes** — see the warning above; the row will not move before the
-   next boundary.
+2. Run `status` straight away — **no waiting needed.** The row has no job, so it
+   is stalled by definition and requeues on the first run. (This step used to say
+   "wait two minutes"; that applied to the boundary gate that no longer exists.)
 3. Run:
 
    ```powershell
-   & $Python $TestScript status --library $LIB --folder $FLD --stall-minutes 1
+   & $Python $TestScript status @Site --library $LIB --folder $FLD --stall-minutes 1
    ```
 
-Expect `requeued : 1` and the row back at `PRINT_READY`. `graph.cancelled` stays
-empty in this case — there is no job to cancel, and the host window shows a
-`requeued` event with no `cancelled` before it.
+Expect `requeued : 1` and the row back at `PRINT_READY`, with a `Print_Time`
+written. No cancel happens here — there is no job to cancel — so the host window
+shows a `requeued` event with **no** `cancelled` line before it, which is the
+difference from C1.
+
+`Print_Time` will be a few minutes out on a file you just uploaded. On an older
+file it can be hours: the schedule is measured from the file's creation, and a
+crash does not reset it.
 
 ## C3. Giving up
 
@@ -690,7 +726,7 @@ any old PDF already in the library rather than waiting.
 2. Run:
 
    ```powershell
-   & $Python $TestScript status --library $LIB --folder $FLD --give-up-days 1
+   & $Python $TestScript status @Site --library $LIB --folder $FLD --give-up-days 1
    ```
 
 This one fires **immediately** — the give-up test runs before the stall test, so
@@ -701,6 +737,7 @@ it does not care whether the job is stalled or how long ago you edited the row.
 | `Print_Status` | **`PRINT_FAILED`** |
 | `Print_Message` | `gave up after 1 day(s) and N retries; outstanding job cancelled` |
 | `Print_JobId` | **kept** — the audit trail on a failed row |
+| `Print_Time` | **emptied** — a terminal row carries no schedule, so a human resetting it to `PRINT_READY` gets an immediate print rather than a silent wait |
 
 `PRINT_FAILED` is **terminal**. Nothing retries it; the row waits for a human.
 That is the deliberate trade for having deleted Resubmit, and it is why the
@@ -710,9 +747,9 @@ message has to be worth reading.
 
 | Behaviour | Why | Nearest thing you can do |
 |---|---|---|
-| The full ten-retry backoff | The last retry falls due at **3d 13h** | Trust `test_each_retry_falls_due_at_its_boundary`, which pins all ten literally |
-| The grace period | Runs from 3d 13h to 10 days | `status --max-retries 1` on a stalled file: expect `requeued : 0`, `gaveUp : 0`, status still `PRINT_PENDING`, and **no** cancel — the last job is deliberately left alive |
-| Retry #2 | Poll's 10-minute cadence swallows the 5- and 15-minute boundaries | Nothing to fix. Nine requeues fire, not ten; the numbering skips 2 |
+| The full backoff | The last unclamped retry falls due at **7d 2h**, and the clamped one at 10 days | Trust `test_each_retry_falls_due_at_its_boundary` and `test_next_retry_time_lands_on_the_boundary`, which pin the ladder literally in both units |
+| The clamp | Needs an 8-day-old file | `test_the_due_time_is_never_scheduled_past_the_give_up_deadline` and `test_the_clamped_final_attempt_is_failed_rather_than_stranded` cover both halves offline |
+| The early retries | The schedule opens at retry 3 with Flow A at 15 min, because `spent` is read off the file's age when the FIRST job is created | Nothing to fix, and note it is **Flow A's** recurrence that decides this, not Flow B's — Flow B at 10 min and 1 min give identical sequences. Shortening Flow A is the only lever; lowering `stallMinutes` makes it worse |
 
 ## Part C troubleshooting
 

@@ -32,9 +32,9 @@ import pytest
 import print_policy
 import printing
 import universal_print
-from helpers import SUBMIT, as_json, post, result_for
+from helpers import SITE, SUBMIT, as_json, post, result_for
 
-BODY = {"library": "Documents", "folder": "/Invoices/ToPrint",
+BODY = {**SITE, "library": "Documents", "folder": "/Invoices/ToPrint",
         "printerShareId": "share-guid"}
 
 PDF = "application/pdf"

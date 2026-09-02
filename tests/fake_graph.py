@@ -100,6 +100,7 @@ class FakeGraph:
             "Print_JobId": transform("Print_JobId"),
             "Print_Message": transform("Print_Message"),
             "Printer_Name": transform("Printer_Name"),
+            "Print_Time": transform("Print_Time"),
         }
         self.list_title = "Documents"
         self.items: Dict[str, Dict[str, Any]] = {}
@@ -133,12 +134,19 @@ class FakeGraph:
                  folder: str = "/sites/Ops/Shared Documents/Invoices/ToPrint",
                  job_id: str = "", printer: str = "", message: str = "",
                  size: int = 1024, modified: Optional[str] = None,
-                 mime_type: str = "application/pdf") -> Dict[str, Any]:
+                 mime_type: str = "application/pdf",
+                 print_time: str = "") -> Dict[str, Any]:
         """`mime_type` is the drive item's file.mimeType, which is what
         universal_print.guess_content_type PREFERS over the file extension. It
         was hardcoded to PDF here, so no test could describe a library holding
         anything else -- and a profile that refuses a non-PDF source had nothing
-        to refuse. Defaults to PDF, so every existing fixture is unchanged."""
+        to refuse. Defaults to PDF, so every existing fixture is unchanged.
+
+        `print_time` is when the next attempt falls due. It defaults to EMPTY,
+        which is both the honest shape for a file the upstream process just
+        created and the one Submit must treat as due immediately -- so every
+        existing fixture keeps printing without saying anything about schedules.
+        Pass `iso(minutes=-30)` for a file that is not due yet."""
         fields = {
             "FileLeafRef": name,
             "FileDirRef": folder,
@@ -146,6 +154,7 @@ class FakeGraph:
             self.columns["Print_JobId"]: job_id,
             self.columns["Print_Message"]: message,
             self.columns["Printer_Name"]: printer,
+            self.columns["Print_Time"]: print_time,
         }
         self.items[item_id] = {
             "id": item_id,

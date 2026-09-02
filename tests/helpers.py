@@ -22,6 +22,14 @@ from datetime import datetime, timedelta, timezone
 # frozen_now fixture, so every window assertion is deterministic.
 NOW = datetime(2026, 8, 30, 21, 0, 0, tzinfo=timezone.utc)
 
+# The site every offline test addresses. This used to be two app settings, set by
+# conftest's clean_env fixture; it is request input now, so it lives here and each
+# module's body constant spreads it. One definition, so the day the key names change
+# there is one place to change them -- and a body that omits it gets a 400 rather
+# than quietly addressing whatever the environment happened to hold.
+SITE = {"sharepointHostname": "contoso.sharepoint.com",
+        "sharepointSitePath": "/sites/Ops"}
+
 
 def iso(*, days: float = 0, hours: float = 0, minutes: float = 0) -> str:
     """A timestamp that far before NOW.

@@ -190,13 +190,37 @@ Only worth doing once stage 1 prints.
 
 **A — SharePoint.** In the target library:
 
-1. The four columns exist with these **exact display names**:
+1. The five columns exist with these **exact display names**:
    `Print_Status`, `Print_JobId`, `Print_Message`, `Printer_Name` (all single
-   line of text).
+   line of text) and **`Print_Time`** (**Date and Time**, *Include Time* on,
+   *Friendly format* off, and **no default value** — a default such as
+   `Today's date` stamps every new row and the column stops meaning "a retry is
+   scheduled for exactly then").
 2. **`Print_Status` is indexed.** *Library settings → Indexed columns → Create a
    new index.* Not optional: a non-indexed column cannot be used in a Graph
    `$filter` at all, so without it **every** query fails.
-3. At least one PDF in the target folder with `Print_Status = PRINT_READY`.
+   **`Print_Time` needs no index** — the due-time comparison happens in Python,
+   because SharePoint honours only one indexed field per `$filter`.
+3. **Prove the `Print_Time` round trip once**, before trusting the retry
+   schedule. This is the one thing the offline suite cannot establish, because
+   `FakeGraph` stores whatever it is handed:
+
+   ```powershell
+   # read-only: does the column resolve, and what is on the ready rows?
+   .\.venv\Scripts\python.exe scripts\verify_print_time.py `
+       --hostname noblehomes.sharepoint.com --site-path /sites/PM `
+       --library "AI_DropBox_V2026"
+
+   # then round-trip ONE row you do not mind disturbing (it is restored after)
+   .\.venv\Scripts\python.exe scripts\verify_print_time.py `
+       --hostname noblehomes.sharepoint.com --site-path /sites/PM `
+       --library "AI_DropBox_V2026" --item <id>
+   ```
+
+   Three PASS lines: the column resolves, a written value comes back as the same
+   instant, and `null` empties it. A failure that is a whole number of hours means
+   the UTC offset was lost somewhere — see the entry in `docs/ai/troubleshooting.md`.
+4. At least one PDF in the target folder with `Print_Status = PRINT_READY`.
 
 **B — Entra app registration** (this one you do need, unlike stage 1):
 
@@ -215,8 +239,9 @@ Copy-Item functionapp\local.settings.json.template functionapp\local.settings.js
 notepad functionapp\local.settings.json
 ```
 
-Fill in `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `SHAREPOINT_HOSTNAME`
-(e.g. `noblehomes.sharepoint.com`), `SHAREPOINT_SITE_PATH` (e.g. `/sites/Operations`).
+Fill in `GRAPH_TENANT_ID` and `GRAPH_CLIENT_ID`. The **site is not a setting** —
+pass `--hostname` (e.g. `noblehomes.sharepoint.com`) and `--site-path`
+(e.g. `/sites/Operations`) to `scripts/test.py`, exactly as a flow sends them.
 
 For a local run you can skip Key Vault entirely — leave `KEY_VAULT_URI` as the
 placeholder and put the refresh token straight in `PRINT_REFRESH_TOKEN`:
@@ -250,23 +275,26 @@ cd "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"
 #    tells you the REAL internal column names, which is the one thing I could
 #    not determine without your tenant.
 .\.venv\Scripts\python.exe scripts\test.py dryrun `
+    --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
     --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
 
 # 5. One real file.
 .\.venv\Scripts\python.exe scripts\test.py submit `
+    --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
     --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5" `
     --batch-size 1
 
 # 6. Mark it complete once the page is out.
 .\.venv\Scripts\python.exe scripts\test.py status `
+    --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "AI_DropBox_V2026" --folder "/Backup/Invoice"
 ```
 
 ### What "passing" looks like
 
-Step 4 should list the four columns and their internal names. If they come back
+Step 4 should list the five columns and their internal names. If they come back
 as `Print_x005f_Status` etc., the encoding I predicted is real; if they come back
 clean, it is not. **Either is fine** — the code resolves them at runtime — but
 this is where you find out.

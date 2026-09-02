@@ -35,16 +35,19 @@ from helpers import NOW, iso  # noqa: E402,F401  -- one definition, shared
 def clean_env(monkeypatch):
     """A known environment for every test.
 
-    Tunables are cleared so a value left in the developer's shell cannot change
-    what the suite asserts; the two required settings are supplied so the
-    resolve path works without each test repeating them.
+    Only two settings still influence a run -- the wall-clock budget and the
+    display time zone -- and both are cleared so a value left in the developer's
+    shell cannot change what the suite asserts.
+
+    The site used to be supplied here, as SHAREPOINT_HOSTNAME and
+    SHAREPOINT_SITE_PATH, and the tunables used to be cleared here because each
+    had an app-setting fallback. All of that now arrives in the request body, so
+    the environment has nothing left to say about which site a run touches or how
+    it is paced. The values live in `helpers.SITE` instead.
     """
-    for name in ("PRINT_BATCH_SIZE", "PRINT_GIVE_UP_DAYS", "PRINT_STALL_MINUTES",
-                 "PRINT_MAX_RETRIES", "PRINT_BUDGET_SECONDS",
-                 "PRINT_BUSINESS_TZ", "PRINT_REFRESH_TOKEN"):
+    for name in ("PRINT_BUDGET_SECONDS", "PRINT_BUSINESS_TZ",
+                 "PRINT_REFRESH_TOKEN"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("SHAREPOINT_HOSTNAME", "contoso.sharepoint.com")
-    monkeypatch.setenv("SHAREPOINT_SITE_PATH", "/sites/Ops")
 
 
 @pytest.fixture

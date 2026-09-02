@@ -43,8 +43,14 @@ COLUMN_STATUS = "Print_Status"
 COLUMN_JOB_ID = "Print_JobId"
 COLUMN_MESSAGE = "Print_Message"
 COLUMN_PRINTER = "Printer_Name"
+# WHEN THE NEXT ATTEMPT FALLS DUE. Written by Poll when it requeues a stalled file,
+# honoured by Submit, and cleared everywhere else -- it is only ever set on a
+# PRINT_READY row (design §5.4). This is what turned the retry backoff from a
+# comparison Poll made privately into a time anyone can read off the library.
+COLUMN_PRINT_TIME = "Print_Time"
 
-COLUMN_DISPLAY_NAMES = (COLUMN_STATUS, COLUMN_JOB_ID, COLUMN_MESSAGE, COLUMN_PRINTER)
+COLUMN_DISPLAY_NAMES = (COLUMN_STATUS, COLUMN_JOB_ID, COLUMN_MESSAGE, COLUMN_PRINTER,
+                        COLUMN_PRINT_TIME)
 
 # --- Print status vocabulary --------------------------------------------------
 # PRINT_READY is set by an upstream process AND by Poll when it requeues a stalled
@@ -63,16 +69,23 @@ COMPLETED = "PRINT_COMPLETED"
 # not add handling for values the app does not own.
 
 # --- Tunables -----------------------------------------------------------------
-# Each has a constant default, an env override, and range validation. An
-# out-of-range REQUEST value is a 400; an out-of-range ENV value logs a warning
-# and falls back, because a server misconfiguration must not fail every request.
+# Each has a constant default and range validation, and is resolved from the POWER
+# AUTOMATE REQUEST BODY alone. There is deliberately no app-setting fallback: every
+# knob a flow can set lives in the flow, so there is exactly one place to look when
+# the pacing is not what someone expected. An out-of-range request value is a 400.
 DEFAULT_BATCH_SIZE = 5
 MIN_BATCH_SIZE = 1
 MAX_BATCH_SIZE = 15  # the requirement's "oldest 15" is the ceiling, not the default
 
 # How long a file may stay PRINT_PENDING before Poll cancels the outstanding job
-# and writes PRINT_FAILED. Measured from the SharePoint creation time. This is the
-# outer bound on WAITING; MAX_RETRIES is the bound on WORK.
+# and writes PRINT_FAILED. Measured from the SharePoint creation time.
+#
+# THIS IS THE ONLY UPPER BOUND. There used to be a second, `maxRetries`, which
+# capped the NUMBER of requeues while this capped the WAITING, with a grace period
+# in between. Two bounds for one question was one too many: the retry count is
+# derived from the file's age anyway, so a count and a deadline were saying the same
+# thing in different units. `next_retry_time` now clamps the schedule to this
+# deadline, so nothing is ever scheduled past the moment the row will be failed.
 DEFAULT_GIVE_UP_DAYS = 10
 MIN_GIVE_UP_DAYS = 1
 MAX_GIVE_UP_DAYS = 365
@@ -84,12 +97,6 @@ MAX_GIVE_UP_DAYS = 365
 DEFAULT_STALL_MINUTES = 5
 MIN_STALL_MINUTES = 1
 MAX_STALL_MINUTES = 1440  # one day
-
-# The most requeues one file may receive. Each costs a render, a conversion and an
-# upload, so this bounds the work an undeliverable document can consume.
-DEFAULT_MAX_RETRIES = 10
-MIN_MAX_RETRIES = 1
-MAX_MAX_RETRIES = 20
 
 BUSINESS_TZ = "America/Vancouver"
 MESSAGE_MAX_CHARS = 255
@@ -177,29 +184,77 @@ def job_is_stalled(state: Optional[str], has_job: bool,
     return job_age_minutes >= stall_minutes
 
 
-def retries_due(file_age_minutes: Optional[float], base_minutes: int,
-                max_retries: int) -> int:
+def retries_due(file_age_minutes: Optional[float], base_minutes: int) -> int:
     """How many requeues the schedule says should have happened by this age.
 
     Retry n falls due at `base * (2**n - 1)`: 5, 15, 35, 75, 155 ... minutes for
     the default base of 5. Exponential, so a printer that is off for the weekend
     is retried a handful of times rather than every ten minutes for sixty hours.
 
-    THIS IS WHAT MAKES THE RETRY COUNT STATELESS. The four-column schema has no
-    attempt counter and none was added; instead the count is a pure function of
-    age, and comparing this value at two instants tells the caller whether a new
-    retry has come due. See `poll_decision`.
+    THIS IS WHAT MAKES THE RETRY COUNT STATELESS. The schema has no attempt
+    counter and none was added; instead the count is a pure function of age. See
+    `poll_decision`, which reads it off the current job's creation time.
 
-    Capped at `max_retries` so the arithmetic cannot run away on an ancient row.
+    UNBOUNDED, AND SAFELY SO. There used to be a `max_retries` cap here, added to
+    stop "the arithmetic running away on an ancient row". It cannot: the ladder
+    doubles, so the loop terminates in log2(age/base) steps -- 32 of them for a
+    year-9999 timestamp at a one-minute base. And `poll_decision` only consults
+    this after `within_window` has passed, which bounds the age at `giveUpDays`,
+    so the largest value this can actually return is 19 -- at base 1 with a 365-day
+    give-up, the most extreme pair the range validation permits.
     """
     if file_age_minutes is None or file_age_minutes < base_minutes:
         return 0
     count = 0
-    while count < max_retries:
-        if file_age_minutes < base_minutes * (2 ** (count + 1) - 1):
-            break
+    while file_age_minutes >= base_minutes * (2 ** (count + 1) - 1):
         count += 1
     return count
+
+
+def next_retry_time(file_created: Optional[datetime], base_minutes: int,
+                    retry_number: int,
+                    give_up_days: int) -> Optional[datetime]:
+    """When retry `retry_number` falls due -- never later than the give-up deadline.
+
+    The same ladder as `retries_due`, evaluated as a TIME rather than counted as a
+    number; a test pins that the two agree at every boundary. Poll writes this into
+    `Print_Time` and Submit honours it, which is what makes the backoff visible.
+
+    THE CLAMP IS THE WHOLE UPPER BOUND. A waiting row sits at PRINT_READY, and Poll
+    queries PRINT_PENDING only -- so a row scheduled past its own give-up deadline
+    would be invisible at the moment it was due to be failed, and would print days
+    late against a row that then reads PRINT_FAILED. Clamping means the last attempt
+    always lands ON the deadline: it gets `stallMinutes` of life, and the next Poll
+    run finds the file out of window and fails it.
+
+    A due time in the PAST is normal and means "print immediately" -- the early
+    boundaries have usually gone by before Poll first notices the stall, which is
+    what reproduces the pre-`Print_Time` timing.
+    """
+    if file_created is None:
+        return None
+    deadline = file_created + timedelta(days=give_up_days)
+    try:
+        due = file_created + timedelta(
+            minutes=base_minutes * (2 ** retry_number - 1))
+    except OverflowError:
+        # Only reachable for a creation date within about two years of datetime.max.
+        # The clamp is the answer anyway, so there is nothing to lose by taking it.
+        return deadline
+    return min(due, deadline)
+
+
+def is_due(print_time: Optional[datetime], now: datetime) -> bool:
+    """Whether Submit may pick this file up yet.
+
+    A MISSING OR UNREADABLE VALUE MEANS DUE NOW, and that direction is deliberate.
+    Files arrive from an upstream process that knows nothing about `Print_Time`, and
+    the documented recovery for a terminal row is that a human sets it back to
+    PRINT_READY by hand. Fail-closed would strand both, and the whole queue with
+    them; fail-open costs nothing, because a file with no schedule has none to wait
+    for.
+    """
+    return print_time is None or print_time <= now
 
 
 def minutes_between(earlier: Optional[datetime],
@@ -221,8 +276,7 @@ def poll_decision(state: Optional[str], *,
                   job_created: Optional[datetime],
                   attempt_started: Optional[datetime],
                   now: datetime,
-                  stall_minutes: int, give_up_days: int,
-                  max_retries: int) -> tuple:
+                  stall_minutes: int, give_up_days: int) -> tuple:
     """(action, retry_number) for one PRINT_PENDING row.
 
     `attempt_started` is when the CURRENT attempt began -- the print job's own
@@ -233,8 +287,10 @@ def poll_decision(state: Optional[str], *,
     requeue creates a fresh job, so an attempt that began late in the schedule
     proves the earlier retries happened. Note this is the file's age at that
     moment, NOT the attempt's own age -- those coincide on the first attempt, and
-    using the latter would make `spent` equal `due` forever and no retry would
-    ever fire.
+    using the latter would report nothing was ever spent.
+
+    On a requeue the number returned is `spent + 1`: the retry about to be
+    SCHEDULED, which the caller turns into a `Print_Time` via `next_retry_time`.
 
     THE ORDER OF THESE CHECKS IS LOAD-BEARING:
 
@@ -246,13 +302,14 @@ def poll_decision(state: Optional[str], *,
     3. Past the give-up threshold: stop waiting. The caller cancels whatever is
        outstanding FIRST -- without that, an abandoned job could print days later
        against a row that says PRINT_FAILED.
-    4. Stalled, retries left, and a new boundary crossed: requeue.
-    5. Anything else: leave it alone. That covers three situations which all want
-       silence -- a healthy job in flight, a stalled job inside the backoff gap,
-       and a stalled job whose retries are spent but which is still inside the
-       give-up window. The last is the GRACE PERIOD: no further work is spent, but
-       the final job stays live, so a printer that comes back still gets the
-       document out and check 1 records it.
+    4. Stalled: requeue, and say which retry is being scheduled.
+    5. Anything else -- a healthy job in flight -- is left alone.
+
+    THERE IS NO BACKOFF TEST HERE ANY MORE. It used to sit between 4 and 5: a
+    stalled job was requeued only once `retries_due(now)` exceeded `spent`, so a
+    row waited out its backoff at PRINT_PENDING with Poll silently declining it on
+    every run. The wait now happens in Submit against `Print_Time`, which means the
+    same schedule with the same arithmetic, but recorded where someone can see it.
 
     A row whose creation time will not parse is left alone entirely. It cannot be
     aged, so neither the give-up test nor the schedule means anything for it, and
@@ -265,7 +322,7 @@ def poll_decision(state: Optional[str], *,
         return POLL_FAIL, 0
 
     spent = retries_due(minutes_between(file_created, attempt_started),
-                        stall_minutes, max_retries)
+                        stall_minutes)
 
     if file_created is None:
         return POLL_NONE, spent
@@ -275,13 +332,8 @@ def poll_decision(state: Optional[str], *,
     if not job_is_stalled(state, has_job, minutes_between(job_created, now),
                           stall_minutes):
         return POLL_NONE, spent
-    if spent >= max_retries:
-        return POLL_NONE, spent
 
-    due = retries_due(minutes_between(file_created, now), stall_minutes, max_retries)
-    if due > spent:
-        return POLL_REQUEUE, due
-    return POLL_NONE, spent
+    return POLL_REQUEUE, spent + 1
 
 
 # --- Printer health -----------------------------------------------------------
@@ -521,6 +573,26 @@ def _business_zone(tz_name: Optional[str] = None):
 PRINTED_ON_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
+def format_business_datetime(when: Optional[datetime],
+                             tz_name: Optional[str] = None) -> str:
+    """`Print_Time` on the wire: ISO 8601 in the business zone, WITH its offset.
+
+    Rendered locally because the column exists to be read by a person in
+    SharePoint, and a due time in UTC is a due time nobody can act on.
+
+    THE OFFSET IS NOT DECORATION AND MUST NEVER BE DROPPED. This value is read
+    back and compared, unlike `printed_on_message`, which is display-only and
+    therefore free to emit a naive local time. `parse_graph_datetime` assumes a
+    naive value is UTC, so an offset-less local string would come back seven or
+    eight hours wrong -- and the error would CHANGE with daylight saving, because
+    America/Vancouver is -08:00 in January and -07:00 in July. With the offset
+    present the round trip is exact and the arithmetic stays in UTC throughout.
+    """
+    if when is None:
+        return ""
+    return when.astimezone(_business_zone(tz_name)).isoformat(timespec="seconds")
+
+
 def completion_time(acknowledged: Any, observed: Optional[datetime] = None) -> datetime:
     """The best available answer to "when was this printed?".
 
@@ -687,59 +759,45 @@ def _item_id(item: Any) -> Any:
 # --- Tunable resolution -------------------------------------------------------
 
 
-def _resolve_int(name: str, request_value: Any, env_var: str,
+def _resolve_int(name: str, request_value: Any,
                  default: int, low: int, high: int) -> int:
-    """Resolve a tunable from (request > env > constant) with range validation.
+    """Resolve a tunable from (request > constant) with range validation.
 
     A bad REQUEST value raises ValueError, which the route turns into a 400: the
-    caller asked for something impossible and should be told. A bad ENV value
-    logs a warning and falls back, because server misconfiguration must not take
-    every request down with it.
-    """
-    if request_value is not None:
-        try:
-            value = int(request_value)
-        except (TypeError, ValueError):
-            raise ValueError(f"{name} must be an integer, got {request_value!r}")
-        if not low <= value <= high:
-            raise ValueError(f"{name} must be between {low} and {high}, got {value}")
-        return value
+    caller asked for something impossible and should be told.
 
-    raw = os.getenv(env_var)
-    if raw:
-        try:
-            value = int(raw)
-            if low <= value <= high:
-                return value
-            logging.warning("%s=%s is outside [%s, %s]; using %s",
-                            env_var, raw, low, high, default)
-        except ValueError:
-            logging.warning("%s=%s is not an integer; using %s", env_var, raw, default)
-    return default
+    THERE IS NO APP-SETTING LAYER. Every one of these used to fall back to an env
+    var, on the reasoning that a server should be able to retune itself. In
+    practice it split the answer to "why is the pacing wrong?" across a flow and
+    an app setting, with the flow silently winning -- so the setting could be read,
+    believed, and be doing nothing at all. All three now live in the flow body
+    alone. `PRINT_BUDGET_SECONDS` and `PRINT_BUSINESS_TZ` keep their settings on
+    purpose: neither is something a flow sets.
+    """
+    if request_value is None:
+        return default
+    try:
+        value = int(request_value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be an integer, got {request_value!r}")
+    if not low <= value <= high:
+        raise ValueError(f"{name} must be between {low} and {high}, got {value}")
+    return value
 
 
 def resolve_batch_size(request_value: Any = None) -> int:
-    return _resolve_int("batchSize", request_value, "PRINT_BATCH_SIZE",
+    return _resolve_int("batchSize", request_value,
                         DEFAULT_BATCH_SIZE, MIN_BATCH_SIZE, MAX_BATCH_SIZE)
 
 
-# The three retry knobs below are read from the POWER AUTOMATE REQUEST BODY first,
-# then the app setting, then the default. That ordering is the point: the pacing
-# of the whole retry schedule can be retuned by editing a flow, with no deploy and
-# no app-setting change.
 def resolve_give_up_days(request_value: Any = None) -> int:
-    return _resolve_int("giveUpDays", request_value, "PRINT_GIVE_UP_DAYS",
+    return _resolve_int("giveUpDays", request_value,
                         DEFAULT_GIVE_UP_DAYS, MIN_GIVE_UP_DAYS, MAX_GIVE_UP_DAYS)
 
 
 def resolve_stall_minutes(request_value: Any = None) -> int:
-    return _resolve_int("stallMinutes", request_value, "PRINT_STALL_MINUTES",
+    return _resolve_int("stallMinutes", request_value,
                         DEFAULT_STALL_MINUTES, MIN_STALL_MINUTES, MAX_STALL_MINUTES)
-
-
-def resolve_max_retries(request_value: Any = None) -> int:
-    return _resolve_int("maxRetries", request_value, "PRINT_MAX_RETRIES",
-                        DEFAULT_MAX_RETRIES, MIN_MAX_RETRIES, MAX_MAX_RETRIES)
 
 
 def resolve_budget_seconds() -> float:

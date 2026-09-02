@@ -31,9 +31,9 @@ comes back.
 from __future__ import annotations
 
 import print_policy
-from helpers import POLL, SUBMIT as SUBMIT_ROUTE, as_json, iso, post
+from helpers import POLL, SITE, SUBMIT as SUBMIT_ROUTE, as_json, iso, post
 
-POLL_BODY = {"library": "Documents", "folder": "/Invoices/ToPrint"}
+POLL_BODY = {**SITE, "library": "Documents", "folder": "/Invoices/ToPrint"}
 
 
 # --- F1: Poll must check every pending job in the window ----------------------
@@ -192,7 +192,7 @@ def test_paging_returns_only_rows_matching_the_filter(graph, frozen_now):
     for i in range(4):
         graph.add_item("other-{}".format(i), status=print_policy.COMPLETED)
 
-    payload = as_json(post(SUBMIT_ROUTE, {"library": "Documents",
+    payload = as_json(post(SUBMIT_ROUTE, {**SITE, "library": "Documents",
                                           "folder": "/Invoices/ToPrint",
                                           "printerShareId": graph.SHARE_ID,
                                           "dryRun": True}))
@@ -263,7 +263,7 @@ def test_a_skipped_file_still_counts_as_remaining(graph, frozen_now):
 
     graph._patch_fields = steal_then_patch
 
-    payload = as_json(post(SUBMIT_ROUTE, {"library": "Documents",
+    payload = as_json(post(SUBMIT_ROUTE, {**SITE, "library": "Documents",
                                           "folder": "/Invoices/ToPrint",
                                           "printerShareId": graph.SHARE_ID}))
 

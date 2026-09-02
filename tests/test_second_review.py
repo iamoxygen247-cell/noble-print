@@ -41,9 +41,9 @@ import graph_client
 import print_policy
 import sharepoint
 from fake_graph import FakeGraph
-from helpers import POLL, SUBMIT, as_json, iso, post
+from helpers import POLL, SITE, SUBMIT, as_json, iso, post
 
-BODY = {"library": "Documents", "folder": "/Invoices/ToPrint"}
+BODY = {**SITE, "library": "Documents", "folder": "/Invoices/ToPrint"}
 
 
 def submit_body(**overrides):

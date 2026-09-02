@@ -96,8 +96,7 @@ def test_windows_are_computed_in_utc_across_a_dst_change():
 
 
 def decide(state="stopped", *, file_age_minutes=1.0, job_age_minutes=None,
-           spent_at_minutes=None, stall_minutes=5, give_up_days=10,
-           max_retries=10):
+           spent_at_minutes=None, stall_minutes=5, give_up_days=10):
     """poll_decision in the units the schedule is actually specified in.
 
     `spent_at_minutes` is the file's age when the current attempt began, which is
@@ -116,7 +115,6 @@ def decide(state="stopped", *, file_age_minutes=1.0, job_age_minutes=None,
         attempt_started=NOW - timedelta(minutes=file_age_minutes - started_at),
         now=NOW,
         stall_minutes=stall_minutes, give_up_days=give_up_days,
-        max_retries=max_retries,
     )
 
 
@@ -192,51 +190,127 @@ BOUNDARIES = [5, 15, 35, 75, 155, 315, 635, 1275, 2555, 5115]
 
 @pytest.mark.parametrize("n,minutes", list(enumerate(BOUNDARIES, start=1)))
 def test_each_retry_falls_due_at_its_boundary(n, minutes):
-    assert policy.retries_due(minutes, 5, 10) == n
-    assert policy.retries_due(minutes - 0.001, 5, 10) == n - 1
+    assert policy.retries_due(minutes, 5) == n
+    assert policy.retries_due(minutes - 0.001, 5) == n - 1
 
 
-def test_all_ten_retries_fit_inside_the_ten_day_give_up_window():
-    """With the shipped defaults it is max_retries that stops the retrying, at
-    about 3d 13h, not the calendar. The remaining 6.5 days are the grace period
-    in which the final job may still print."""
-    assert BOUNDARIES[-1] < 10 * 24 * 60
-    assert policy.retries_due(10 * 24 * 60, 5, 10) == 10
+def test_the_ladder_continues_past_the_old_maximum():
+    """`maxRetries` used to stop the count at 10, about 3d 13h. It is gone --
+    giveUpDays is the only bound now -- so the eleventh retry is reachable, and
+    inside a ten-day window it is the last one that is."""
+    assert policy.retries_due(10 * 24 * 60, 5) == 11
+    assert 5 * (2 ** 11 - 1) < 10 * 24 * 60 < 5 * (2 ** 12 - 1)
 
 
-def test_retries_due_is_capped_at_the_maximum():
-    """However ancient the row, the arithmetic must not run away."""
-    assert policy.retries_due(10_000_000, 5, 10) == 10
-    assert policy.retries_due(10_000_000, 5, 3) == 3
+def test_retries_due_terminates_on_an_absurd_age():
+    """The cap was added to stop 'the arithmetic running away on an ancient row'.
+    It cannot: the ladder doubles, so the loop is logarithmic in the age. This is
+    the assertion that lets the cap stay deleted."""
+    assert policy.retries_due(10_000_000, 5) == 20
+    # A year-9999 timestamp at the smallest legal base -- the worst case that can
+    # physically be constructed, and still trivial.
+    assert policy.retries_due(4_200_000_000, 1) == 31
 
 
 def test_retries_due_is_monotonic():
     previous = 0
     for minutes in range(0, 6000, 7):
-        current = policy.retries_due(minutes, 5, 10)
+        current = policy.retries_due(minutes, 5)
         assert current >= previous, "the count may never go backwards"
         previous = current
 
 
 def test_nothing_is_due_before_the_first_boundary():
-    assert policy.retries_due(0, 5, 10) == 0
-    assert policy.retries_due(4.9, 5, 10) == 0
-    assert policy.retries_due(None, 5, 10) == 0
+    assert policy.retries_due(0, 5) == 0
+    assert policy.retries_due(4.9, 5) == 0
+    assert policy.retries_due(None, 5) == 0
 
 
 def test_the_schedule_rescales_with_the_stall_threshold():
     """One knob. A one-minute threshold gives 1, 3, 7, 15 ... minutes."""
-    assert [policy.retries_due(m, 1, 10) for m in (1, 3, 7, 15)] == [1, 2, 3, 4]
+    assert [policy.retries_due(m, 1) for m in (1, 3, 7, 15)] == [1, 2, 3, 4]
 
 
-def test_a_requeue_needs_a_NEWLY_crossed_boundary():
-    """THE BACKOFF. Two retries are already spent (the attempt began at 27
-    minutes); the third is not due until 35. At 32 minutes the job is stalled and
-    retries remain, and still nothing happens."""
-    action, _ = decide(file_age_minutes=32, job_age_minutes=5,
-                       spent_at_minutes=27)
-    assert action == policy.POLL_NONE
+# --- the ladder as a TIME: next_retry_time ------------------------------------
 
+
+@pytest.mark.parametrize("n,minutes", list(enumerate(BOUNDARIES, start=1)))
+def test_next_retry_time_lands_on_the_boundary(n, minutes):
+    """The same ladder `retries_due` counts, expressed as an instant."""
+    created = NOW - timedelta(days=1)
+    assert policy.next_retry_time(created, 5, n, 10) == created + timedelta(
+        minutes=minutes)
+
+
+@pytest.mark.parametrize("n,minutes", list(enumerate(BOUNDARIES, start=1)))
+def test_the_count_and_the_time_agree(n, minutes):
+    """The two definitions of the schedule must not drift apart: the instant
+    next_retry_time returns for retry n is exactly the age at which retries_due
+    starts answering n."""
+    created = NOW - timedelta(days=30)
+    due = policy.next_retry_time(created, 5, n, 365)
+    assert policy.retries_due((due - created).total_seconds() / 60.0, 5) == n
+
+
+def test_next_retry_time_is_clamped_to_the_give_up_deadline():
+    """THE ONLY UPPER BOUND. Retry 12 would fall at 20475 minutes, four days past
+    a ten-day deadline -- and a row waiting that long sits at PRINT_READY, where
+    Poll cannot see it to fail it. Clamped, the last attempt lands ON the
+    deadline instead."""
+    created = NOW - timedelta(days=1)
+    deadline = created + timedelta(days=10)
+    assert 5 * (2 ** 12 - 1) > 10 * 24 * 60, "retry 12 is outside the window"
+    assert policy.next_retry_time(created, 5, 12, 10) == deadline
+    assert policy.next_retry_time(created, 5, 40, 10) == deadline
+
+
+def test_next_retry_time_survives_a_created_date_near_the_end_of_time():
+    """2**retry_number can overflow datetime for a creation date near year 9999.
+    The clamp is the answer anyway, so it is returned rather than raised."""
+    created = datetime(9999, 1, 1, tzinfo=timezone.utc)
+    assert policy.next_retry_time(created, 1440, 60, 1) == created + timedelta(days=1)
+
+
+def test_next_retry_time_without_a_creation_time_is_unknowable():
+    assert policy.next_retry_time(None, 5, 3, 10) is None
+
+
+# --- is_due -------------------------------------------------------------------
+
+
+def test_a_blank_schedule_means_due_now():
+    """Files arrive from upstream with no Print_Time, and a human resetting a
+    terminal row leaves none either. Fail-closed would strand both."""
+    assert policy.is_due(None, NOW) is True
+
+
+def test_a_past_schedule_is_due_and_a_future_one_is_not():
+    assert policy.is_due(NOW - timedelta(seconds=1), NOW) is True
+    assert policy.is_due(NOW, NOW) is True, "the boundary is inclusive"
+    assert policy.is_due(NOW + timedelta(seconds=1), NOW) is False
+
+
+def test_a_stalled_job_is_requeued_at_once_and_the_backoff_becomes_a_due_time():
+    """THE BACKOFF, RELOCATED. Two retries are already spent (the attempt began at
+    27 minutes) and the third is not due until 35. This case used to answer
+    POLL_NONE at 32 minutes: the row waited at PRINT_PENDING while Poll declined it
+    on every run, and the backoff was a comparison nobody could see.
+
+    Now the row leaves PRINT_PENDING immediately and carries the wait with it, as
+    the retry-3 due time the caller writes into Print_Time. The schedule is
+    unchanged -- the third attempt still happens at 35 minutes -- but it is
+    written down, and Submit is what honours it.
+    """
+    created = NOW - timedelta(minutes=32)
+    action, attempt = decide(file_age_minutes=32, job_age_minutes=5,
+                             spent_at_minutes=27)
+    assert action == policy.POLL_REQUEUE
+    assert attempt == 3, "the retry being SCHEDULED, not the one already spent"
+    assert policy.next_retry_time(created, 5, attempt, 10) == created + timedelta(
+        minutes=35), "still the 35-minute boundary, three minutes from now"
+
+    # Eight minutes later the same file is past that boundary, so the identical
+    # decision now yields a due time in the past -- print immediately.
     action, attempt = decide(file_age_minutes=40, job_age_minutes=13,
                              spent_at_minutes=27)
     assert action == policy.POLL_REQUEUE
@@ -263,12 +337,18 @@ def test_a_job_whose_age_is_unknown_is_not_stalled():
 # --- the grace period and giving up -------------------------------------------
 
 
-def test_spent_retries_stop_the_requeue_without_failing_the_row():
-    """THE GRACE PERIOD: no more work, but the row stays PRINT_PENDING so its
-    last job can still print and be recorded."""
-    action, _ = decide(file_age_minutes=6000, job_age_minutes=600,
-                       spent_at_minutes=6000, max_retries=2)
-    assert action == policy.POLL_NONE
+def test_work_continues_right_up_to_the_give_up_deadline():
+    """THE GRACE PERIOD IS GONE, deliberately. `maxRetries` used to stop new jobs
+    at about 3d 13h and leave the last one live until day 10. With one bound left,
+    a stalled row deep in the schedule is still requeued -- and the clamp is what
+    keeps that from scheduling anything past the deadline."""
+    action, attempt = decide(file_age_minutes=6000, job_age_minutes=600,
+                             spent_at_minutes=6000)
+    assert action == policy.POLL_REQUEUE
+
+    created = NOW - timedelta(minutes=6000)
+    assert policy.next_retry_time(created, 5, attempt, 10) <= created + timedelta(
+        days=10), "never scheduled past the moment the row will be failed"
 
 
 def test_past_the_give_up_threshold_the_row_is_failed():
@@ -291,7 +371,7 @@ def test_a_row_with_no_creation_time_is_left_alone():
     action, _ = policy.poll_decision(
         "stopped", file_created=None, has_job=True,
         job_created=NOW - timedelta(minutes=600), attempt_started=None, now=NOW,
-        stall_minutes=5, give_up_days=10, max_retries=10)
+        stall_minutes=5, give_up_days=10)
     assert action == policy.POLL_NONE
 
 
@@ -341,6 +421,79 @@ def test_the_give_up_message_says_how_many_attempts_and_how_long():
     has to be worth reading."""
     message = policy.give_up_message(9, 10)
     assert "9" in message and "10" in message
+
+
+# --- Print_Time on the wire ---------------------------------------------------
+
+
+def test_the_due_time_is_written_in_business_local_time():
+    """The column exists to be read by a person in SharePoint, so it is rendered
+    where they live. August in Vancouver is PDT, UTC-7."""
+    assert policy.format_business_datetime(NOW) == "2026-08-30T14:00:00-07:00"
+
+
+def test_the_due_time_always_carries_its_offset():
+    """THE BUG GUARD. This value is read back and compared, unlike the printed-on
+    message, and parse_graph_datetime assumes a naive string is UTC -- so dropping
+    the offset would misread every due time by seven or eight hours."""
+    for when in (NOW, datetime(2026, 1, 15, 20, 0, tzinfo=UTC)):
+        rendered = policy.format_business_datetime(when)
+        assert rendered.endswith(("-07:00", "-08:00")), rendered
+
+
+@pytest.mark.parametrize("when", [
+    datetime(2026, 1, 15, 20, 0, tzinfo=UTC),   # PST, UTC-8
+    datetime(2026, 7, 15, 20, 0, tzinfo=UTC),   # PDT, UTC-7
+])
+def test_the_due_time_round_trips_to_the_same_instant(when):
+    """Written locally, read back as UTC, unchanged -- on both sides of the
+    daylight-saving switch, where a naive value would be wrong by an amount that
+    itself changes with the season."""
+    assert policy.parse_graph_datetime(
+        policy.format_business_datetime(when)) == when
+
+
+@pytest.mark.parametrize("tz,offset", [
+    ("Asia/Kolkata", "+05:30"),
+    ("Asia/Kathmandu", "+05:45"),
+    ("Pacific/Chatham", "+12:45"),
+])
+def test_a_fractional_hour_offset_survives_the_round_trip(tz, offset):
+    """Not every zone is a whole number of hours from UTC, and the obvious
+    "simplification" -- strftime("%z") -- emits +0530 without the colon. This pins
+    the ISO form, which is what parse_graph_datetime and Graph both expect."""
+    when = datetime(2026, 7, 15, 20, 0, tzinfo=UTC)
+    rendered = policy.format_business_datetime(when, tz_name=tz)
+
+    assert rendered.endswith(offset), rendered
+    assert policy.parse_graph_datetime(rendered) == when
+
+
+def test_a_due_time_is_truncated_to_whole_seconds_and_never_rounded_up():
+    """SharePoint's createdDateTime carries milliseconds, so a computed due time
+    does too, and the column is written to second precision. Truncating makes a
+    file due a fraction of a second EARLY; rounding up would make it late, and a
+    schedule that drifts later on every hop would compound."""
+    created = policy.parse_graph_datetime("2026-09-02T14:23:23.456Z")
+    due = policy.next_retry_time(created, 5, 3, 10)
+
+    written_back = policy.parse_graph_datetime(
+        policy.format_business_datetime(due))
+
+    assert written_back <= due
+    assert due - written_back < timedelta(seconds=1)
+
+
+def test_an_unknown_due_time_is_written_as_empty():
+    """Which is what clears the column, and what is_due reads as 'print now'."""
+    assert policy.format_business_datetime(None) == ""
+
+
+def test_the_due_time_falls_back_to_utc_without_a_time_zone_database():
+    """tzdata is a hard requirement, but a reporting time zone must never be able
+    to fail a print run -- and the offset survives even in the fallback."""
+    rendered = policy.format_business_datetime(NOW, tz_name="Mars/Olympus_Mons")
+    assert rendered == "2026-08-30T21:00:00+00:00"
 
 
 # --- the printed-on message ---------------------------------------------------
@@ -481,25 +634,9 @@ def test_batch_size_non_integer_in_a_request_raises(bad):
         policy.resolve_batch_size(bad)
 
 
-def test_batch_size_env_override(monkeypatch):
-    monkeypatch.setenv("PRINT_BATCH_SIZE", "9")
-    assert policy.resolve_batch_size() == 9
-    # An explicit request still wins over the environment.
-    assert policy.resolve_batch_size(3) == 3
-
-
-@pytest.mark.parametrize("bad", ["0", "99", "not-a-number"])
-def test_batch_size_bad_env_falls_back_instead_of_failing(monkeypatch, bad):
-    """Server misconfiguration must not take every request down with it -- the
-    opposite of how a bad REQUEST value is treated."""
-    monkeypatch.setenv("PRINT_BATCH_SIZE", bad)
-    assert policy.resolve_batch_size() == policy.DEFAULT_BATCH_SIZE
-
-
 def test_the_retry_knob_defaults():
     assert policy.resolve_give_up_days() == 10
     assert policy.resolve_stall_minutes() == 5
-    assert policy.resolve_max_retries() == 10
 
 
 @pytest.mark.parametrize("resolver,bad", [
@@ -507,8 +644,6 @@ def test_the_retry_knob_defaults():
     (policy.resolve_give_up_days, 400),
     (policy.resolve_stall_minutes, 0),
     (policy.resolve_stall_minutes, 2000),
-    (policy.resolve_max_retries, 0),
-    (policy.resolve_max_retries, 99),
 ])
 def test_retry_knob_range_validation(resolver, bad):
     """An out-of-range REQUEST value raises, which function_app._tunable turns
@@ -517,29 +652,25 @@ def test_retry_knob_range_validation(resolver, bad):
         resolver(bad)
 
 
-@pytest.mark.parametrize("resolver,env", [
-    (policy.resolve_give_up_days, "PRINT_GIVE_UP_DAYS"),
-    (policy.resolve_stall_minutes, "PRINT_STALL_MINUTES"),
-    (policy.resolve_max_retries, "PRINT_MAX_RETRIES"),
+@pytest.mark.parametrize("resolver,env,default", [
+    (policy.resolve_batch_size, "PRINT_BATCH_SIZE", policy.DEFAULT_BATCH_SIZE),
+    (policy.resolve_give_up_days, "PRINT_GIVE_UP_DAYS", policy.DEFAULT_GIVE_UP_DAYS),
+    (policy.resolve_stall_minutes, "PRINT_STALL_MINUTES",
+     policy.DEFAULT_STALL_MINUTES),
 ])
-def test_a_request_value_beats_the_app_setting(monkeypatch, resolver, env):
-    """The ordering that lets Power Automate retune the schedule with no deploy:
-    request first, then the app setting, then the built-in default."""
+def test_an_app_setting_no_longer_influences_a_tunable(monkeypatch, resolver, env,
+                                                       default):
+    """THE FALLBACK IS GONE, AND THIS IS WHAT PROVES IT. Each of these resolved
+    request > app setting > default, which split the answer to 'why is the pacing
+    wrong?' across two places with the flow silently winning -- so a setting could
+    be read, believed, and be doing nothing.
+
+    A leftover value in the environment must now change nothing at all. That
+    matters most during the deploy, when the settings still exist on the Function
+    App and are only deleted once the flows are confirmed green."""
     monkeypatch.setenv(env, "7")
-    assert resolver() == 7, "the app setting is the fallback"
-    assert resolver(3) == 3, "the request body wins"
-
-
-@pytest.mark.parametrize("resolver,env", [
-    (policy.resolve_give_up_days, "PRINT_GIVE_UP_DAYS"),
-    (policy.resolve_stall_minutes, "PRINT_STALL_MINUTES"),
-    (policy.resolve_max_retries, "PRINT_MAX_RETRIES"),
-])
-def test_a_bad_app_setting_falls_back_instead_of_failing(monkeypatch, resolver, env):
-    """Server misconfiguration must not take every request down with it -- the
-    opposite of how a bad REQUEST value is treated."""
-    monkeypatch.setenv(env, "not-a-number")
-    assert resolver() > 0
+    assert resolver() == default, "the environment is not consulted"
+    assert resolver(3) == 3, "the request body still decides"
 
 
 def test_budget_default_undercuts_the_connector_timeout():
@@ -626,7 +757,11 @@ def test_column_names_match_the_requirement():
     assert policy.COLUMN_JOB_ID == "Print_JobId"
     assert policy.COLUMN_MESSAGE == "Print_Message"
     assert policy.COLUMN_PRINTER == "Printer_Name"
-    assert len(policy.COLUMN_DISPLAY_NAMES) == 4
+    # The fifth: when the next attempt falls due. Every one of these names is a
+    # column somebody has to create in SharePoint by hand, so the count is pinned
+    # -- adding one is a deployment step, not just a code change.
+    assert policy.COLUMN_PRINT_TIME == "Print_Time"
+    assert len(policy.COLUMN_DISPLAY_NAMES) == 5
 
 
 def test_print_failed_is_terminal():

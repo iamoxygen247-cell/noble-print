@@ -11,15 +11,16 @@ and nothing else in the suite would notice if it were reversed.
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 import pytest
 
 import print_policy
 import universal_print
-from helpers import (POLL, SUBMIT, as_json, post, print_events, result_for,
-                     run_summaries)
+from helpers import (NOW, POLL, SITE, SUBMIT, as_json, iso, post, print_events,
+                     result_for, run_summaries)
 
-BODY = {"library": "Documents", "folder": "/Invoices/ToPrint",
+BODY = {**SITE, "library": "Documents", "folder": "/Invoices/ToPrint",
         "printerShareId": "share-guid"}
 
 
@@ -112,7 +113,7 @@ def test_a_completion_replaces_the_retry_history(graph):
     assert "Retry job" in graph.field("1", "Print_Message")
 
     graph.add_job(graph.field("1", "Print_JobId"), state="completed")
-    post(POLL, {"library": "Documents", "folder": "/Invoices/ToPrint"})
+    post(POLL, {**SITE, "library": "Documents", "folder": "/Invoices/ToPrint"})
 
     assert graph.field("1", "Print_Message").startswith("printed on ")
     assert "Retry job" not in graph.field("1", "Print_Message")
@@ -152,6 +153,95 @@ def test_only_files_in_the_requested_folder(graph):
     payload = as_json(post(SUBMIT, body()))
 
     assert [i["itemId"] for i in payload["items"]] == ["in"]
+
+
+# --- Print_Time: only print what is due ---------------------------------------
+
+
+def test_a_file_whose_due_time_has_not_arrived_is_left_alone(graph, frozen_now):
+    """The waiting half of the retry schedule. Poll writes the due time; this is
+    where it is honoured."""
+    graph.add_item("1", print_time=iso(minutes=-30))   # thirty minutes from now
+
+    payload = as_json(post(SUBMIT, body()))
+
+    assert payload["submitted"] == 0
+    assert payload["candidatesFound"] == 0
+    assert payload["notYetDue"] == 1
+    assert graph.status_of("1") == print_policy.READY, "not claimed"
+    assert not graph.created_jobs()
+
+
+@pytest.mark.parametrize("print_time,why", [
+    ("", "blank -- an upstream file, or a row a human just reset"),
+    ("   ", "whitespace"),
+    ("not a date", "unparseable"),
+    (None, "the column absent altogether"),
+])
+def test_a_file_with_no_readable_due_time_prints_now(graph, frozen_now,
+                                                     print_time, why):
+    """FAIL-OPEN, and the whole queue depends on it. Files arrive from a process
+    that knows nothing about Print_Time, and PRINT_FAILED is terminal with 'a human
+    resets the row' as the documented recovery. Reading a missing schedule as 'not
+    yet' would strand both, silently."""
+    graph.add_item("1")
+    if print_time is None:
+        del graph.items["1"]["fields"][graph.columns["Print_Time"]]
+    else:
+        graph.items["1"]["fields"][graph.columns["Print_Time"]] = print_time
+
+    payload = as_json(post(SUBMIT, body()))
+
+    assert payload["submitted"] == 1, why
+    assert payload["notYetDue"] == 0
+
+
+def test_a_due_time_that_has_passed_prints(graph, frozen_now):
+    graph.add_item("1", print_time=iso(minutes=1))
+
+    assert as_json(post(SUBMIT, body()))["submitted"] == 1
+
+
+def test_a_file_not_yet_due_does_not_consume_a_batch_slot(graph, frozen_now):
+    """THE ORDERING TRAP. select_oldest sorts by creation time, and a file that has
+    been requeued several times is the OLDEST in the queue -- so it sorts to the
+    front and is also the one most likely to be waiting. Filter after the batch is
+    taken and five waiting files fill every slot while printable ones sit behind
+    them, doing no work at all."""
+    graph.add_item("waiting", created="2026-08-01T10:00:00Z",
+                   print_time=iso(minutes=-30))
+    for i in range(5):
+        graph.add_item(str(i), created="2026-08-1{}T10:00:00Z".format(i))
+
+    payload = as_json(post(SUBMIT, body()))
+
+    assert payload["submitted"] == 5
+    assert [i["itemId"] for i in payload["items"]] == ["0", "1", "2", "3", "4"]
+    assert graph.status_of("waiting") == print_policy.READY
+
+
+def test_a_file_not_yet_due_is_not_counted_as_remaining(graph, frozen_now):
+    """Flow A runs `Do Until remainingReady = 0`. A file waiting on a future due
+    time can never be submitted this cycle, so counting it here would spin the loop
+    to its iteration cap on every recurrence -- the same failure an offline printer
+    used to cause."""
+    graph.add_item("waiting", print_time=iso(minutes=-30))
+
+    payload = as_json(post(SUBMIT, body()))
+
+    assert payload["remainingReady"] == 0, "nothing is submittable this cycle"
+    assert payload["notYetDue"] == 1, "...but the flow can still see why"
+
+
+def test_the_claim_clears_the_due_time(graph, frozen_now):
+    """Print_Time is only ever set on a PRINT_READY row (design §5.4). Left behind,
+    it would survive into a terminal row and silently suppress a human's reset."""
+    graph.add_item("1", print_time=iso(minutes=1))
+
+    post(SUBMIT, body())
+
+    assert graph.status_of("1") == print_policy.PENDING
+    assert not graph.field("1", "Print_Time")
 
 
 def test_batch_size_defaults_to_five(graph):
@@ -222,6 +312,29 @@ def test_a_lost_claim_is_skipped_and_no_job_is_created(graph):
         "a file we did not claim must never reach the printer"
 
 
+def test_a_missing_site_is_a_400_and_touches_nothing(graph):
+    """The site moved out of app settings and into the request. A caller who omits
+    it is told so -- and, like every other 400, is told before a single row is
+    claimed, so their corrected retry does not find the files already taken."""
+    graph.add_item("1")
+
+    for missing in ("sharepointHostname", "sharepointSitePath"):
+        payload = {k: v for k, v in BODY.items() if k != missing}
+        response = post(SUBMIT, payload)
+
+        assert response.status_code == 400, missing
+        assert missing in as_json(response)["error"]
+
+    assert graph.status_of("1") == print_policy.READY
+    assert not [c for c in graph.calls if c.method == "PATCH"]
+
+
+def test_an_empty_site_path_means_the_root_site(graph):
+    graph.add_item("1")
+
+    assert as_json(post(SUBMIT, body(sharepointSitePath="")))["submitted"] == 1
+
+
 # --- failure handling ---------------------------------------------------------
 
 
@@ -245,6 +358,25 @@ def test_a_failure_at_any_stage_lands_print_failed(graph, method, fragment, stag
     message = graph.field("1", "Print_Message")
     assert message, "a PRINT_FAILED row with an empty message is undiagnosable"
     assert message.startswith(stage + ":"), message
+
+
+def test_a_failed_submission_clears_the_due_time(graph, frozen_now):
+    """The write matrix's failure row, Print_Time column -- the one terminal write
+    that is Submit's rather than Poll's.
+
+    PRINT_FAILED is terminal and the documented recovery is that a human sets the
+    row back to PRINT_READY. A due time surviving that reset would make Submit
+    decline to print it, and the reset would appear to do nothing at all.
+    """
+    graph.add_item("1", print_time=iso(minutes=1))
+    graph.fail_next("POST", "/jobs", status=500, times=3)
+
+    payload = as_json(post(SUBMIT, body()))
+
+    assert payload["failed"] == 1
+    assert graph.field("1", "Print_Status") == print_policy.FAILED
+    assert not graph.field("1", "Print_Time"), \
+        "a terminal row must not carry a schedule a human's reset would inherit"
 
 
 def test_a_failed_upload_lands_print_failed(graph):
@@ -455,3 +587,45 @@ def test_the_created_job_body_carries_only_copies(graph):
     created = graph.created_jobs()
     assert len(created) == 1
     assert created[0].body == {"configuration": {"copies": 1}}
+
+
+def test_the_whole_backoff_cycle_across_both_endpoints(graph, monkeypatch):
+    """END TO END, and the reason the column exists.
+
+    Poll requeues a stalled job and records when the retry is due; Submit declines
+    the file until that moment, then prints it. Neither endpoint knows anything
+    about the other -- the SharePoint row carries the whole handover, which is what
+    makes the backoff something a person can read rather than infer.
+    """
+    clock = {"now": NOW}
+    monkeypatch.setattr(print_policy, "now_utc", lambda: clock["now"])
+
+    # A file 32 minutes old whose current attempt began at 27 minutes: two retries
+    # spent, the third due at 35 minutes.
+    graph.add_item("1", status=print_policy.PENDING, job_id="1825",
+                   printer=graph.SHARE_ID, created=iso(minutes=32),
+                   modified=iso(minutes=5))
+    graph.add_job("1825", state="stopped", created=iso(minutes=5))
+
+    assert as_json(post(POLL, {**SITE, "library": "Documents",
+                               "folder": "/Invoices/ToPrint"}))["requeued"] == 1
+    assert graph.status_of("1") == print_policy.READY
+    due = print_policy.parse_graph_datetime(graph.field("1", "Print_Time"))
+    assert due == NOW + timedelta(minutes=3)
+
+    # Submit, now: not due for another three minutes.
+    payload = as_json(post(SUBMIT, body()))
+    assert payload["submitted"] == 0
+    assert payload["notYetDue"] == 1
+    assert payload["remainingReady"] == 0, "the flow's Do-Until must be able to end"
+    assert graph.status_of("1") == print_policy.READY, "still not claimed"
+
+    # Three minutes later the boundary passes and the same call prints it.
+    clock["now"] = NOW + timedelta(minutes=3)
+
+    payload = as_json(post(SUBMIT, body()))
+    assert payload["submitted"] == 1
+    assert payload["notYetDue"] == 0
+    assert graph.status_of("1") == print_policy.PENDING
+    assert not graph.field("1", "Print_Time"), "the claim clears the schedule"
+    assert graph.field("1", "Print_JobId"), "a new job was created"

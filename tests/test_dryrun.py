@@ -20,11 +20,11 @@ Both exist because of specific failure modes that are otherwise invisible:
 from __future__ import annotations
 
 import print_policy
-from helpers import POLL, SUBMIT, as_json, iso, post
+from helpers import POLL, SITE, SUBMIT, as_json, iso, post
 
-SUBMIT_BODY = {"library": "Documents", "folder": "/Invoices/ToPrint",
+SUBMIT_BODY = {**SITE, "library": "Documents", "folder": "/Invoices/ToPrint",
                "printerShareId": "share-guid"}
-POLL_BODY = {"library": "Documents", "folder": "/Invoices/ToPrint"}
+POLL_BODY = {**SITE, "library": "Documents", "folder": "/Invoices/ToPrint"}
 
 
 # --- dry run ------------------------------------------------------------------
@@ -55,6 +55,7 @@ def test_dry_run_reports_the_resolved_internal_column_names(graph):
         "Print_JobId": "Print_x005f_JobId",
         "Print_Message": "Print_x005f_Message",
         "Printer_Name": "Printer_x005f_Name",
+        "Print_Time": "Print_x005f_Time",
     }
 
 

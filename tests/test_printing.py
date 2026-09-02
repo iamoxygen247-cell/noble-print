@@ -34,9 +34,9 @@ import printing
 import universal_print
 from printing import profiles
 from printing import pwg_converter
-from helpers import SUBMIT, as_json, post, result_for
+from helpers import SITE, SUBMIT, as_json, post, result_for
 
-BODY = {"library": "Documents", "folder": "/Invoices/ToPrint",
+BODY = {**SITE, "library": "Documents", "folder": "/Invoices/ToPrint",
         "printerShareId": "share-guid"}
 
 

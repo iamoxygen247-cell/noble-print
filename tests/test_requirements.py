@@ -25,11 +25,11 @@ import re
 import pytest
 
 import print_policy
-from helpers import POLL, SUBMIT, as_json, iso, post
+from helpers import POLL, SITE, SUBMIT, as_json, iso, post
 
-SUBMIT_BODY = {"library": "Documents", "folder": "/Invoices/ToPrint",
+SUBMIT_BODY = {**SITE, "library": "Documents", "folder": "/Invoices/ToPrint",
                "printerShareId": "share-guid"}
-POLL_BODY = {"library": "Documents", "folder": "/Invoices/ToPrint"}
+POLL_BODY = {**SITE, "library": "Documents", "folder": "/Invoices/ToPrint"}
 
 
 # =============================================================================
@@ -38,12 +38,19 @@ POLL_BODY = {"library": "Documents", "folder": "/Invoices/ToPrint"}
 # =============================================================================
 
 
-def test_R1_the_four_columns_are_the_ones_named():
+def test_R1_the_named_columns_plus_the_scheduling_one():
+    """The four the requirement names, and a fifth the retry schedule needed.
+
+    `Print_Time` is not in the original requirement: it was added when the backoff
+    moved out of Poll's head and into the library, so that a file waiting on a
+    retry says when the retry is coming. Every name here is a column somebody
+    creates in SharePoint by hand, so the tuple is pinned in full."""
     assert print_policy.COLUMN_DISPLAY_NAMES == (
-        "Print_Status", "Print_JobId", "Print_Message", "Printer_Name")
+        "Print_Status", "Print_JobId", "Print_Message", "Printer_Name",
+        "Print_Time")
 
 
-def test_R1_the_app_reads_and_writes_only_those_four(graph):
+def test_R1_the_app_reads_and_writes_only_those_columns(graph):
     """Nothing else in the library is touched."""
     graph.add_item("1")
     post(SUBMIT, SUBMIT_BODY)
@@ -53,7 +60,7 @@ def test_R1_the_app_reads_and_writes_only_those_four(graph):
         written.update(call.body or {})
 
     allowed = {graph.columns[name] for name in print_policy.COLUMN_DISPLAY_NAMES}
-    assert written <= allowed, "wrote outside the four columns: {}".format(
+    assert written <= allowed, "wrote outside the app's own columns: {}".format(
         written - allowed)
 
 
@@ -400,3 +407,77 @@ def test_PRINT_FAILED_is_terminal_now_that_Resubmit_is_gone(graph, frozen_now):
 
     assert payload["checked"] == 0, "Poll must not touch PRINT_FAILED"
     assert graph.status_of("1") == "PRINT_FAILED"
+
+
+# =============================================================================
+# "When a job is PRINT_PENDING and past the stall threshold, calculate the next
+#  retry attempt using the existing arithmetic and update Print_Time, so it is
+#  clear and visible when the next print will be retried. The status should
+#  still be changed to PRINT_READY."
+# =============================================================================
+
+
+def test_a_stalled_job_goes_back_to_ready_AND_records_when_it_will_retry(
+        graph, frozen_now):
+    """Both halves of the clause. The status change is the old behaviour; the due
+    time is what makes the wait legible to someone looking at the library."""
+    graph.add_item("1", status="PRINT_PENDING", job_id="1825",
+                   printer=graph.SHARE_ID, created=iso(minutes=32),
+                   modified=iso(minutes=5))
+    graph.add_job("1825", state="stopped", created=iso(minutes=5))
+
+    payload = as_json(post(POLL, POLL_BODY))
+
+    assert payload["requeued"] == 1
+    assert graph.status_of("1") == "PRINT_READY"
+
+    due = print_policy.parse_graph_datetime(graph.field("1", "Print_Time"))
+    assert due is not None, "the retry time must be recorded, not just implied"
+    # "the existing arithmetic": retry three of stallMinutes * (2**n - 1),
+    # counted from the file's creation, exactly as the schedule always was.
+    assert due == print_policy.next_retry_time(
+        print_policy.parse_graph_datetime(graph.items["1"]["createdDateTime"]),
+        5, 3, 10)
+
+
+def test_the_recorded_retry_time_is_readable_local_time(graph, frozen_now):
+    """"Clear and visible" is the point of the column, so it is written where the
+    people reading it live -- with the offset, so it still round-trips exactly."""
+    graph.add_item("1", status="PRINT_PENDING", job_id="1825",
+                   printer=graph.SHARE_ID, created=iso(minutes=40),
+                   modified=iso(minutes=13))
+    graph.add_job("1825", state="stopped", created=iso(minutes=13))
+
+    post(POLL, POLL_BODY)
+
+    written = graph.field("1", "Print_Time")
+    assert written.endswith(("-07:00", "-08:00")), written
+    assert print_policy.parse_graph_datetime(written) is not None
+
+
+# =============================================================================
+# "When retrieving SharePoint file properties where Print_Status = PRINT_READY
+#  and Print_Time <= Now -- so it only processes files that should be printed."
+# =============================================================================
+
+
+def test_submit_processes_only_files_whose_retry_time_has_arrived(graph, frozen_now):
+    """The queue is filtered on BOTH conditions. A file whose retry is still in the
+    future is left alone; one whose time has come is printed."""
+    graph.add_item("due", print_time=iso(minutes=1))
+    graph.add_item("waiting", print_time=iso(minutes=-30))
+
+    payload = as_json(post(SUBMIT, SUBMIT_BODY))
+
+    assert [i["itemId"] for i in payload["items"]] == ["due"]
+    assert graph.status_of("waiting") == "PRINT_READY"
+    assert payload["notYetDue"] == 1
+
+
+def test_a_file_with_no_retry_time_is_treated_as_ready_to_print(graph, frozen_now):
+    """The upstream process sets PRINT_READY and knows nothing about Print_Time.
+    If a blank meant "not due", the pipeline would stop printing entirely on the
+    day this shipped."""
+    graph.add_item("1")
+
+    assert as_json(post(SUBMIT, SUBMIT_BODY))["submitted"] == 1

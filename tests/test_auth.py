@@ -22,7 +22,7 @@ import pytest
 
 import function_app
 import graph_auth
-from helpers import SUBMIT, as_json, post
+from helpers import SITE, SUBMIT, as_json, post
 
 
 @pytest.fixture(autouse=True)
@@ -216,7 +216,7 @@ def test_the_endpoint_surfaces_the_remedy(graph, monkeypatch):
 
     monkeypatch.setattr(graph_auth, "get_access_token", boom)
 
-    response = post(SUBMIT, {"library": "Documents", "folder": "/x",
+    response = post(SUBMIT, {**SITE, "library": "Documents", "folder": "/x",
                              "printerShareId": "share-guid"})
     payload = as_json(response)
 

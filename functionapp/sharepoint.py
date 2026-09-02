@@ -1,6 +1,6 @@
 """
 sharepoint.py — SharePoint adapter: find the library, read the queue, write the
-four columns, fetch the bytes.
+five columns, fetch the bytes.
 
 Knows Graph's site/list/driveItem URL shapes. Knows NOTHING about what a print
 status means -- every status string arrives as an argument. That is what lets a
@@ -99,6 +99,10 @@ class PrintFile:
     job_id: str
     printer: str
     message: str
+    # When the next print attempt falls due, or None when the column is blank.
+    # None is the ordinary case, not an error: files arrive from upstream without
+    # it, and print_policy.is_due reads a missing schedule as "due now".
+    print_time: Optional[datetime] = None
     fields: Dict[str, Any] = dataclass_field(default_factory=dict)
 
     @property
@@ -195,6 +199,11 @@ def _to_print_file(context: ListContext, item: Dict[str, Any]) -> PrintFile:
         job_id=(fields.get(context.internal(print_policy.COLUMN_JOB_ID)) or "").strip(),
         printer=(fields.get(context.internal(print_policy.COLUMN_PRINTER)) or "").strip(),
         message=(fields.get(context.internal(print_policy.COLUMN_MESSAGE)) or "").strip(),
+        # Parsed rather than stripped: it is a moment, and every blank shape the
+        # column can hold -- absent, null, "", whitespace, unparseable -- collapses
+        # to None here, which is exactly what "no schedule, print it now" needs.
+        print_time=print_policy.parse_graph_datetime(
+            fields.get(context.internal(print_policy.COLUMN_PRINT_TIME))),
         fields=fields,
     )
 

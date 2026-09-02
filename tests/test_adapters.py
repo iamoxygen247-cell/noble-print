@@ -16,6 +16,7 @@ would reintroduce silently.
 from __future__ import annotations
 
 import urllib.parse
+from datetime import datetime, timezone
 
 import pytest
 
@@ -139,9 +140,10 @@ def test_item_folder_falls_back_to_web_url_when_file_dir_ref_is_absent(
     assert print_policy.folder_matches(row.folder, "/Backup/Invoice")
 
 
-def test_query_maps_all_four_columns_onto_the_row(client, graph, context):
+def test_query_maps_all_five_columns_onto_the_row(client, graph, context):
     graph.add_item("1", status="PRINT_PENDING", job_id="1825",
-                   printer="share-guid", message="hello", name="bill.pdf")
+                   printer="share-guid", message="hello", name="bill.pdf",
+                   print_time="2026-08-30T14:00:00-07:00")
 
     row = sharepoint.query_by_status(client, context, "PRINT_PENDING")[0]
 
@@ -150,6 +152,21 @@ def test_query_maps_all_four_columns_onto_the_row(client, graph, context):
     assert row.file_name == "bill.pdf"
     assert row.etag == graph.items["1"]["eTag"]
     assert row.created is not None
+    # Parsed to an instant, and NORMALISED TO UTC. The column is written in the
+    # business zone for whoever reads it in SharePoint; every comparison the app
+    # makes is UTC, and this is the seam where the one becomes the other.
+    assert row.print_time == datetime(2026, 8, 30, 21, 0, tzinfo=timezone.utc)
+
+
+def test_a_blank_due_time_becomes_none_rather_than_a_string(client, graph, context):
+    """Which is what print_policy.is_due reads as "print it now". Every blank shape
+    the column can hold has to arrive the same way, or Submit would compare a
+    string to a datetime and raise on an ordinary row."""
+    graph.add_item("1", status="PRINT_READY")
+
+    row = sharepoint.query_by_status(client, context, "PRINT_READY")[0]
+
+    assert row.print_time is None
 
 
 # --- the claim ----------------------------------------------------------------
@@ -164,6 +181,34 @@ def test_patch_translates_display_names_to_internal_names(client, graph, context
     body = graph.calls_to("/items/1/fields", method="PATCH")[0].body
     assert body == {"Print_x005f_Status": "PRINT_PENDING"}
     assert graph.status_of("1") == "PRINT_PENDING"
+
+
+def test_patch_writes_the_due_time_under_its_encoded_internal_name(
+        client, graph, context):
+    """Print_Time is resolved like every other column, never hardcoded. The fake
+    defaults to the encoded form, so this is also the test that nobody wrote
+    "Print_Time" into a Graph call and got away with it locally."""
+    graph.add_item("1")
+
+    sharepoint.patch_fields(client, context, "1",
+                            {print_policy.COLUMN_PRINT_TIME: "2026-09-02T07:00:00-07:00"})
+
+    body = graph.calls_to("/items/1/fields", method="PATCH")[0].body
+    assert body == {"Print_x005f_Time": "2026-09-02T07:00:00-07:00"}
+
+
+def test_patch_clears_the_due_time_with_null_not_an_empty_string(
+        client, graph, context):
+    """A SharePoint Date and Time column will not accept "". None becomes JSON
+    null, which is what actually empties it."""
+    graph.add_item("1", print_time="2026-09-02T07:00:00-07:00")
+
+    sharepoint.patch_fields(client, context, "1",
+                            {print_policy.COLUMN_PRINT_TIME: None})
+
+    body = graph.calls_to("/items/1/fields", method="PATCH")[0].body
+    assert body == {"Print_x005f_Time": None}
+    assert not graph.field("1", "Print_Time")
 
 
 def test_patch_with_a_matching_etag_succeeds(client, graph, context):

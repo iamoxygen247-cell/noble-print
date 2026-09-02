@@ -28,7 +28,7 @@ import pytest
 import graph_auth
 import print_policy
 import universal_print
-from helpers import HEALTH, SUBMIT, as_json, post, print_events, run_summaries
+from helpers import HEALTH, SITE, SUBMIT, as_json, post, print_events, run_summaries
 
 PDF = "application/pdf"
 PWG = "image/pwg-raster"
@@ -500,7 +500,7 @@ def test_health_emits_no_print_event(graph, caplog):  # C15
 # it predicts what Submit does; two endpoints describing one printer differently
 # is the failure mode, not a cosmetic inconsistency.
 
-SUBMIT_BODY = {"library": "Documents", "folder": "/Invoices/ToPrint",
+SUBMIT_BODY = {**SITE, "library": "Documents", "folder": "/Invoices/ToPrint",
                "printerShareId": "share-guid", "dryRun": True}
 
 
@@ -538,7 +538,7 @@ def test_a_stale_share_id_on_submit_names_the_remedy(graph):  # S1
     allow_status=(404,) and returns None, so a stale share there is `not_found`,
     never a 500.
     """
-    response = post(SUBMIT, {"library": "Documents", "folder": "",
+    response = post(SUBMIT, {**SITE, "library": "Documents", "folder": "",
                              "printerShareId": "no-such-share"})
 
     assert response.status_code == 500
@@ -623,3 +623,18 @@ def test_a_job_configuration_that_cannot_be_built_is_reported(graph, monkeypatch
     finding = [e for e in payload["errors"]
                if e["code"] == print_policy.HEALTH_JOB_CONFIGURATION_FAILED][0]
     assert "mediaSize" in finding["message"]
+
+
+def test_health_needs_no_site_and_no_library(graph):
+    """Health reads one printer share and resolves no SharePoint list, so the site
+    parameters Submit and Poll now require do not apply to it.
+
+    That is what makes it the signal during the cutover: between the deploy and the
+    flows being updated, Submit and Poll answer 400 for a missing site while Health
+    keeps answering truthfully about the printer.
+    """
+    response = post(HEALTH, {"printerShareId": graph.SHARE_ID})
+
+    assert response.status_code == 200
+    assert as_json(response)["healthy"] is True
+    assert not graph.calls_to("/lists/"), "Health must not resolve a library"

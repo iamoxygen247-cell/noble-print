@@ -2,7 +2,7 @@
 
 Azure Function App that prints SharePoint documents through Microsoft Universal
 Print, driven by Power Automate. The SharePoint library is both the work queue
-and the audit trail: four columns on each file carry its state.
+and the audit trail: five columns on each file carry its state.
 
 Full design: **[docs/design.md](docs/design.md)**. Inherited engineering rules:
 [docs/ai/project-playbook.md](docs/ai/project-playbook.md).
@@ -44,21 +44,24 @@ Then in a **second** PowerShell window:
 ```powershell
 cd "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"
 
-# 5. Dry run -- resolves the site, library, the four INTERNAL column names and
+# 5. Dry run -- resolves the site, library, the five INTERNAL column names and
 #    the printer's real capabilities. Claims nothing, prints nothing.
 .\.venv\Scripts\python.exe scripts\test.py dryrun `
+    --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "Documents" --folder "/Invoices/ToPrint" `
     --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
 
 # 6. One real file, then mark it complete once the page is out.
 .\.venv\Scripts\python.exe scripts\test.py submit `
+    --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "Documents" --folder "/Invoices/ToPrint" `
     --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5" --batch-size 1
 .\.venv\Scripts\python.exe scripts\test.py status `
+    --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "Documents" --folder "/Invoices/ToPrint"
 ```
 
-**Then open the library and read the four columns.** A 200 response is not proof
+**Then open the library and read the five columns.** A 200 response is not proof
 the write landed.
 
 ## The three endpoints
@@ -66,16 +69,26 @@ the write landed.
 | Name | Route | What it does |
 |---|---|---|
 | **Health** | `POST /api/print/health` | Can the pipeline work right now? One share read, **no writes**. Called before the other two |
-| **Submit** | `POST /api/print/submit` | Claims the oldest `PRINT_READY` files and creates print jobs |
+| **Submit** | `POST /api/print/submit` | Claims the oldest `PRINT_READY` files **that are due** and creates print jobs |
 | **Poll** | `POST /api/print/status` | Checks `PRINT_PENDING` jobs: marks the finished, requeues the stalled, fails the hopeless |
 
+Submit and Poll both require the site in the request body —
+`sharepointHostname` and `sharepointSitePath`, alongside `library` and `folder`.
+These were app settings until 2026-09-02; one Function App now serves any site a
+flow names. Health takes neither, because it resolves no library.
+
 Poll owns recovery. A stalled job is cancelled and the file handed back to
-`PRINT_READY` on an exponential schedule — retry *n* becomes due at
-`5 × (2ⁿ − 1)` minutes from the file's creation, so 5, 15, 35, 75 … — up to 10
-retries, then `PRINT_FAILED` after 10 days. Poll runs every 10 minutes, so the
-first requeue is observed at ≈10 min rather than ≈5. The pacing lives
-in the Power Automate request body (`stallMinutes`, `maxRetries`, `giveUpDays`),
-so it is retuned without a deploy.
+`PRINT_READY` with **`Print_Time`** set to the moment the next attempt is due —
+retry *n* falls due at `5 × (2ⁿ − 1)` minutes from the file's creation, so
+5, 15, 35, 75 … — and Submit will not claim it before then. `giveUpDays` (10) is
+the only bound: the schedule is clamped to it, and past it the row is cancelled
+and written `PRINT_FAILED`. The pacing lives in the Power Automate request body
+(`stallMinutes`, `giveUpDays`) and nowhere else, so it is retuned without a deploy.
+
+> **Reading a live run:** the *waiting* is exact, but the front of the ladder is
+> skipped, and it is **Flow A's** recurrence that decides how much — `spent` is
+> read off the file's age when its *first* job is created. Flow A every 15 min
+> opens the schedule at retry 3. Flow B's cadence no longer costs a retry at all.
 
 > **`POST /api/print/resubmit` is gone.** It ran daily and would not touch a file
 > until it was 72 hours old; it was retired on 2026-09-01 and its recovery work
@@ -90,8 +103,16 @@ so it is retuned without a deploy.
 | `Print_JobId` | The Universal Print job id. Only meaningful together with `Printer_Name` — job ids are per-printer, not globally unique |
 | `Printer_Name` | The printer **share id** the job was sent to |
 | `Print_Message` | `printed on YYYY-MM-DD HH:MM:SS` on success, or the failure reason, tagged with the stage that failed |
+| `Print_Time` | **When the next print attempt falls due.** Set only on a `PRINT_READY` row, and cleared everywhere else. A **Date and Time** column; it needs no index |
 
 `PRINT_READY` is set by an upstream process. This app never creates work.
+
+**`Print_Time` is the retry backoff, written down.** When Poll finds a stalled job
+it cancels it, sets the row back to `PRINT_READY`, and records the moment the next
+attempt is due; Submit will not claim the file until then. A value in the past
+means "print now", and **an empty value means the same** — files arrive from
+upstream without one, and a row a human resets from `PRINT_FAILED` has none either,
+so a blank has to mean *go*, not *wait forever*.
 
 **`Print_Message` on success records the printer's own `acknowledgedDateTime` —
 when the printer took the job — not the instant the page finished.** `printJob`
@@ -123,8 +144,14 @@ Password *expiry* alone will not. When it breaks, every endpoint returns 500 wit
 
 ## Prerequisites
 
+- **The five columns must exist**, with those exact display names. `Print_Time` is
+  a **Date and Time** column (Include Time on, no default value); the other four
+  are single line of text. A missing one is a loud 500 from Submit and Poll naming
+  the column.
 - **`Print_Status` must be indexed in SharePoint.** A non-indexed column cannot be
   used in a Graph `$filter` at all, so without the index every query fails.
+  `Print_Time` must **not** need an index — SharePoint honours only one indexed
+  field per `$filter`, so the due-time comparison happens in Python instead.
 - Entra app registration with public client flows enabled, and admin consent for
   the delegated scopes `Sites.ReadWrite.All`, `PrintJob.ReadWriteBasic`,
   `PrintJob.Create`, `Printer.Read.All`, `PrinterShare.ReadBasic.All`,
@@ -144,6 +171,7 @@ Copy-Item functionapp\local.settings.json.template functionapp\local.settings.js
 # fill it in, then:
 .\scripts\start-local.ps1
 .\.venv\Scripts\python.exe scripts\test.py dryrun --library "Documents" `
+    --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --folder "/Invoices/ToPrint" `
     --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
 ```

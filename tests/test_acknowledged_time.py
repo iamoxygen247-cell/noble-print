@@ -32,9 +32,9 @@ from datetime import datetime, timedelta, timezone
 
 import print_policy
 import universal_print
-from helpers import NOW, POLL, as_json, iso, post
+from helpers import NOW, POLL, SITE, as_json, iso, post
 
-BODY = {"library": "Documents", "folder": "/Invoices/ToPrint"}
+BODY = {**SITE, "library": "Documents", "folder": "/Invoices/ToPrint"}
 
 # The real job 6, verbatim.
 ACK_ISO = "2026-08-31T05:25:03Z"

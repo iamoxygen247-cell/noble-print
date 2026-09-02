@@ -22,11 +22,15 @@ Note that dryrun is a MODE OF THE ENDPOINT, not logic in this file. A harness
 with its own code path proves nothing about the deployed app; going through the
 real endpoint exercises the real auth, resolution and queries.
 
-The retry knobs -- --stall-minutes, --give-up-days, --max-retries -- go into the
-request body exactly as Power Automate sends them, which is how the pacing is
-retuned without a deploy. Use them here to prove a change before putting it in a
-flow. The same is true of --batch-size, --print-format and, on `status`,
---printer-share-id.
+The retry knobs -- --stall-minutes and --give-up-days -- go into the request body
+exactly as Power Automate sends them, which is how the pacing is retuned without a
+deploy. Use them here to prove a change before putting it in a flow. The same is
+true of --batch-size, --print-format and, on `status`, --printer-share-id.
+
+--hostname and --site-path are REQUIRED for submit, dryrun and status: the site
+moved out of app settings and into the request, so this script has to name it the
+same way a flow does. `health` needs neither -- it reads a printer share and no
+SharePoint list at all.
 
     # upload a raster instead of the PDF, without touching the printer's config
     ... submit --printer-share-id <guid> --print-format image/pwg-raster
@@ -150,9 +154,14 @@ def summarise(command: str, status: int, payload: dict) -> None:
                         ", ".join("{}={}".format(k, v) for k, v in sorted(job.items())
                                   if not isinstance(v, dict))))
 
-        print("candidates   : {}".format(payload.get("candidatesFound")))
+        # Two different empties: nothing to print, and nothing DUE to print. A dry
+        # run that reported only the first would look identical for a queue full of
+        # files waiting out their retry backoff.
+        print("candidates   : {} due, {} not yet due".format(
+            payload.get("candidatesFound"), payload.get("notYetDue")))
         for item in payload.get("wouldSubmit") or []:
-            print("    would submit {} ({})".format(item["itemId"], item["fileName"]))
+            print("    would submit {} ({}) print_time={}".format(
+                item["itemId"], item["fileName"], item.get("printTime")))
         if not printer.get("acceptingJobs"):
             print("\nWARNING: the printer is not accepting jobs; a real run "
                   "would submit nothing.")
@@ -196,14 +205,13 @@ def summarise(command: str, status: int, payload: dict) -> None:
         # Echoed by the endpoint, so this shows what was ACTUALLY in force rather
         # than what the caller believes it sent -- the difference matters once the
         # numbers live in a Power Automate flow instead of the code.
-        print("settings        : stall={}min giveUp={}d maxRetries={}".format(
-            payload.get("stallMinutes"), payload.get("giveUpDays"),
-            payload.get("maxRetries")))
+        print("settings        : stall={}min giveUp={}d".format(
+            payload.get("stallMinutes"), payload.get("giveUpDays")))
         if payload.get("printerShareId"):
             print("printer override: {}".format(payload["printerShareId"]))
 
-    for key in ("candidatesFound", "remainingReady", "submitted", "failed",
-                "skipped", "checked", "completed", "requeued", "gaveUp",
+    for key in ("candidatesFound", "remainingReady", "notYetDue", "submitted",
+                "failed", "skipped", "checked", "completed", "requeued", "gaveUp",
                 "stillRunning", "notFound", "malformed", "pendingFound",
                 "uncheckedCount", "printerOverridden", "printerAvailable",
                 "budgetExhausted"):
@@ -254,6 +262,15 @@ def main() -> int:
     parser.add_argument("--key", default="", help="function key (deployed app only)")
     parser.add_argument("--library", default="Documents")
     parser.add_argument("--folder", default="")
+    # The site, which is request input now rather than an app setting. No default:
+    # it names an environment, and guessing one would point a real run at whatever
+    # tenant happened to be typed into this file.
+    parser.add_argument("--hostname", default="",
+                        help="submit/dryrun/status: SharePoint hostname, "
+                             "e.g. contoso.sharepoint.com")
+    parser.add_argument("--site-path", default=None,
+                        help='submit/dryrun/status: server-relative site path, '
+                             'e.g. /sites/Ops. Pass "" for the root site.')
     parser.add_argument("--printer-share-id", default="")
     parser.add_argument("--batch-size", type=int)
     # The retry knobs, sent in the body exactly as a Power Automate flow sends
@@ -262,8 +279,6 @@ def main() -> int:
                         help="status: fail a PRINT_PENDING row older than this")
     parser.add_argument("--stall-minutes", type=int,
                         help="status: a job idle this long counts as stalled")
-    parser.add_argument("--max-retries", type=int,
-                        help="status: most requeues one file may receive")
     parser.add_argument("--print-format",
                         help="submit/dryrun/health: the format to UPLOAD, e.g. "
                              "application/pdf (no conversion -- the invoice "
@@ -276,8 +291,16 @@ def main() -> int:
     if args.command == "badpayload":
         # The validation path: it must 400 BEFORE anything is claimed, or a
         # malformed call would lock files out until its own retry.
+        #
+        # Everything EXCEPT folder is supplied, so the 400 can only be about the
+        # missing folder. A body that omits several fields would still 400, but on
+        # whichever is checked first -- and would keep passing even if folder
+        # validation were removed entirely.
         status, payload = call(args.base_url, ROUTES["submit"], args.key,
-                               {"library": "Documents"})
+                               {"sharepointHostname": args.hostname or "example.sharepoint.com",
+                                "sharepointSitePath": args.site_path or "",
+                                "library": "Documents",
+                                "printerShareId": "share-guid"})
         print("HTTP {} (expected 400)".format(status))
         print(json.dumps(payload, indent=2))
         if status != 400:
@@ -287,7 +310,9 @@ def main() -> int:
         return 0
 
     body = ({} if args.command in PRINTER_ONLY
-            else {"library": args.library, "folder": args.folder})
+            else {"sharepointHostname": args.hostname,
+                  "sharepointSitePath": args.site_path or "",
+                  "library": args.library, "folder": args.folder})
     # Sent for status as well, where it is an OPTIONAL HARD OVERRIDE: every
     # lookup and cancel in the run addresses this share instead of each row's
     # own Printer_Name. Omit it and every row follows its own column.
@@ -301,13 +326,21 @@ def main() -> int:
         body["giveUpDays"] = args.give_up_days
     if args.stall_minutes is not None:
         body["stallMinutes"] = args.stall_minutes
-    if args.max_retries is not None:
-        body["maxRetries"] = args.max_retries
     if args.print_format:
         body["printFormat"] = args.print_format
 
     if args.command in ("submit", "dryrun", "health") and not args.printer_share_id:
         parser.error("--printer-share-id is required for {}".format(args.command))
+
+    # The site is required wherever a library is resolved. Caught here rather than
+    # left to the endpoint's 400 so the message names the flag, not the JSON key.
+    if args.command not in PRINTER_ONLY and args.command != "badpayload":
+        if not args.hostname:
+            parser.error("--hostname is required for {} (the site is request "
+                         "input now, not an app setting)".format(args.command))
+        if args.site_path is None:
+            parser.error('--site-path is required for {} (pass "" for the root '
+                         'site)'.format(args.command))
 
     status, payload = call(args.base_url, ROUTES[args.command], args.key, body)
 

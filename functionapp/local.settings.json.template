@@ -11,13 +11,8 @@
     "PRINT_REFRESH_TOKEN_SECRET": "up-print-refresh-token",
     "PRINT_REFRESH_TOKEN": "",
 
-    "SHAREPOINT_HOSTNAME": "YOURTENANT.sharepoint.com",
-    "SHAREPOINT_SITE_PATH": "/sites/YOURSITE",
+    "_comment_request_inputs": "The site (sharepointHostname, sharepointSitePath) and the tunables (batchSize, giveUpDays, stallMinutes) are REQUEST BODY fields, not app settings. They used to live here; a leftover copy now does nothing at all. See docs/timing.md.",
 
-    "PRINT_BATCH_SIZE": "5",
-    "PRINT_GIVE_UP_DAYS": "10",
-    "PRINT_STALL_MINUTES": "5",
-    "PRINT_MAX_RETRIES": "10",
     "PRINT_BUSINESS_TZ": "America/Vancouver",
     "PRINT_BUDGET_SECONDS": "90",
     "GRAPH_TIMEOUT_SECONDS": "30",

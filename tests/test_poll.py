@@ -20,14 +20,15 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import timedelta
 
 import pytest
 
 import print_policy
-from helpers import (POLL, as_json, iso, post, print_events, result_for,
+from helpers import (NOW, POLL, SITE, as_json, iso, post, print_events, result_for,
                      run_summaries)
 
-BODY = {"library": "Documents", "folder": "/Invoices/ToPrint"}
+BODY = {**SITE, "library": "Documents", "folder": "/Invoices/ToPrint"}
 
 PRINTED_ON = re.compile(r"^printed on \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 
@@ -60,9 +61,12 @@ def stalled(graph, item_id="1", *, job_id="1825", state="stopped",
     which is what makes it stalled. `job_minutes_old` overrides just the job's
     age, for the case where the attempt is old but its job is fresh.
 
-    Keeping these consistent matters: a one-day-old file whose job was created an
-    hour ago implies eight retries already happened, so no new boundary is due and
-    nothing would be requeued.
+    Keeping these consistent still matters, but for a different reason than it used
+    to. A stalled row is now requeued unconditionally, so `attempt_at_minutes` no
+    longer decides WHETHER anything happens -- it decides WHICH retry is scheduled,
+    and therefore what `Print_Time` a test should expect. A one-day-old file whose
+    job was created an hour ago implies eight retries already spent, so the one
+    scheduled is the ninth, not the first.
     """
     attempt_ago = file_minutes_old - attempt_at_minutes
     job_ago = attempt_ago if job_minutes_old is None else job_minutes_old
@@ -245,6 +249,28 @@ def test_a_malformed_request_is_400(graph, payload, fragment):
     response = post(POLL, payload)
     assert response.status_code == 400
     assert fragment in as_json(response)["error"]
+
+
+def test_a_missing_site_is_a_400_not_a_500(graph):
+    """The site used to be an app setting, and its absence a RuntimeError -- which
+    surfaced as a 500, telling the caller the server was broken when in fact their
+    request was. It is request input now, so it is answered as what it is."""
+    for missing in ("sharepointHostname", "sharepointSitePath"):
+        payload = {k: v for k, v in BODY.items() if k != missing}
+        response = post(POLL, payload)
+
+        assert response.status_code == 400, missing
+        assert missing in as_json(response)["error"]
+
+
+def test_an_empty_site_path_means_the_root_site(graph, frozen_now):
+    """Exactly the shape `folder` has: "" is a real answer, so only an absent key
+    is an error. A tenant whose library lives on the root site must not have to
+    invent a path."""
+    pending_item(graph)
+    graph.add_job("1825", state="processing", created=iso(minutes=1))
+
+    assert post(POLL, body(sharepointSitePath="")).status_code == 200
 
 
 def test_a_bad_give_up_threshold_is_400(graph):
@@ -557,14 +583,22 @@ def test_a_job_inside_the_stall_threshold_is_left_alone(graph, frozen_now):
     assert graph.cancelled == []
 
 
-def test_a_stalled_job_inside_the_backoff_gap_is_left_alone(graph, frozen_now):
-    """THE BACKOFF ITSELF. This file was requeued 27 minutes into its life, so
-    two retries are already spent; the third is not due until 35 minutes. At 32
-    minutes old the job is stalled and there are retries left -- and still
-    nothing happens, because no new boundary has been crossed.
+def test_a_stalled_job_inside_the_backoff_gap_is_requeued_with_a_future_due_time(
+        graph, frozen_now):
+    """THE BACKOFF ITSELF, now written into the row instead of held in Poll.
 
-    Without this, an offline printer would be retried every ten minutes all
-    night, each round costing a render, a conversion and an upload.
+    This file was requeued 27 minutes into its life, so two retries are spent and
+    the third is not due until 35 minutes. At 32 minutes the job is stalled but the
+    boundary is still three minutes away. Poll used to answer by doing nothing, and
+    the row waited at PRINT_PENDING while every run re-derived the same silence.
+
+    Now the row is requeued at once and carries the wait as a due time. The third
+    attempt still happens at 35 minutes -- Submit is what holds it until then -- but
+    it is a value anyone can read rather than a decision nobody could see.
+
+    The offline printer this guards against is still guarded: the expensive work
+    (render, conversion, upload) happens when Submit acts, and Submit will not act
+    until the due time passes.
     """
     graph.add_item("1", status=print_policy.PENDING, job_id="1825",
                    printer=graph.SHARE_ID, created=iso(minutes=32),
@@ -573,8 +607,32 @@ def test_a_stalled_job_inside_the_backoff_gap_is_left_alone(graph, frozen_now):
 
     payload = as_json(post(POLL, body()))
 
-    assert payload["requeued"] == 0, "no new boundary crossed at 32 minutes"
-    assert graph.cancelled == []
+    assert payload["requeued"] == 1
+    assert graph.status_of("1") == print_policy.READY
+    assert graph.cancelled == ["1825"], "the stalled job is killed before the retry"
+
+    due = print_policy.parse_graph_datetime(graph.field("1", "Print_Time"))
+    assert due == NOW + timedelta(minutes=3), (
+        "retry three falls due 35 minutes after creation, three minutes from now")
+    assert result_for(payload, "1")["retry"] == 3
+
+
+def test_a_stalled_job_past_its_boundary_is_given_a_due_time_in_the_past(
+        graph, frozen_now):
+    """The same file eight minutes later. The due time is behind us, so the row is
+    immediately printable -- which is what reproduces the pre-Print_Time timing for
+    every boundary that has already gone by when Poll first looks."""
+    graph.add_item("1", status=print_policy.PENDING, job_id="1825",
+                   printer=graph.SHARE_ID, created=iso(minutes=40),
+                   modified=iso(minutes=13))
+    graph.add_job("1825", state="stopped", created=iso(minutes=13))
+
+    payload = as_json(post(POLL, body()))
+
+    assert payload["requeued"] == 1
+    due = print_policy.parse_graph_datetime(graph.field("1", "Print_Time"))
+    assert due == NOW - timedelta(minutes=5), "the 35-minute boundary, five minutes ago"
+    assert print_policy.is_due(due, NOW) is True
 
 
 def test_a_stalled_job_past_the_next_boundary_is_requeued(graph, frozen_now):
@@ -601,27 +659,74 @@ def test_the_first_retry_falls_due_at_the_stall_threshold(graph, frozen_now):
     assert payload["requeued"] == 1
 
 
-def test_retries_stop_at_the_max_but_the_row_is_not_failed(graph, frozen_now):
-    """THE GRACE PERIOD. Once the retries are spent no more work is done, but the
-    row stays PRINT_PENDING and its final job stays live, so a printer that comes
-    back still gets the document out and the next Poll records it."""
-    stalled(graph, file_minutes_old=5 * DAY,
-            attempt_at_minutes=5 * DAY - 600)
+def test_the_due_time_is_never_scheduled_past_the_give_up_deadline(graph, frozen_now):
+    """THE CLAMP, WHICH IS THE ONLY UPPER BOUND LEFT.
 
-    payload = as_json(post(POLL, body(maxRetries=1)))
+    An eight-day-old file whose eleventh retry has already been spent. The twelfth
+    falls due at 20475 minutes -- 14.2 days, four past the ten-day deadline -- and a
+    row waiting that long sits at PRINT_READY, where Poll (which queries
+    PRINT_PENDING only) could not see it to fail it. It would print days late
+    against a row about to read PRINT_FAILED.
 
-    assert payload["requeued"] == 0
-    assert payload["gaveUp"] == 0
-    assert graph.field("1", "Print_Status") == print_policy.PENDING
-    assert graph.cancelled == [], "the last job must stay alive"
+    Clamped, the last attempt lands ON the deadline instead: it gets stallMinutes
+    of life, and the run after that finds the file out of window and fails it.
+    """
+    stalled(graph, file_minutes_old=8 * DAY, attempt_at_minutes=8 * DAY - 600)
+
+    payload = as_json(post(POLL, body()))
+
+    assert payload["requeued"] == 1, "work continues; there is no grace period now"
+    assert result_for(payload, "1")["retry"] == 12
+
+    created = NOW - timedelta(minutes=8 * DAY)
+    assert 5 * (2 ** 12 - 1) > 10 * DAY, "retry twelve really is outside the window"
+    due = print_policy.parse_graph_datetime(graph.field("1", "Print_Time"))
+    assert due == created + timedelta(days=10), "clamped to the deadline exactly"
 
 
-def test_a_job_completing_in_the_grace_period_still_counts_as_printed(graph, frozen_now):
-    """The point of leaving the last job alive."""
+def test_the_clamped_final_attempt_is_failed_rather_than_stranded(graph, monkeypatch):
+    """THE OTHER HALF OF THE CLAMP, and the reason it closes a hole rather than
+    moving one.
+
+    Scheduling the last attempt ON the deadline is only safe if something then
+    fails the row. Nothing would, if the row were still waiting at PRINT_READY --
+    Poll queries PRINT_PENDING only. So: Submit claims it at the deadline, which
+    puts it back where Poll can see it, and the next run finds the file out of
+    window, cancels the job it just created, and writes PRINT_FAILED.
+    """
+    from helpers import SUBMIT
+
+    created = NOW - timedelta(days=10)
+    clock = {"now": NOW}
+    monkeypatch.setattr(print_policy, "now_utc", lambda: clock["now"])
+
+    # Waiting at PRINT_READY with a due time of exactly the deadline -- the row
+    # shape the clamp produces.
+    graph.add_item("1", status=print_policy.READY,
+                   created=created.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   print_time=NOW.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+    submitted = as_json(post(SUBMIT, dict(BODY, printerShareId=graph.SHARE_ID)))
+    assert submitted["submitted"] == 1, "due exactly on the deadline, so claimable"
+    assert graph.status_of("1") == print_policy.PENDING
+
+    # The next Poll run, ten minutes later: the file is now outside the window.
+    clock["now"] = NOW + timedelta(minutes=10)
+    payload = as_json(post(POLL, body()))
+
+    assert payload["gaveUp"] == 1
+    assert graph.status_of("1") == print_policy.FAILED
+    assert graph.cancelled, "the job created at the deadline must be cancelled"
+    assert not graph.field("1", "Print_Time"), "and the schedule cleared with it"
+
+
+def test_a_job_completing_late_still_counts_as_printed(graph, frozen_now):
+    """Completion is checked before the deadline, so a job that finishes while the
+    schedule has all but run out is still recorded as printed rather than failed."""
     pending_item(graph, days_old=5)
     graph.add_job("1825", state="completed", created=iso(days=5))
 
-    payload = as_json(post(POLL, body(maxRetries=1)))
+    payload = as_json(post(POLL, body()))
 
     assert payload["completed"] == 1
     assert graph.field("1", "Print_Status") == print_policy.COMPLETED
@@ -650,6 +755,40 @@ def test_giving_up_cancels_the_outstanding_job(graph, frozen_now):
     post(POLL, body())
 
     assert graph.cancelled == ["1825"]
+
+
+# --- Print_Time is only ever set on a PRINT_READY row -------------------------
+
+
+def test_a_terminal_outcome_clears_the_due_time(graph, frozen_now):
+    """THE INVARIANT, and it is not tidiness. PRINT_FAILED is terminal and the
+    documented recovery is that a human sets the row back to PRINT_READY. If a
+    future due time survived that reset, Submit would decline to print and the
+    reset would appear to do nothing at all -- with no error anywhere to explain
+    it.
+
+    Each of these rows carries a due time in the future before the run, and must
+    not afterwards.
+    """
+    # completed
+    pending_item(graph, "done", job_id="900", print_time=iso(minutes=-30))
+    graph.add_job("900", state="completed")
+    # canceled at the printer -- terminal, never retried
+    pending_item(graph, "killed", job_id="901", print_time=iso(minutes=-30))
+    graph.add_job("901", state="canceled", description="Canceled at the device.")
+    # past the give-up deadline
+    stalled(graph, "old", job_id="902", file_minutes_old=11 * DAY,
+            print_time=iso(minutes=-30))
+
+    payload = as_json(post(POLL, body()))
+
+    assert (payload["completed"], payload["failed"], payload["gaveUp"]) == (1, 1, 1)
+    for item_id, status in (("done", print_policy.COMPLETED),
+                            ("killed", print_policy.FAILED),
+                            ("old", print_policy.FAILED)):
+        assert graph.status_of(item_id) == status
+        assert not graph.field(item_id, "Print_Time"), (
+            "{} kept a due time it can no longer act on".format(item_id))
 
 
 def test_a_completed_job_past_the_give_up_threshold_is_still_completed(graph, frozen_now):
@@ -714,7 +853,6 @@ def test_the_give_up_threshold_can_be_set_per_request(graph, frozen_now):
 @pytest.mark.parametrize("payload", [
     {"stallMinutes": 0}, {"stallMinutes": 99999},
     {"giveUpDays": 0}, {"giveUpDays": 400},
-    {"maxRetries": 0}, {"maxRetries": 99},
 ])
 def test_an_out_of_range_tunable_is_400_and_touches_nothing(graph, frozen_now, payload):
     """An out-of-range REQUEST value is the caller's error, not a server fault,
@@ -734,11 +872,25 @@ def test_the_response_echoes_the_settings_in_force(graph, frozen_now):
     pending_item(graph)
     graph.add_job("1825", state="processing", created=iso(minutes=1))
 
-    payload = as_json(post(POLL, body(stallMinutes=7, giveUpDays=3, maxRetries=4)))
+    payload = as_json(post(POLL, body(stallMinutes=7, giveUpDays=3)))
 
     assert payload["stallMinutes"] == 7
     assert payload["giveUpDays"] == 3
-    assert payload["maxRetries"] == 4
+    assert "maxRetries" not in payload, "the second bound is gone, not renamed"
+
+
+def test_a_flow_still_sending_max_retries_is_not_rejected(graph, frozen_now):
+    """`maxRetries` was retired, but every deployed Flow B body still carries it.
+    Accepting and ignoring an unknown key is what lets the code deploy before the
+    flows are edited; 400-ing would take the pipeline down at the moment of the
+    deploy instead."""
+    pending_item(graph)
+    graph.add_job("1825", state="processing", created=iso(minutes=1))
+
+    response = post(POLL, body(maxRetries=4))
+
+    assert response.status_code == 200
+    assert "maxRetries" not in as_json(response)
 
 
 # --- printerShareId: the request-level printer override -----------------------

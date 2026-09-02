@@ -471,3 +471,38 @@ defect, and do not roll the scope back to make it go away.
 check the permission table of **every** call in a sequence, not just the first
 one. And when a bench script works and the app does not, diff their scope lists
 before anything else.
+
+---
+
+## A timestamp written back to SharePoint reads back 7 or 8 hours early
+
+**What happened (2026-09-02):** while adding the `Print_Time` column — a due time
+written for humans to read, and *also* re-read by Submit to decide what to print —
+the obvious move was to reuse the formatting that `printed_on_message` already
+uses, which renders in `PRINT_BUSINESS_TZ`. Measured before shipping it, against
+`print_policy.parse_graph_datetime`:
+
+| written | read back as | |
+|---|---|---|
+| `2026-09-02T14:23:23Z` | `14:23:23+00:00` | correct |
+| `2026-09-02T07:23:23-07:00` | `14:23:23+00:00` | correct |
+| `2026-09-02T07:23:23` | `07:23:23+00:00` | **7 hours early** |
+
+**Cause:** `parse_graph_datetime` treats a naive value as UTC, which is what Graph
+documents for its own timestamps. `printed_on_message` emits naive *local* time and
+gets away with it because nothing ever parses that string back — it is display
+only. A value that is both displayed and re-read cannot borrow that formatter.
+
+Worse than a fixed offset: America/Vancouver is `-08:00` in January and `-07:00` in
+July, so the error changes twice a year. A test written in one season would pass
+and the same code would be an hour further out in the other.
+
+**Fix:** `format_business_datetime` renders in the business zone via
+`.isoformat()`, which **always** carries the offset, and a test asserts the output
+ends in one. The round trip is then exact in both seasons, and every comparison in
+the app stays UTC because `parse_graph_datetime` normalises on read.
+
+**Rule:** a timestamp that will be **parsed back** must carry its offset; only a
+string that is purely for display may be naive. Before reusing a formatter, ask
+whether the existing caller ever reads its output back — if it does not, its
+format is not evidence that yours is safe.
