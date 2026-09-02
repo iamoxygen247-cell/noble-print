@@ -175,13 +175,22 @@ def resolve_list(client: GraphClient, site_id: str, library: str) -> ListContext
 
 def _to_print_file(context: ListContext, item: Dict[str, Any]) -> PrintFile:
     fields = item.get("fields") or {}
+
+    # Graph can omit FileDirRef from expanded list-item fields. Fall back to
+    # the list item's webUrl and remove the filename to obtain its folder.
+    web_path = urllib.parse.unquote(
+        urllib.parse.urlsplit(str(item.get("webUrl") or "")).path
+    )
+    web_folder = web_path.rpartition("/")[0] if web_path else ""
+    folder = fields.get(FIELD_DIR) or web_folder
+
     return PrintFile(
         item_id=str(item.get("id", "")),
         etag=item.get("eTag"),
         created=print_policy.parse_graph_datetime(item.get("createdDateTime")),
         modified=print_policy.parse_graph_datetime(item.get("lastModifiedDateTime")),
         file_name=fields.get(FIELD_LEAF) or item.get("name") or "",
-        folder=fields.get(FIELD_DIR) or "",
+        folder=folder,
         status=(fields.get(context.internal(print_policy.COLUMN_STATUS)) or "").strip(),
         job_id=(fields.get(context.internal(print_policy.COLUMN_JOB_ID)) or "").strip(),
         printer=(fields.get(context.internal(print_policy.COLUMN_PRINTER)) or "").strip(),

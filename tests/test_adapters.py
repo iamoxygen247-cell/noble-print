@@ -120,6 +120,23 @@ def test_query_scopes_to_the_folder(client, graph, context):
     assert [f.item_id for f in found] == ["in"]
 
 
+def test_item_folder_falls_back_to_web_url_when_file_dir_ref_is_absent(
+        graph, context):
+    item = graph.add_item("1", name="invoice 1.pdf")
+    item["fields"].pop("FileDirRef")
+    item["webUrl"] = (
+        "https://example.sharepoint.com/sites/PM/AI_DropBox_V2026/"
+        "Backup/Invoice/invoice%201.pdf"
+    )
+
+    row = sharepoint._to_print_file(context, item)
+
+    assert row.folder == (
+        "/sites/PM/AI_DropBox_V2026/Backup/Invoice"
+    )
+    assert print_policy.folder_matches(row.folder, "/Backup/Invoice")
+
+
 def test_query_maps_all_four_columns_onto_the_row(client, graph, context):
     graph.add_item("1", status="PRINT_PENDING", job_id="1825",
                    printer="share-guid", message="hello", name="bill.pdf")
