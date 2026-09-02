@@ -714,9 +714,11 @@ kind of configuration: setting it appeared to work and did nothing (S4).
 - **Index the `Print_Status` column** — non-indexed columns cannot be used in `$filter` at all.
 - ~~Confirm whether content approval is enabled on the library.~~ **Checked
   2026-08-31: off**, and require-check-out is off too. No moderation handling needed.
-- Entra app: public client flows enabled; delegated `PrintJob.ReadWriteBasic`, `Printer.Read.All`,
-  `PrinterShare.ReadBasic.All`, `Sites.ReadWrite.All`, `offline_access`; admin consent.
-  (`PrintJob.ReadWriteBasic` covers cancel as well as create/start.)
+- Entra app: public client flows enabled; delegated `PrintJob.ReadWriteBasic`, `PrintJob.Create`,
+  `Printer.Read.All`, `PrinterShare.ReadBasic.All`, `Sites.ReadWrite.All`, `offline_access`;
+  admin consent. (`PrintJob.ReadWriteBasic` covers cancel as well as create/start;
+  `createUploadSession` accepts only `PrintJob.Create` or `PrintJob.ReadWrite`, which is
+  why both are listed — see `graph_auth.SCOPES` for the per-call table.)
 - Function App managed identity → **Key Vault Secrets Officer**.
 
 ---

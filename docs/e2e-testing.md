@@ -63,7 +63,7 @@ Paper in the tray, printer awake.
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-Expect **488 passed** in about half a second. Red here means stop — do not spend
+Expect **492 passed** in about half a second. Red here means stop — do not spend
 paper diagnosing something the suite already knows about.
 
 ## A2. Is the printer reachable and still the printer we think?
@@ -567,6 +567,8 @@ or cold start. See `README.md`, "What a local run cannot prove".
 | `printerAvailable: false` | The printer is not accepting jobs. HTTP 200 with `failed=0`, so only that flag reveals it |
 | `budgetExhausted: true` | The 90 s budget ran out mid-batch. The remainder is picked up next run — expected under load, not an error |
 | `!!` warning on an item | The document printed but its job id could not be recorded, so Poll reads the row as a crashed submission and **requeues it within roughly ten minutes**. Fix `Print_JobId` by hand, fast, or set the row to `PRINT_COMPLETED` |
+| `download: ... has no downloadable driveItem (is it a folder?)` on a real PDF | Defect **L1**, fixed 2026-09-01. The driveItem GET carried a `$select`, which makes Graph drop the `@microsoft.graph.downloadUrl` annotation — so **every** file failed, folder or not. If it reappears, a `$select` has come back to `sharepoint.get_download_url`; run `pytest -k select_away_the_download_url` |
+| `download failed: ('Connection aborted.', ConnectionResetError(10054, ...))` | The **workstation's** TLS interception, not the pipeline — measured at two resets in three identical attempts on this machine, and absent in Azure. Retried three times with backoff since 2026-09-01; if all three are reset the row lands at `PRINT_FAILED`, so reset it to `PRINT_READY` and re-run |
 
 ---
 

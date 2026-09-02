@@ -26,6 +26,8 @@ import re
 import urllib.parse
 from typing import Any, Dict, List, Optional
 
+import requests
+
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 
@@ -351,14 +353,28 @@ class FakeGraph:
         if item is None:
             return FakeResponse(404, {"error": {"code": "itemNotFound",
                                                 "message": "no such item"}})
-        return FakeResponse(200, {
+        payload = {
             "id": "drive-" + item_id,
             "name": item["name"],
             "size": item["size"],
             "file": {"mimeType": item.get("mimeType") or "application/pdf"},
             "@microsoft.graph.downloadUrl": "{}/{}?token=abc".format(
                 DOWNLOAD_HOST, item_id),
-        })
+        }
+
+        # A $SELECT NAMING ORDINARY PROPERTIES DROPS THE ANNOTATIONS. Verified
+        # against the live service on 2026-09-01 (defect L1): asking for
+        # "id,name,size,file,@microsoft.graph.downloadUrl" returns the four
+        # properties and NO download URL, while omitting $select -- or selecting
+        # the annotation alone, which the service ignores -- returns the whole
+        # item WITH it. The fake modelled neither, so every offline download test
+        # passed against a request shape that cannot download anything.
+        selected = [f.strip() for f in (query.get("$select") or [""])[0].split(",")
+                    if f.strip()]
+        if any(not field.startswith("@") for field in selected):
+            payload = {key: value for key, value in payload.items()
+                       if key in selected and not key.startswith("@")}
+        return FakeResponse(200, payload)
 
     def _patch_fields(self, rel, query, body, headers):
         item_id = rel.split("/items/")[1].split("/")[0]
@@ -458,9 +474,18 @@ class FakeAnonSession:
         self.deleted: List[str] = []
         self.download_status = 200
         self.put_status_override: Optional[int] = None
+        # How many of the next GETs die mid-handshake instead of answering. A
+        # connection reset is not a status code -- requests raises before there
+        # is a response at all -- so it needs its own knob to be reproducible.
+        self.download_resets = 0
 
     def get(self, url, timeout=None):
         self.calls.append(Call("GET", url, {}, None))
+        if self.download_resets > 0:
+            self.download_resets -= 1
+            raise requests.ConnectionError(
+                "('Connection aborted.', ConnectionResetError(10054, "
+                "'An existing connection was forcibly closed by the remote host'))")
         if self.download_status != 200:
             return FakeResponse(self.download_status,
                                 {"error": {"code": "gone", "message": "expired"}})
@@ -483,3 +508,9 @@ class FakeAnonSession:
         self.deleted.append(url)
         self.calls.append(Call("DELETE", url, {}, None))
         return FakeResponse(204)
+
+    def calls_to(self, fragment: str, method: Optional[str] = None) -> List[Call]:
+        """Same helper as FakeGraph.calls_to, so a test that counts attempts
+        reads the same whichever session made them."""
+        return [c for c in self.calls
+                if fragment in c.url and (method is None or c.method == method.upper())]

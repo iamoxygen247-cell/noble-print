@@ -167,7 +167,8 @@ documented `Application: Not supported`.
    | Permission | For |
    |---|---|
    | `Sites.ReadWrite.All` | read the queue, write the four columns |
-   | `PrintJob.ReadWriteBasic` | create, start **and cancel** print jobs |
+   | `PrintJob.ReadWriteBasic` | create the job, start it **and cancel** it |
+   | `PrintJob.Create` | **createUploadSession** — it refuses `ReadWriteBasic`, so without this the pipeline 403s *after* claiming a row (defect L3) |
    | `Printer.Read.All` | resolve the printer behind a share |
    | `PrinterShare.ReadBasic.All` | the preflight |
    | `offline_access` | issue a refresh token at all — **see the note** |
@@ -556,7 +557,7 @@ az functionapp config appsettings list --resource-group $RG --name $APP `
 ## 7. Deploy the code
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest        # 487 tests must be green FIRST
+.\.venv\Scripts\python.exe -m pytest        # 492 tests must be green FIRST
 
 # func shells out to the RAW az.cmd for an ARM token and cannot refresh it over
 # the network through the inspecting proxy. Pre-warm the cache through the

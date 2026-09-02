@@ -277,16 +277,46 @@ def download_unauthenticated(url: str, timeout: Optional[float] = None) -> bytes
 
     These URLs expire within minutes, so they are fetched immediately after being
     read and never cached.
+
+    RETRIED, UNLIKE THE PRINT-JOB CALLS. A GET of a document is idempotent --
+    exception 2 in the module docstring is about creating a job, where a retry
+    prints a second page, and nothing here can print anything. What it protects
+    against is a reset mid-handshake: measured on a development workstation
+    running TLS interception, two of three identical attempts died with
+    WinError 10054 and the third returned the file. Without a retry that is a
+    claimed row landing at PRINT_FAILED for a reason outside the pipeline, and a
+    human resetting the column to try again.
+
+    The backoff stays well inside the URL's lifetime: three attempts, capped at
+    8s plus jitter each.
     """
     timeout = timeout if timeout is not None else resolve_timeout_seconds()
-    try:
-        response = _anon_session.get(url, timeout=timeout)
-    except requests.RequestException as exc:
-        raise GraphError(f"download failed: {exc}", url=url)
-    if response.status_code != 200:
-        raise GraphError(f"download failed: {_error_text(response)}",
-                         status_code=response.status_code, url=url, **_correlation(response))
-    return response.content
+
+    last_error: Optional[GraphError] = None
+    for attempt in range(MAX_ATTEMPTS):
+        response = None
+        try:
+            response = _anon_session.get(url, timeout=timeout)
+        except requests.RequestException as exc:
+            last_error = GraphError(f"download failed: {exc}", url=url)
+        else:
+            if response.status_code == 200:
+                return response.content
+            last_error = GraphError(f"download failed: {_error_text(response)}",
+                                    status_code=response.status_code, url=url,
+                                    **_correlation(response))
+            if response.status_code not in RETRYABLE_STATUS:
+                raise last_error
+
+        if attempt == MAX_ATTEMPTS - 1:
+            raise last_error
+
+        delay = _sleep_for(response, attempt)
+        logging.warning("download failed (%s); retrying in %.1fs (attempt %s/%s)",
+                        last_error, delay, attempt + 2, MAX_ATTEMPTS)
+        time.sleep(delay)
+
+    raise last_error or GraphError("download failed", url=url)
 
 
 def put_unauthenticated(url: str, data: bytes, headers: Dict[str, str],

@@ -44,9 +44,30 @@ from typing import Optional
 
 # Delegated scopes. offline_access / openid / profile are added by MSAL itself
 # and must not be listed here -- MSAL rejects the reserved scopes.
+#
+# THE TWO PRINTJOB SCOPES ARE BOTH REQUIRED AND NEITHER IS REDUNDANT. Submitting
+# a document is four calls and no single "Basic" scope covers all four. Verified
+# against the v1.0 permission tables on 2026-09-01:
+#
+#   call                    least privileged        ReadWriteBasic accepted?
+#   POST .../jobs           PrintJob.ReadWriteBasic  yes
+#   createUploadSession     PrintJob.Create          NO -- Create or ReadWrite only
+#   POST .../start          PrintJob.Create          yes
+#   POST .../cancel         PrintJob.ReadWriteBasic  yes
+#
+# So createUploadSession is the odd one out, and with ReadWriteBasic alone the
+# pipeline gets a job created, a document created, and then a 403 "The token does
+# not have one or more required security scopes" -- after the row is claimed
+# (defect L3). PrintJob.ReadWrite would also cover all four in one scope; two
+# narrow scopes are preferred to one broad one.
+#
+# ADDING A SCOPE HERE IS NOT ENOUGH. The refresh token carries the scopes that
+# were consented when it was minted, so a new scope needs the delegated
+# permission added in Entra AND a fresh scripts/bootstrap_token.py sign-in.
 SCOPES = [
     "https://graph.microsoft.com/Sites.ReadWrite.All",
     "https://graph.microsoft.com/PrintJob.ReadWriteBasic",
+    "https://graph.microsoft.com/PrintJob.Create",
     "https://graph.microsoft.com/Printer.Read.All",
     "https://graph.microsoft.com/PrinterShare.ReadBasic.All",
 ]

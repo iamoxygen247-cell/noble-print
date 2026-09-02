@@ -127,7 +127,9 @@ Password *expiry* alone will not. When it breaks, every endpoint returns 500 wit
   used in a Graph `$filter` at all, so without the index every query fails.
 - Entra app registration with public client flows enabled, and admin consent for
   the delegated scopes `Sites.ReadWrite.All`, `PrintJob.ReadWriteBasic`,
-  `Printer.Read.All`, `PrinterShare.ReadBasic.All`, `offline_access`.
+  `PrintJob.Create`, `Printer.Read.All`, `PrinterShare.ReadBasic.All`,
+  `offline_access`. Both PrintJob scopes are required — `createUploadSession`
+  accepts `PrintJob.Create` or `PrintJob.ReadWrite` but not `ReadWriteBasic`.
 - The Function App's managed identity needs **Key Vault Secrets Officer** —
   *Officer*, not *User*, because rotation writes the new token back.
 

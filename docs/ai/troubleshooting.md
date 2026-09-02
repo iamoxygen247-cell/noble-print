@@ -334,3 +334,140 @@ app resolves for itself at preflight. Treat a 404 on `/print/shares/{id}` as
 404 on that route as evidence of anything else -- it also voided the job
 retention measurement that was counting days against a job created through the
 retired share (see `docs/live-test.md`).
+
+---
+
+## `download: list item N has no downloadable driveItem (is it a folder?)` on an ordinary PDF
+
+**What happened (2026-09-01):** the first live `submit` of a real file (e2e Part
+B3) reported `submitted: 0, failed: 1` and wrote that message to
+`Print_Message`. Item 2620 was not a folder — it was a 273,074-byte
+`application/pdf` sitting in the right library. Probing every `PRINT_READY`
+candidate in the folder showed the **same** result for all seven: the driveItem
+came back with a `file` facet, a name and a size, and no download URL anywhere.
+
+**Cause:** the `$select` on the driveItem GET, in `sharepoint.get_download_url`
+since the initial commit. `@microsoft.graph.downloadUrl` is an OData
+**annotation**, not a property, and a `$select` naming ordinary properties makes
+the service return those properties and drop the annotations — including the one
+named in the same `$select`. Measured against the live service:
+
+| request | annotation returned |
+|---|---|
+| `?$select=id,name,size,file,@microsoft.graph.downloadUrl` | **no** |
+| `?$select=@microsoft.graph.downloadUrl` (annotation alone) | yes — the select is ignored and the full item comes back |
+| no `$select` | yes |
+| `listItem?$expand=driveItem` | yes |
+
+The error message was misleading rather than wrong: the code cannot tell an
+absent URL from an unselectable one, and "is it a folder?" was the only
+hypothesis it offered.
+
+**Why no test caught it:** `FakeGraph._get_drive_item` ignored `$select` and
+returned the URL unconditionally, so all 488 offline tests passed against a
+request shape that could never download a byte. Same class of harness flaw as
+F4 — the fake was more permissive than the service, in the one dimension that
+mattered.
+
+**Fix:** drop the `$select` (`functionapp/sharepoint.py`), and teach the fake to
+model the real behaviour so the bug is reproducible offline. Verified live: the
+adapter now returns a URL and downloads 273,074 bytes beginning `%PDF-`.
+Pinned by `test_the_drive_item_request_does_not_select_away_the_download_url`,
+which fails with the exact live error string when the `$select` is restored.
+
+**Rule:** never put an OData annotation (`@microsoft.graph.*`) in a `$select`
+alongside ordinary properties — either omit `$select` entirely or expand the
+navigation property. And when a fake makes a query option a no-op, the tests
+covering that call are asserting nothing about it.
+
+---
+
+## `ConnectionResetError: [WinError 10054]` downloading from `*.sharepoint.com`
+
+**What happened (2026-09-01):** while verifying the fix above, the
+pre-authenticated download failed twice and succeeded on the third identical
+attempt — same URL, same process, seconds apart. Two resets out of three.
+
+**Cause:** local TLS interception (the same Norton handshake reset the `az`
+wrapper in the PowerShell profile retries five times for). It is a
+**workstation** condition, not an Azure one, and it is unrelated to the
+`$select` defect above — it strikes *after* a download URL is obtained.
+
+**Fix (2026-09-01):** `graph_client.download_unauthenticated` now retries.
+It made **one** attempt and had no retry loop of its own, so a local `submit`
+landed a file at `PRINT_FAILED` with `download: ... Connection aborted` purely
+from the local proxy — which is exactly what happened on the next B3 run. It now
+mirrors the authenticated path: three attempts, exponential backoff with jitter,
+and no retry for a non-retryable status (a 410 on an expired URL will expire
+again). A document GET is idempotent, so this does not touch the "creating a
+print job is not retryable" rule. Pinned by
+`test_a_reset_connection_is_retried_rather_than_failing_the_file` and
+`test_a_download_gives_up_after_the_attempt_limit`.
+
+If it still exhausts all three attempts: the row is terminal, so reset it to
+`PRINT_READY` before re-running.
+
+**Rule:** a `download failed: Connection aborted` is the workstation, not the
+pipeline. Distinguish it from a real download defect by whether an identical
+retry succeeds — and retry the calls that are safe to retry, rather than letting
+a claimed row die of someone else's TLS proxy.
+
+---
+
+## `403 The token does not have one or more required security scopes` on `createUploadSession`
+
+**What happened (2026-09-01):** e2e B3, third attempt. Submit got *further* than
+ever — the print job was created (id 27) and its document with it — and then
+`POST /print/shares/{share}/jobs/27/documents/{doc}/createUploadSession` returned
+403. The terminal truncated the body; the full text is above, and it names no
+scope, which is what makes this expensive to diagnose from the message alone.
+
+Decoding the live token's `scp` claim showed exactly what `graph_auth.SCOPES`
+asks for: `Sites.ReadWrite.All`, `PrintJob.ReadWriteBasic`, `Printer.Read.All`,
+`PrinterShare.ReadBasic.All`, `User.Read`.
+
+**Cause:** `PrintJob.ReadWriteBasic` does not cover `createUploadSession`, and it
+is the **only** one of the four print calls it does not cover. From the v1.0
+permission tables:
+
+| call | least privileged | is `ReadWriteBasic` accepted? |
+|---|---|---|
+| `POST /print/shares/{id}/jobs` | `PrintJob.ReadWriteBasic` | yes |
+| `createUploadSession` | **`PrintJob.Create`** | **no** — `Create` or `ReadWrite` only |
+| `POST .../jobs/{id}/start` | `PrintJob.Create` | yes |
+| `POST /print/printers/{id}/jobs/{id}/cancel` | `PrintJob.ReadWriteBasic` | yes |
+
+So the app could create a job it could never upload to. The failure lands
+*after* the row is claimed and after a job exists on the printer, leaving an
+orphan job at `paused`/`uploadPending` per attempt — harmless, since an unstarted
+job never prints, but they accumulate.
+
+**The evidence was already in the repo.** `scripts\live-print-test.ps1` — the
+Part A bench script that prints paper — requests `PrintJob.Create` alongside
+`PrintJob.ReadWriteBasic`. So did `samples\test-pwg-universal-print.ps1`. Only
+the Function App's own scope list omitted it, which is why Part A passing said
+nothing about whether Part B could upload.
+
+**Fix:** add `PrintJob.Create` to `graph_auth.SCOPES`, then — and this is the
+half that is easy to miss — **add the delegated permission in Entra, grant admin
+consent, and re-run `scripts\bootstrap_token.py`.** A refresh token carries the
+scopes consented when it was minted; editing the Python list alone changes
+nothing about an existing token.
+
+**Expect the app to go fully down in between.** `_redeem` asks for the whole of
+`SCOPES` on every refresh, so the moment an unconsented scope is added to the
+list, the refresh token stops redeeming at all:
+
+```
+AADSTS65001: The user or administrator has not consented to use the application
+```
+
+That is `AuthBootstrapRequired` on *every* endpoint, not a 403 on one call — it
+is the expected state between editing `SCOPES` and finishing the consent, and it
+clears the moment `bootstrap_token.py` succeeds. Do not read it as a second
+defect, and do not roll the scope back to make it go away.
+
+**Rule:** "Basic" scopes are not a subset relationship you can reason about —
+check the permission table of **every** call in a sequence, not just the first
+one. And when a bench script works and the app does not, diff their scope lists
+before anything else.

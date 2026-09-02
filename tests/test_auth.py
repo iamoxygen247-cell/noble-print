@@ -248,7 +248,17 @@ def test_the_scopes_exclude_the_reserved_ones():
 
 
 def test_the_scopes_cover_every_operation_the_app_performs():
+    """One assertion per call the app makes, because this test previously said
+    "every operation" while omitting one -- and the one it omitted was the one
+    ReadWriteBasic does not cover.
+
+    createUploadSession accepts PrintJob.Create or PrintJob.ReadWrite, and NOT
+    PrintJob.ReadWriteBasic (verified against the v1.0 permission table,
+    2026-09-01). Dropping PrintJob.Create returns the pipeline to defect L3: a
+    403 arriving after the row is claimed and the job created.
+    """
     joined = " ".join(graph_auth.SCOPES)
     assert "Sites.ReadWrite.All" in joined      # read the queue, write the columns
-    assert "PrintJob.ReadWriteBasic" in joined  # create, start, cancel
+    assert "PrintJob.ReadWriteBasic" in joined  # create the job, start it, cancel it
+    assert "PrintJob.Create" in joined          # createUploadSession -- Basic is refused
     assert "Printer.Read.All" in joined         # resolve the printer behind a share

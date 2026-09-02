@@ -202,8 +202,10 @@ Only worth doing once stage 1 prints.
 
 1. New registration → **Authentication** → enable **Allow public client flows**.
 2. **API permissions** → Microsoft Graph → *Delegated*:
-   `Sites.ReadWrite.All`, `PrintJob.ReadWriteBasic`, `Printer.Read.All`,
-   `PrinterShare.ReadBasic.All`, `offline_access` → **Grant admin consent**.
+   `Sites.ReadWrite.All`, `PrintJob.ReadWriteBasic`, `PrintJob.Create`,
+   `Printer.Read.All`, `PrinterShare.ReadBasic.All`, `offline_access` →
+   **Grant admin consent**. Both PrintJob scopes are needed: `createUploadSession`
+   refuses `ReadWriteBasic`.
 3. Note the **Application (client) ID** and **Directory (tenant) ID**.
 
 **C — local settings:**

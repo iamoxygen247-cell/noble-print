@@ -15,6 +15,8 @@ would reintroduce silently.
 
 from __future__ import annotations
 
+import urllib.parse
+
 import pytest
 
 import graph_client
@@ -214,6 +216,87 @@ def test_get_download_url_returns_name_size_and_content_type(client, graph, cont
     assert info["name"] == "statement.pdf"
     assert info["size"] == 4096
     assert info["content_type"] == "application/pdf"
+
+
+def test_the_drive_item_request_does_not_select_away_the_download_url(client, graph, context):
+    """Defect L1, found in live testing on 2026-09-01 and reproduced by the fake.
+
+    `@microsoft.graph.downloadUrl` is an annotation, not a property. A $select
+    naming ordinary properties returns those properties and drops the
+    annotations -- including this one, even when it is named in the same
+    $select. The shipped code did exactly that, so EVERY real download failed
+    with "no downloadable driveItem (is it a folder?)" on files that were
+    perfectly ordinary PDFs.
+
+    The offline suite could not see it: FakeGraph ignored $select and returned
+    the URL regardless. It now models the service, which is what makes this test
+    fail if the select comes back.
+    """
+    graph.add_item("1")
+    info = sharepoint.get_download_url(client, context, "1")
+    assert info["download_url"]
+
+    request = graph.calls_to("/driveItem", method="GET")[-1]
+    ordinary = [field for field in _select_fields(request.url)
+                if not field.startswith("@")]
+    assert not ordinary, (
+        "the driveItem GET selects {} -- any ordinary property in $select "
+        "drops the download URL annotation".format(", ".join(ordinary)))
+
+
+def _select_fields(url: str) -> list:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    return [field.strip() for field in (query.get("$select") or [""])[0].split(",")
+            if field.strip()]
+
+
+def test_a_reset_connection_is_retried_rather_than_failing_the_file(client, graph,
+                                                                    context, no_sleep):
+    """A GET of a document is idempotent, so a reset mid-handshake must not cost
+    a claimed row.
+
+    Measured on a workstation running TLS interception (2026-09-01): two of three
+    identical attempts died with WinError 10054 and the third returned the file.
+    Unretried, that is a PRINT_FAILED written for a reason outside the pipeline,
+    and a human resetting the column by hand before anything can be re-run.
+    """
+    graph.add_item("1")
+    graph.anon.download_resets = 2
+
+    info = sharepoint.get_download_url(client, context, "1")
+    assert sharepoint.download(info["download_url"]) == graph.anon.content
+
+    assert len(graph.anon.calls_to("/download/1")) == 3
+    assert len(no_sleep) == 2, "the retries did not back off"
+
+
+def test_a_download_gives_up_after_the_attempt_limit(client, graph, context, no_sleep):
+    """The retry is bounded. The download URL expires within minutes, so an
+    endlessly retried GET would outlive the URL it is fetching."""
+    graph.add_item("1")
+    graph.anon.download_resets = 99
+
+    info = sharepoint.get_download_url(client, context, "1")
+    with pytest.raises(GraphError) as caught:
+        sharepoint.download(info["download_url"])
+
+    assert "10054" in str(caught.value), "the underlying cause must survive"
+    assert len(graph.anon.calls_to("/download/1")) == graph_client.MAX_ATTEMPTS
+
+
+def test_an_expired_download_url_is_not_retried(client, graph, context, no_sleep):
+    """410 Gone means the URL expired, and every retry of it expires too. Only a
+    transport failure and the documented retryable statuses are worth a second
+    attempt."""
+    graph.add_item("1")
+    graph.anon.download_status = 410
+
+    info = sharepoint.get_download_url(client, context, "1")
+    with pytest.raises(GraphError):
+        sharepoint.download(info["download_url"])
+
+    assert len(graph.anon.calls_to("/download/1")) == 1
+    assert no_sleep == []
 
 
 def test_a_list_item_with_no_drive_item_is_an_error(client, graph, context):

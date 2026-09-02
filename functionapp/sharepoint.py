@@ -229,9 +229,20 @@ def get_download_url(client: GraphClient, context: ListContext,
     listItem exposes a documented `driveItem` relationship for document
     libraries. The download URL expires within minutes, so it is fetched here
     immediately before use and never cached.
+
+    THERE IS DELIBERATELY NO $SELECT, AND ADDING ONE BREAKS EVERY DOWNLOAD.
+    `@microsoft.graph.downloadUrl` is an OData *annotation*, not a property: a
+    $select naming ordinary properties makes the service return those properties
+    and drop the annotations -- INCLUDING the one asked for by name in the same
+    $select. Verified against the live service on 2026-09-01 (defect L1):
+
+        ?$select=id,name,size,file,@microsoft.graph.downloadUrl   -> no URL
+        (no $select)                                              -> URL present
+
+    The response is a few hundred bytes larger without the select. That is the
+    whole cost, and it buys a request shape that can actually download a file.
     """
-    url = (f"{context.items_url}/{item_id}/driveItem"
-           f"?$select=id,name,size,file,@microsoft.graph.downloadUrl")
+    url = f"{context.items_url}/{item_id}/driveItem"
     payload = client.get_json(url) or {}
     download_url = payload.get("@microsoft.graph.downloadUrl")
     if not download_url:
