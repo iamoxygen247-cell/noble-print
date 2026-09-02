@@ -51,8 +51,11 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $PdfPath,
 
-    [string] $ShareId = "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5",
+    # Local George's Brother MFC-L5800DW, registered 2026-08-31. Print Format is image/pwg-raster
+#    [string] $ShareId = "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5",
 
+# Noble Homes office Brother Printer MFC-L5915DW. Print Format is application/pdf.
+    [string] $ShareId = "5f488e73-ab80-4a6b-a60a-a0f883e17e2e",
     [switch] $KeepRaster,
     [switch] $PlanOnly,
 
