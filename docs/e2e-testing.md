@@ -63,7 +63,7 @@ Paper in the tray, printer awake.
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-Expect **487 passed** in about half a second. Red here means stop — do not spend
+Expect **488 passed** in about half a second. Red here means stop — do not spend
 paper diagnosing something the suite already knows about.
 
 ## A2. Is the printer reachable and still the printer we think?
@@ -156,39 +156,62 @@ the deployed variant is one flag, in B7.
 Two windows. In the first:
 
 ```powershell
-cd "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"
-.\scripts\start-local.ps1          # Ctrl+C stops it
+$Repo = "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"
+Set-Location -LiteralPath $Repo
+& (Join-Path $Repo "scripts\start-local.ps1")   # Ctrl+C stops it
 ```
 
 Leave it running and watch it — the `RUN_SUMMARY` and `PRINT_EVENT` lines scroll
 past there, and they are the only place you can see *why* Poll did what it did.
 
-Everything else goes in a **second** window, also at the repo root. Set these
-once so the commands below stay short:
+Everything else goes in a **second** window. Paste this setup block first. It
+uses absolute paths, so the commands continue to work even if the window was
+previously in `functionapp` or another directory:
 
 ```powershell
-$PY  = ".\.venv\Scripts\python.exe"
+$Repo = "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"
+Set-Location -LiteralPath $Repo
+
+$Python          = Join-Path $Repo ".venv\Scripts\python.exe"
+$TestScript      = Join-Path $Repo "scripts\test.py"
+$BootstrapScript = Join-Path $Repo "scripts\bootstrap_token.py"
+
+foreach ($RequiredFile in @($Python, $TestScript, $BootstrapScript)) {
+    if (-not (Test-Path -LiteralPath $RequiredFile -PathType Leaf)) {
+        throw "Required file was not found: $RequiredFile"
+    }
+}
+
 $LIB = "AI_DropBox_V2026"
 $FLD = "/Backup/Invoice"
 $SHARE = "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
 ```
 
+> **PowerShell syntax:** the leading `&` in every Python command below is the
+> call operator. It is required because `$Python` contains an executable path.
+> Typing `$Python scripts\test.py ...` without `&` causes `Unexpected token`, and
+> defining `$Python` as a relative path causes `not recognized` after changing
+> directories.
+
 **Prerequisites**, all one-time:
 
 ```powershell
 # 1. local.settings.json exists and is filled in
-Copy-Item functionapp\local.settings.json.template functionapp\local.settings.json
+if (-not (Test-Path -LiteralPath ".\functionapp\local.settings.json")) {
+    Copy-Item ".\functionapp\local.settings.json.template" `
+        ".\functionapp\local.settings.json"
+}
 #    then set GRAPH_TENANT_ID, GRAPH_CLIENT_ID, SHAREPOINT_HOSTNAME,
 #    SHAREPOINT_SITE_PATH -- see docs/deploy-to-azure.md steps 1 and 6
 
 # 2. a refresh token. Locally you may use PRINT_REFRESH_TOKEN instead of a vault:
-$PY scripts\bootstrap_token.py --print-only
+& $Python $BootstrapScript --print-only
 #    paste the value into local.settings.json as PRINT_REFRESH_TOKEN
 #    (it logs a warning on every use -- that is deliberate, and it must NEVER
 #     be set in Azure)
 
 # 3. TLS, if Graph calls fail with CERTIFICATE_VERIFY_FAILED
-$PY -m pip install truststore
+& $Python -m pip install truststore
 ```
 
 ## B0a. Health — run this before anything else
@@ -198,7 +221,7 @@ and Poll, so it is what you should call before the rest of Part B: if it is
 unhealthy, everything below fails for a reason it already told you.
 
 ```powershell
-$PY scripts\test.py health --printer-share-id $SHARE --print-format image/pwg-raster
+& $Python $TestScript health --printer-share-id $SHARE --print-format image/pwg-raster
 ```
 
 Expect exactly this on the real printer:
@@ -218,7 +241,7 @@ summary      : printer <name> is ready; documents go through the pdf-to-pwg-rast
 
 ```powershell
 # application/pdf on a printer that takes raster ONLY
-$PY scripts\test.py health --printer-share-id $SHARE --print-format application/pdf
+& $Python $TestScript health --printer-share-id $SHARE --print-format application/pdf
 ```
 
 ```
@@ -233,7 +256,7 @@ summary      : 1 problem: FORMAT_NOT_SUPPORTED
 was malformed and 500 means Health itself broke. Prove that distinction:
 
 ```powershell
-$PY scripts\test.py health --printer-share-id $SHARE --print-format image/png
+& $Python $TestScript health --printer-share-id $SHARE --print-format image/png
 #   -> HTTP 400  printFormat 'image/png' is not supported
 #      no `healthy` key at all: this says nothing about the printer
 ```
@@ -242,7 +265,7 @@ $PY scripts\test.py health --printer-share-id $SHARE --print-format image/png
 
 ```powershell
 # power the printer down, wait ~30s for Universal Print to notice, then:
-$PY scripts\test.py health --printer-share-id $SHARE --print-format image/pwg-raster
+& $Python $TestScript health --printer-share-id $SHARE --print-format image/pwg-raster
 ```
 
 Expect `healthy : False` with `PRINTER_NOT_ACCEPTING_JOBS`:
@@ -263,7 +286,7 @@ Compare against Submit for the same state — this is the whole argument for the
 endpoint:
 
 ```powershell
-$PY scripts\test.py submit --library $LIB --folder $FLD --printer-share-id $SHARE --batch-size 1
+& $Python $TestScript submit --library $LIB --folder $FLD --printer-share-id $SHARE --batch-size 1
 #   -> HTTP 200, submitted: 0, failed: 0, printerAvailable: False
 #      A 200 with no failures. Health says False in one field instead.
 ```
@@ -273,7 +296,7 @@ Switch the printer back on before continuing.
 ## B1. The validation path — must 400, must touch nothing
 
 ```powershell
-$PY scripts\test.py badpayload
+& $Python $TestScript badpayload
 ```
 
 Expect `HTTP 400 (expected 400)` and `OK: rejected without touching the queue.`
@@ -283,7 +306,7 @@ would lock files out until its own retry.
 ## B2. Dry run — resolves everything, prints nothing
 
 ```powershell
-$PY scripts\test.py dryrun --library $LIB --folder $FLD --printer-share-id $SHARE
+& $Python $TestScript dryrun --library $LIB --folder $FLD --printer-share-id $SHARE
 ```
 
 The highest-value call here. Expected shape:
@@ -318,7 +341,7 @@ Check four things:
 ## B3. One real file
 
 ```powershell
-$PY scripts\test.py submit --library $LIB --folder $FLD `
+& $Python $TestScript submit --library $LIB --folder $FLD `
     --printer-share-id $SHARE --batch-size 1
 ```
 
@@ -338,7 +361,7 @@ step people skip, and the one that catches a silent write failure:
 ## B4. Mark it complete once the page is out
 
 ```powershell
-$PY scripts\test.py status --library $LIB --folder $FLD
+& $Python $TestScript status --library $LIB --folder $FLD
 ```
 
 New output shape. The `settings` line is new, and so are `requeued`, `gaveUp` and
@@ -375,11 +398,11 @@ This is the point of the change, so test it explicitly:
 
 ```powershell
 # out of range -> 400, and nothing is written
-$PY scripts\test.py status --library $LIB --folder $FLD --stall-minutes 0
-$PY scripts\test.py status --library $LIB --folder $FLD --give-up-days 400
+& $Python $TestScript status --library $LIB --folder $FLD --stall-minutes 0
+& $Python $TestScript status --library $LIB --folder $FLD --give-up-days 400
 
 # in range -> echoed back in the `settings` line
-$PY scripts\test.py status --library $LIB --folder $FLD `
+& $Python $TestScript status --library $LIB --folder $FLD `
     --stall-minutes 1 --give-up-days 2 --max-retries 3
 ```
 
@@ -402,7 +425,7 @@ it, **you** choose, and the printer's preference does not get a vote.
 
 ```powershell
 # 1. What WOULD be uploaded. Prints nothing.
-$PY scripts\test.py dryrun --library $LIB --folder $FLD `
+& $Python $TestScript dryrun --library $LIB --folder $FLD `
     --printer-share-id $SHARE --print-format image/pwg-raster
 ```
 
@@ -429,14 +452,14 @@ reaching the endpoint** — fix that before believing anything else here.
 # 2. Refusals. Both must 400 and claim nothing.
 
 # 2a. a format this app cannot produce at all
-$PY scripts\test.py dryrun --library $LIB --folder $FLD `
+& $Python $TestScript dryrun --library $LIB --folder $FLD `
     --printer-share-id $SHARE --print-format image/png
 #   -> 400  printFormat 'image/png' is not supported
 #           (expected one of: application/pdf, image/pwg-raster)
 
 # 2b. a supported format THIS PRINTER does not report. On the Brother that is
 #     application/pdf -- it takes raster only, so asking for PDF is refused.
-$PY scripts\test.py dryrun --library $LIB --folder $FLD `
+& $Python $TestScript dryrun --library $LIB --folder $FLD `
     --printer-share-id $SHARE --print-format application/pdf
 #   -> 400  printer <share display name> does not accept application/pdf
 #           (supports: image/pwg-raster)
@@ -451,7 +474,7 @@ misconfigured flow and a damaged queue.
 
 ```powershell
 # 3. For real, one file, naming the format explicitly.
-$PY scripts\test.py submit --library $LIB --folder $FLD `
+& $Python $TestScript submit --library $LIB --folder $FLD `
     --printer-share-id $SHARE --batch-size 1 --print-format image/pwg-raster
 ```
 
@@ -475,7 +498,7 @@ Optional on `status`, and a **hard override** when sent: every job lookup and
 every cancel addresses that share instead of each row's own `Printer_Name`.
 
 ```powershell
-$PY scripts\test.py status --library $LIB --folder $FLD --printer-share-id $SHARE
+& $Python $TestScript status --library $LIB --folder $FLD --printer-share-id $SHARE
 ```
 
 Expect two lines:
@@ -500,7 +523,7 @@ flag or pass the share those rows actually name.
 ## B6. Other flags
 
 ```powershell
-$PY scripts\test.py status --library $LIB --folder $FLD --json   # raw response
+& $Python $TestScript status --library $LIB --folder $FLD --json   # raw response
 ```
 
 ## B7. Against the deployed app instead
@@ -514,7 +537,7 @@ $BASE = "https://$HOST_NAME"
 $KEY  = az functionapp keys list --resource-group rg-noble-print `
     --name func-noble-print --query "functionKeys.default" -o tsv
 
-$PY scripts\test.py dryrun --base-url $BASE --key $KEY `
+& $Python $TestScript dryrun --base-url $BASE --key $KEY `
     --library $LIB --folder $FLD --printer-share-id $SHARE
 ```
 
@@ -533,6 +556,8 @@ or cold start. See `README.md`, "What a local run cannot prove".
 
 | Symptom | Cause and fix |
 |---|---|
+| `Unexpected token 'scripts\test.py'` | Python was invoked through a variable without PowerShell's call operator. Re-paste the B0 setup block and run `& $Python $TestScript ...` |
+| `'.\.venv\Scripts\python.exe' is not recognized` | `$Python` was defined as a relative path and the window is in `functionapp`. Re-paste the B0 setup block; it defines an absolute interpreter path and returns to the repository root |
 | `invalid choice: 'resubmit'` / `'stale'` | Both are gone. Recovery is Poll's now — see Part C |
 | `could not reach http://localhost:7071` | `start-local.ps1` is not running, or it failed to start. Check the first window |
 | `HTTP 401` (deployed only) | Missing or wrong `--key` |
@@ -580,7 +605,7 @@ The cleanest test, and the one that pins the double-print guard. No hand editing
 3. Submit it:
 
 ```powershell
-$PY scripts\test.py submit --library $LIB --folder $FLD `
+& $Python $TestScript submit --library $LIB --folder $FLD `
     --printer-share-id $SHARE --batch-size 1
 ```
 
@@ -589,7 +614,7 @@ Note the `Print_JobId` SharePoint now shows. The job is queued and going nowhere
 4. Wait about two minutes, then poll with a one-minute stall threshold:
 
 ```powershell
-$PY scripts\test.py status --library $LIB --folder $FLD --stall-minutes 1
+& $Python $TestScript status --library $LIB --folder $FLD --stall-minutes 1
 ```
 
 Expect `requeued : 1`, and in SharePoint:
@@ -644,7 +669,11 @@ owns it.
    `Print_JobId` = empty.
 2. **Wait two minutes** — see the warning above; the row will not move before the
    next boundary.
-3. `status --stall-minutes 1`
+3. Run:
+
+   ```powershell
+   & $Python $TestScript status --library $LIB --folder $FLD --stall-minutes 1
+   ```
 
 Expect `requeued : 1` and the row back at `PRINT_READY`. `graph.cancelled` stays
 empty in this case — there is no job to cancel, and the host window shows a
@@ -656,7 +685,11 @@ Needs a file **older than one day**, because `giveUpDays` has a floor of 1. Use
 any old PDF already in the library rather than waiting.
 
 1. Set an old file to `Print_Status` = `PRINT_PENDING` with a `Printer_Name`.
-2. `status --give-up-days 1`
+2. Run:
+
+   ```powershell
+   & $Python $TestScript status --library $LIB --folder $FLD --give-up-days 1
+   ```
 
 This one fires **immediately** — the give-up test runs before the stall test, so
 it does not care whether the job is stalled or how long ago you edited the row.
