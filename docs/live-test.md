@@ -10,10 +10,17 @@ Azure portal left ambiguous. Do it first; if it fails, nothing in stage 2 can wo
 
 > ## ⚠️ The printer changed on 2026-08-31 — this stage must be re-run
 >
+> **Superseded: use [`e2e-testing.md`](e2e-testing.md) Part A instead.** It is the
+> maintained version of this stage — it runs the app's own profile selection and
+> job configuration rather than settings of its own, and it tracks the current
+> printer. This document is kept for the reasoning below, which is still what makes
+> a green run mean something.
+>
 > Everything in Stage 1 below was measured on the **Brother DCP-L2540DW**, which
-> has since been retired: it is not a Universal Print ready device. The current
-> printer is the **Brother MFC-L5800DW series [3c2af401eecf]**
-> (share `4429bf4e-…`, printer `cf8d9fa1-…`).
+> has since been retired: it is not a Universal Print ready device. It was replaced
+> by the **Brother MFC-L5800DW series [3c2af401eecf]** (share `4429bf4e-…`,
+> printer `cf8d9fa1-…`), and the current printer is the **Noble Home MFC**
+> (share `5f488e73-…`) — two printer changes since this text was written.
 >
 > **Stage 1 cannot be re-run as written.** The MFC reports `image/pwg-raster` and
 > nothing else, and this script uploads a PDF, so it will fail at the upload. The
@@ -277,13 +284,13 @@ cd "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"
 .\.venv\Scripts\python.exe scripts\test.py dryrun `
     --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
-    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
+    --printer-share-id "5f488e73-ab80-4a6b-a60a-a0f883e17e2e"
 
 # 5. One real file.
 .\.venv\Scripts\python.exe scripts\test.py submit `
     --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
-    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5" `
+    --printer-share-id "5f488e73-ab80-4a6b-a60a-a0f883e17e2e" `
     --batch-size 1
 
 # 6. Mark it complete once the page is out.
@@ -304,7 +311,7 @@ After step 5, open the library. The file should read:
 | Column | Value |
 |---|---|
 | `Print_Status` | `PRINT_PENDING` |
-| `Printer_Name` | `4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5` |
+| `Printer_Name` | `5f488e73-ab80-4a6b-a60a-a0f883e17e2e` |
 | `Print_JobId` | a short number — they start at 1 per printer, so expect something like `6`, not a GUID |
 | `Print_Message` | *(empty)* |
 

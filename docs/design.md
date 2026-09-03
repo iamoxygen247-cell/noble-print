@@ -1050,7 +1050,7 @@ py -m venv .venv
 
 .\.venv\Scripts\python.exe scripts\bootstrap_token.py      # one-time device-code sign-in
 .\scripts\start-local.ps1                                  # venv + TLS shim + func start
-.\.venv\Scripts\python.exe scripts\test.py --dry-run --library "Documents" --folder "/Invoices/ToPrint"
+.\.venv\Scripts\python.exe scripts\test.py dryrun --hostname "<tenant>.sharepoint.com" --site-path "/sites/<site>" --library "Documents" --folder "/Invoices/ToPrint" --printer-share-id "<guid>"
 .\.venv\Scripts\python.exe scripts\test.py submit --hostname "<tenant>.sharepoint.com" --site-path "/sites/<site>" --library "Documents" --folder "/Invoices/ToPrint" --printer-share-id "<guid>" --batch-size 1
 ```
 

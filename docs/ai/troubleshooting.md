@@ -506,3 +506,38 @@ the app stays UTC because `parse_graph_datetime` normalises on read.
 string that is purely for display may be naive. Before reusing a formatter, ask
 whether the existing caller ever reads its output back — if it does not, its
 format is not evidence that yours is safe.
+
+---
+
+## Swapping the printer silently changed which conversion profile runs
+
+**Symptom:** nothing errors. Pages still come out. But the pipeline is uploading
+PDFs unconverted when every bench test proved the raster path — or a runbook says
+`application/pdf` is "a 400 on every recurrence" and it is now accepted.
+
+**Cause:** profile selection is capability-driven when `printFormat` is omitted.
+`printing.PROFILES` is ordered `(PwgRasterProfile, PassthroughProfile)`, and
+`PwgRasterProfile.matches` returns `False` as soon as the printer accepts the
+source type — "passthrough is cheaper; let it win". So the same flow body means
+two different pipelines:
+
+| The printer reports | `printFormat` omitted | `printFormat: image/pwg-raster` |
+|---|---|---|
+| `image/pwg-raster` only | `pdf-to-pwg-raster` | `pdf-to-pwg-raster` |
+| **both** raster and `application/pdf` | **`passthrough`** | `pdf-to-pwg-raster` |
+
+Change the printer and the flow body does not change — but what it *does* can.
+Every doc that recorded "this printer reports raster only" then becomes an
+assertion about a device that is no longer the target, and the two documents
+disagree without either being edited.
+
+**Fix:** read the capability list, do not infer it from another document —
+`live-printer-check.ps1 -DiagnoseOnly`, or the `content` line of
+`test.py dryrun` / `test.py health`. Then name the format explicitly in Flow A
+whenever the printer reports more than one, so the deployed path equals the
+bench-tested one by construction rather than by luck.
+
+**Rule:** when a device's *capabilities* are an input to behaviour, a printer swap
+is a behaviour change. Record capabilities with the share id and a date next to
+them, and re-read them on every swap — an undated capability claim inherited from
+the previous device is the failure mode, not the value itself.

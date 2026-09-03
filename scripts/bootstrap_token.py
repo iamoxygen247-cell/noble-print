@@ -151,6 +151,7 @@ def main() -> int:
     print()
     print("Verify with:")
     print("  .\\.venv\\Scripts\\python.exe scripts\\test.py dryrun "
+          "--hostname <tenant>.sharepoint.com --site-path /sites/<site> "
           "--library \"Documents\" --folder \"/Invoices/ToPrint\" "
           "--printer-share-id <guid>")
     return 0

@@ -208,9 +208,14 @@ $FLD = "/Backup/Invoice"
 $SHARE = "5f488e73-ab80-4a6b-a60a-a0f883e17e2e"
 
 # The upload format, splatted into every health / submit / dryrun call below.
-# This printer reports BOTH image/pwg-raster and application/pdf, and with no
-# format named the capabilities pick passthrough -- the PDF goes up unchanged.
 # This is the one line that decides the format for every step below.
+#
+# IF this printer reports BOTH image/pwg-raster and application/pdf, then with no
+# format named the capabilities pick passthrough and the PDF goes up unchanged --
+# so naming the format is what keeps this run on the raster path, and Flow A must
+# name it too (deploy-to-azure.md step 10). Confirm with B0a's `content` line
+# before trusting either reading; the sample outputs further down were captured on
+# the PREVIOUS printer, which was raster-only.
 #
 #   @("--print-format", "image/pwg-raster")   raster  <- default
 #   @("--print-format", "application/pdf")    PDF, explicitly
@@ -258,7 +263,7 @@ unhealthy, everything below fails for a reason it already told you.
 & $Python $TestScript health --printer-share-id $SHARE @FMT
 ```
 
-Expect exactly this on the real printer:
+Expect this shape:
 
 ```
 HTTP 200
@@ -270,6 +275,12 @@ summary      : printer <name> is ready; documents go through the pdf-to-pwg-rast
   content    : image/pwg-raster
   profile    : pdf-to-pwg-raster  (converts: True)
 ```
+
+> **The sample blocks in this document were captured on the previous printer**
+> (share `4429bf4e-…`), so the ids differ from `$SHARE` and so may `content`.
+> **`content` is the line to read here** — it is the one value the rest of this
+> document, and Flow A's body, depend on. If it lists `application/pdf` as well as
+> `image/pwg-raster`, see B5a and `deploy-to-azure.md` step 10 before going on.
 
 ### The refusal — and why it is a 200
 
@@ -457,14 +468,20 @@ defaults.
 Without this flag Submit picks a profile from what the **printer** reports. With
 it, **you** choose, and the printer's preference does not get a vote.
 
-> **Read this before running anything.** `$SHARE` above is the Brother
-> MFC-L5800DW, and it reports **`image/pwg-raster` and nothing else** — verified
-> against the live API on 2026-08-31 (README "Its capabilities and defaults").
-> On *this* printer `--print-format image/pwg-raster` and omitting the flag
-> select the **same** profile, because the capabilities already forced the raster
-> path. So the flag cannot change the outcome here — what you are testing is that
-> it is **honoured and echoed**, and that the wrong format is **refused**. On a
-> printer that also accepted PDF the flag would genuinely change the pipeline.
+> **Read this before running anything — what the flag does here depends on B0a's
+> `content` line.**
+>
+> * **Raster-only printer** — `--print-format image/pwg-raster` and omitting the
+>   flag select the **same** profile, because the capabilities already forced the
+>   raster path. The flag cannot change the outcome; what you are testing is that
+>   it is **honoured and echoed**, and that the wrong format is **refused** with a
+>   400. This was true of the previous printer, the Brother MFC-L5800DW (share
+>   `4429bf4e-…`), verified 2026-08-31.
+> * **Dual-format printer** — the flag genuinely changes the pipeline. Omitting it
+>   selects `passthrough` and uploads the PDF unconverted; naming
+>   `image/pwg-raster` selects the converter. `--print-format application/pdf` is
+>   then **accepted**, not a 400. Flow A must name the format too, or production
+>   runs a path Part A never proved (`deploy-to-azure.md` step 10).
 
 ```powershell
 # 1. What WOULD be uploaded. Prints nothing.

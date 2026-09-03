@@ -6,8 +6,10 @@ before, and two of them fail *silently* if done out of sequence.
 > **Do [`docs/e2e-testing.md`](e2e-testing.md) Part A first.** If a page does not
 > come out of the tray from a standalone script, nothing here will make it print —
 > and Part A needs no Azure resources at all, so it costs nothing to find out.
-> This printer accepts `image/pwg-raster` only, so that test is also the one that
-> proves the PDF → raster conversion works against the real device.
+> Part A prints through `image/pwg-raster`, so it is also the test that proves the
+> PDF → raster conversion works against the real device. **Whether the printer
+> *requires* that conversion or merely accepts it decides Flow A's body** — see
+> [The printer](#the-printer) below, and settle it before step 10.
 
 ---
 
@@ -117,8 +119,10 @@ secret belongs in this file.
 
 ### Names used below
 
-**Step 3 creates these in the Azure portal.** Set the variables in PowerShell too
-— steps 5 to 9 use them — but nothing here creates anything.
+**Step 3 creates these in the Azure portal**; nothing here creates anything. Set
+them in PowerShell as well — `$RG`, `$APP`, `$VAULT`, `$SECRET` and `$SHARE` are
+used again in steps 5 to 9. The other four are here so the names are written down
+in one place; you type them into the portal rather than into a shell.
 
 ```powershell
 $RG        = "rg-noble-print"
@@ -129,6 +133,9 @@ $VAULT     = "kv-noble-print"            # globally unique
 $INSIGHTS  = "appi-noble-print"
 $WORKSPACE = "log-noble-print"
 $SECRET    = "up-print-refresh-token"
+
+# The printer share. PERISHABLE -- see "The printer" below before using it.
+$SHARE     = "5f488e73-ab80-4a6b-a60a-a0f883e17e2e"
 ```
 
 > **Region: West US**, to sit with the rest of the estate — the sibling invoice
@@ -136,6 +143,51 @@ $SECRET    = "up-print-refresh-token"
 > Consumption offers Python 3.10–3.14 there (verified 2026-08-31), so nothing is
 > given up by co-locating. Every resource below goes in **westus**; a resource in
 > the wrong region cannot be moved, only recreated.
+
+### The printer
+
+| | |
+|---|---|
+| Printer | **Noble Home MFC** |
+| Share id (`$SHARE`) | `5f488e73-ab80-4a6b-a60a-a0f883e17e2e` |
+| Content types | **read them — see below** |
+
+The share id is the **perishable** half of the share/printer pair: deleting and
+re-creating a share mints a new one while the printer id is untouched, and the
+only symptom is a 404. Every recorded copy — this file, `README.md`,
+`live-printer-check.ps1`'s default and the Power Automate flow bodies — goes stale
+at that moment. Read the current one from *Universal Print → Printers → the
+printer → Overview*.
+
+> ### ⚠️ Read this printer's content types before step 10 — they decide Flow A's body
+>
+> This is not documentation trivia. `printing/PROFILES` is ordered
+> `(PwgRasterProfile, PassthroughProfile)`, and `PwgRasterProfile.matches` stands
+> aside the moment the printer accepts the source type — rasterizing what the
+> device takes natively is wasted work. So **what the printer reports decides what
+> an omitted `printFormat` selects**:
+>
+> | Printer reports | Flow A omits `printFormat` | Flow A sends `image/pwg-raster` |
+> |---|---|---|
+> | `image/pwg-raster` only | `pdf-to-pwg-raster` | `pdf-to-pwg-raster` — identical |
+> | **both** raster **and** `application/pdf` | **`passthrough` — the PDF uploads unconverted** | `pdf-to-pwg-raster` |
+>
+> Both rows print. But `e2e-testing.md` Part A proves the **raster** path, so on a
+> dual-format printer an omitted key puts production on a pipeline nothing bench-
+> tested. One command settles it, needs no Function App, and prints nothing:
+>
+> ```powershell
+> .\scripts\live-printer-check.ps1 -DiagnoseOnly
+> ```
+>
+> **Record the answer here with a date**, the way every other verified fact in
+> this file is recorded, then follow the matching branch in step 10.
+>
+> **The repo currently disagrees with itself** and must not be trusted for this:
+> `e2e-testing.md:211` says this printer reports both, while its own §B5a callout
+> and `README.md` describe the **retired** Brother MFC-L5800DW (share
+> `4429bf4e-…`), which reported `image/pwg-raster` and nothing else. Only a live
+> read is evidence.
 
 ---
 
@@ -229,14 +281,20 @@ While you are there, confirm the **five** columns exist with these exact display
 names — `Print_Status`, `Print_JobId`, `Print_Message`, `Printer_Name`, and
 `Print_Time`.
 
-> **`Print_Time` must exist BEFORE the code is deployed.** It is a **Date and
-> Time** column, and it does **not** need indexing — the due-time comparison happens
-> in Python, because SharePoint honours only one indexed field in a `$filter` and
-> `Print_Status` holds that slot.
+> **`Print_Time` must exist BEFORE the code is deployed**, and its *settings*
+> matter as much as its existence. Create it as **Date and Time**, with:
 >
-> Unlike the two silent ordering traps elsewhere in this runbook, this one fails
-> loudly: every Submit and Poll returns 500 naming the missing column until it
-> exists. Health keeps working, because it resolves no list.
+> | Setting | Value | Why |
+> |---|---|---|
+> | **Include Time** | **Yes** | The column holds a *moment* — `stallMinutes × (2ⁿ − 1)` lands on minutes. Date-only truncates every retry boundary to midnight and the whole backoff collapses |
+> | **Friendly format** | **No** | Renders an absolute timestamp instead of "in 2 days", so the value can be read against the log |
+> | Indexed | **No** | The due-time comparison happens in Python: SharePoint honours only one indexed field in a `$filter` and `Print_Status` holds that slot |
+>
+> Unlike the two silent ordering traps elsewhere in this runbook, a *missing*
+> column fails loudly: every Submit and Poll returns 500 naming it until it
+> exists. Health keeps working, because it resolves no list. A column that exists
+> with the **wrong settings** fails quietly instead — which is why they are a table
+> rather than a sentence. Step 9 proves the round trip.
 
 **Index confirmed 2026-08-31** — `Print_Status`, 1 of a maximum 20 indices, on
 list `{6B19AB5B-2823-4073-8B8F-33C3DB52F3E6}` in site
@@ -597,7 +655,8 @@ or wheel is shipped and native packages are resolved for the target OS.
 >
 > The `functionapp/printing/` package ships automatically — it is inside the
 > published folder, and `.funcignore` excludes only `tests/`, `.venv/`,
-> `__pycache__/` and the settings files.
+> `.python_packages/`, `__pycache__/`, `*.py[cod]`, `.vscode/`, `README.md` and
+> the two settings files.
 
 Publishing runs from `functionapp/`, so everything outside it — `tests/`,
 `scripts/`, `.venv/`, `docs/` — is already out of the artifact by construction.
@@ -641,10 +700,14 @@ Expected:
 |---|---|
 | `GRAPH_TENANT_ID` / `GRAPH_CLIENT_ID` | your registration |
 | `KEY_VAULT_URI` | `https://kv-noble-print.vault.azure.net/` |
+| `PRINT_REFRESH_TOKEN_SECRET` | `up-print-refresh-token` |
 | `PRINT_BUSINESS_TZ` | `America/Vancouver` |
+| `PRINT_BUDGET_SECONDS` | `90` |
+| `GRAPH_TIMEOUT_SECONDS` | `30` |
 | `PRINT_RASTER_DPI` | `300` |
 | `PRINT_RASTER_MAX_BYTES` | `33554432` |
 | `PRINT_REFRESH_TOKEN` | **absent** |
+| `SHAREPOINT_HOSTNAME` / `SHAREPOINT_SITE_PATH` | **absent, or present and inert.** They were app settings until 2026-09-02 and the site is request input now. A leftover does nothing at all — the query above filters for them so you see one rather than wonder |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | **present** — set by the portal in 3.4, not by step 6. Missing means App Insights was never enabled on the app, and every count in the weekly report will be empty |
 
 The query above filters by prefix, so widen it to see the App Insights row:
@@ -665,6 +728,11 @@ az functionapp config appsettings list --resource-group $RG --name $APP `
     --query "[?contains(name,'Sampling')]" -o table
 ```
 
+> **An empty table is the pass.** The authority is `host.json`
+> (`samplingSettings.isEnabled: false`), which ships with the code in step 7 — this
+> query only looks for an app setting that would *override* it. Nothing returned
+> means nothing overrides it. A row here is the failure.
+
 Get the host name and a function key:
 
 ```powershell
@@ -683,33 +751,42 @@ $BASE = "https://$HOST_NAME"
 Same harness as local, just pointed at the deployed app.
 
 ```powershell
+# The site, and the upload format. $FMT must carry whatever Flow A will carry --
+# see "The printer" in step 0. Set it to @() only if the printer is raster-only,
+# where omitting and naming the format select the SAME profile.
+$SITE = @("--hostname", "noblehomes.sharepoint.com", "--site-path", "/sites/PM")
+$QUEUE = @("--library", "AI_DropBox_V2026", "--folder", "/Backup/Invoice")
+$FMT  = @("--print-format", "image/pwg-raster")
+
 # 1. Validation path: must 400, must touch nothing.
 .\.venv\Scripts\python.exe scripts\test.py badpayload --base-url $BASE --key $KEY
 
-# 2. Dry run: resolves site, library, the four INTERNAL column names, the
+# 2. Dry run: resolves site, library, the five INTERNAL column names, the
 #    printer's real capabilities, and WHICH CONVERSION PROFILE would run.
 #    Prints nothing on paper.
 .\.venv\Scripts\python.exe scripts\test.py dryrun --base-url $BASE --key $KEY `
-    --hostname noblehomes.sharepoint.com --site-path /sites/PM `
-    --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
-    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
+    @SITE @QUEUE --printer-share-id $SHARE @FMT
 
 # 3. Exactly one real file.
 .\.venv\Scripts\python.exe scripts\test.py submit --base-url $BASE --key $KEY `
-    --hostname noblehomes.sharepoint.com --site-path /sites/PM `
-    --library "AI_DropBox_V2026" --folder "/Backup/Invoice" `
-    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5" --batch-size 1
+    @SITE @QUEUE --printer-share-id $SHARE @FMT --batch-size 1
 
 # 4. Once the page is out, mark it complete.
 .\.venv\Scripts\python.exe scripts\test.py status --base-url $BASE --key $KEY `
-    --hostname noblehomes.sharepoint.com --site-path /sites/PM `
-    --library "AI_DropBox_V2026" --folder "/Backup/Invoice"
+    @SITE @QUEUE
 ```
 
-In step 2's output, `conversion` must read **`pdf-to-pwg-raster`** for this
-printer. `NONE` means no profile matched and every file would fail at preflight.
-The `job config` line should match what
-[`e2e-testing.md`](e2e-testing.md) Part A printed with.
+Read three lines out of the dry run:
+
+* **`content`** — the printer's real capability list. This is the value step 0
+  told you to record, and it decides Flow A's body in step 10.
+* **`conversion`** — must be **`pdf-to-pwg-raster`** when `$FMT` names raster.
+  **`NONE`** means no profile matched and every file would fail at preflight.
+  `passthrough` here means `$FMT` was empty *and* the printer accepts PDF — legal,
+  but it is not the path Part A proved, so make it a decision rather than a
+  surprise.
+* **`job config`** — should match what [`e2e-testing.md`](e2e-testing.md) Part A
+  printed with.
 
 **5. Open the library and read the five columns back.** This is the step people
 skip, and it is the one that catches a silent write failure — the response can
@@ -730,6 +807,29 @@ traces
 | project timestamp, message
 ```
 
+**7. Prove the `Print_Time` round trip.** The offline suite cannot: `FakeGraph`
+stores whatever it is handed, so only the live list can say whether a **Date and
+Time** column accepts the offset-bearing ISO string the app writes, returns the
+same instant, and is emptied by a JSON `null`. Skip it and a mis-created column
+(step 2) surfaces later as a retry schedule that silently does not hold.
+
+```powershell
+# Read-only: resolves the column and reports its internal name.
+.\.venv\Scripts\python.exe scripts\verify_print_time.py `
+    @SITE --library "AI_DropBox_V2026"
+
+# Then, on a PRINT_READY row from that output -- it WRITES to that row and
+# restores the original value afterwards, so nominate one you can disturb.
+.\.venv\Scripts\python.exe scripts\verify_print_time.py `
+    @SITE --library "AI_DropBox_V2026" --item <id>
+```
+
+> This one talks to **Graph directly**, not through the deployed app — no
+> `--base-url`, no `--key`. It needs the step 5 environment (`GRAPH_TENANT_ID`,
+> `GRAPH_CLIENT_ID`, `KEY_VAULT_URI`) in the same shell, or the equivalent in
+> `functionapp/local.settings.json`, and it reads the refresh token as **you**,
+> which the Secrets Officer role from step 4.3 already allows.
+
 ---
 
 ## 10. Power Automate flows
@@ -740,10 +840,26 @@ or you get a race you will debug at 2 a.m.
 
 | Flow | Recurrence | Body |
 |---|---|---|
-| **Health** | *(a step inside A and B, not its own flow)* | `{"printerShareId":"4429bf4e-…"}` |
-| **A — Submit** | 15 min | `{"sharepointHostname":"noblehomes.sharepoint.com","sharepointSitePath":"/sites/PM","library":"AI_DropBox_V2026","folder":"/Backup/Invoice","printerShareId":"4429bf4e-…","batchSize":5}` |
+| **Health** | *(a step inside A and B, not its own flow)* | `{"printerShareId":"5f488e73-…"}` |
+| **A — Submit** | 15 min | `{"sharepointHostname":"noblehomes.sharepoint.com","sharepointSitePath":"/sites/PM","library":"AI_DropBox_V2026","folder":"/Backup/Invoice","printerShareId":"5f488e73-…","batchSize":5}` |
 | **B — Poll** | 10 min | `{"sharepointHostname":"noblehomes.sharepoint.com","sharepointSitePath":"/sites/PM","library":"AI_DropBox_V2026","folder":"/Backup/Invoice","giveUpDays":10,"stallMinutes":5}` |
 | **D — Digest** | Mon 07:00 | SharePoint *Get items* per status; email the counts |
+
+> **Flow A's body above omits `printFormat`, and that is only correct on a
+> raster-only printer.** Read [`printFormat` in Flow A's body](#printformat-in-flow-as-body)
+> below before pasting it. If Health's `content` shows this printer also accepts
+> `application/pdf`, add `"printFormat":"image/pwg-raster"` — otherwise Flow A
+> silently runs passthrough.
+
+> **The recurrences are not arbitrary, and Flow A's is the expensive one.**
+> [`timing.md`](timing.md) is the authority on every clock here. The consequence
+> worth knowing before you tune anything: the retry count is derived from the
+> file's age when its *first* job is created, so **Flow A every 15 min opens the
+> retry ladder at retry 3** — every 5 min at retry 2, every minute at retry 1
+> ([`timing.md`](timing.md), "Flow B's cadence no longer eats a boundary"). Flow B
+> at 10 min and at 1 min produce identical retry sequences, because `Print_Time`
+> pins the instant. Lowering `stallMinutes` compresses the ladder and makes this
+> worse, not better.
 
 > **There is no Flow C.** A daily Resubmit flow used to exist; recovery moved into
 > Flow B on 2026-09-01. If you are working from an older copy of this runbook, do
@@ -781,32 +897,47 @@ action succeeds and the flow keeps control of the branch. Read `healthy`;
 
 ### `printFormat` in Flow A's body
 
-Optional, and **the table above deliberately omits it.** Leave it out and Submit
-picks a profile from what the printer reports, which is what happened before the
-key existed — so an existing flow needs no edit.
+Optional. Leave it out and Submit picks a profile from what the printer reports,
+which is what happened before the key existed — so an existing flow needs no edit.
 
 | Value | Effect |
 |---|---|
 | `application/pdf` | Upload the invoice untouched. **No conversion** — it already is a PDF |
-| `image/pwg-raster` | Run the PWG converter first, for a printer that takes raster only |
+| `image/pwg-raster` | Run the PWG converter first |
 | *(omitted)* | Choose from the printer's `contentTypes` |
 
-> **Do not put `"printFormat":"application/pdf"` in Flow A for the current
-> printer.** The Brother MFC-L5800DW reports **`image/pwg-raster` and nothing
-> else** (verified against the live API 2026-08-31). Asking it for PDF is a **400
-> on every recurrence** — the flow would fail continuously and print nothing.
+**Whether to set it is decided by the printer, not by preference.** `PROFILES` is
+ordered `(PwgRasterProfile, PassthroughProfile)` and `PwgRasterProfile.matches`
+stands aside as soon as the device accepts the source type — rasterizing what the
+printer takes natively is wasted work. So an omitted key resolves differently on
+the two kinds of device:
+
+| The printer reports | Omit the key | Send `"image/pwg-raster"` |
+|---|---|---|
+| `image/pwg-raster` only | `pdf-to-pwg-raster` | `pdf-to-pwg-raster` — identical, so omitting is right and the key buys nothing but an entry in the run history |
+| **both** raster **and** `application/pdf` | **`passthrough`** — the PDF goes up unconverted | `pdf-to-pwg-raster` |
+
+> **On a dual-format printer, put `"printFormat":"image/pwg-raster"` in Flow A.**
+> Both paths print, but only the raster one is bench-proved:
+> [`e2e-testing.md`](e2e-testing.md) Part A and Part B run with
+> `--print-format image/pwg-raster`. Omitting the key there would put production
+> on a pipeline nothing ever tested, and the only visible trace would be
+> `conversion: passthrough` in a dry run nobody re-reads.
 >
-> On this printer the only valid explicit value is `"image/pwg-raster"`, and that
-> selects the *same* profile the capabilities already select, so it buys nothing
-> but an entry in the run history. **Omitting the key is the right default here.**
+> **On a raster-only printer, omit it** — and never send `"application/pdf"`:
+> that is a **400 on every recurrence**, so the flow fails continuously and prints
+> nothing.
 
-Set it when you want the choice to be **yours rather than the device's** — which
-only changes an outcome on a printer that reports **both** formats, where the app
-would otherwise always pick passthrough. A value the printer does not report is a
-**400 at preflight** naming what it does support, and **nothing is claimed**, so a
-wrong value cannot strand files — it just means nothing prints until you fix it.
+Which one this printer is, is the read recorded in [The printer](#the-printer).
+Step 9's dry run reports it again as `content` and `conversion`.
 
-### The three numbers in Flow B's body
+A value the printer does not report is a **400 at preflight** naming what it does
+support, and **nothing is claimed** — so a wrong value cannot strand files; it
+just means nothing prints until you fix it. A format this *document* cannot be
+turned into is different: that is a per-file `PRINT_FAILED`, one bad file among
+good ones.
+
+### The two numbers in Flow B's body
 
 They are the whole reason the retry pacing lives in the flow rather than in app
 settings: **changing them needs no deploy and no app restart.** Each falls back to
@@ -825,8 +956,9 @@ sending `maxRetries` is accepted and ignored — which is what lets the code dep
 before the flows are edited.
 
 An out-of-range value is a **400** — the response names the key and its range.
-The response also echoes all three back, so what was actually in force is visible
-in the run history rather than inferred from what you meant to send.
+The response echoes `giveUpDays`, `stallMinutes` and `printerShareId` back, so
+what was actually in force is visible in the run history rather than inferred from
+what you meant to send.
 
 ### `printerShareId` in Flow B's body — optional, and read this first
 
@@ -910,7 +1042,7 @@ git checkout <GOOD_SHA>
 cd functionapp; func azure functionapp publish $APP --build remote; cd ..
 
 # Or stop the pipeline instantly without touching the app:
-#   turn OFF Power Automate flows A and C.
+#   turn OFF Power Automate flows A and B.
 # Files stay PRINT_READY and nothing is lost -- the library IS the queue.
 ```
 
@@ -932,7 +1064,8 @@ immediately and leaves the queue intact.
 | `convert: ...` in `Print_Message` | The document could not be rasterized | A damaged or password-protected PDF, or one over `PRINT_RASTER_MAX_BYTES`. Reproduce locally: `python -m printing <file>.pdf out.pwg --dpi 300` |
 | Prints, but the page is cropped or scaled | The raster and the job configuration disagree | `scaling`/`margin`/`dpi` in `printing/profiles.py` must match the render dpi. Graph still reports `completed` — only the paper shows it |
 | `ModuleNotFoundError: pypdfium2` | Remote build did not install it | Confirm `pypdfium2` is in `functionapp/requirements.txt` and that publish used `--build remote` |
-| Stuck `PRINT_PENDING`, nothing prints | Nothing is delivering jobs to the device | [`live-test.md`](live-test.md) stage 1 |
+| Stuck `PRINT_PENDING`, nothing prints | Nothing is delivering jobs to the device | [`e2e-testing.md`](e2e-testing.md) Part A |
+| Prints, but not the pipeline Part A proved | Flow A omitted `printFormat` on a printer that also accepts PDF, so passthrough won | Step 10, [`printFormat` in Flow A's body](#printformat-in-flow-as-body) |
 | Counts in the workbook look low | Adaptive sampling got enabled | Step 8 |
 
 Anything not on this list belongs in
@@ -945,11 +1078,15 @@ cause and verified the fix.
 
 ```
 [ ]  0  e2e-testing.md Part A: a page came out of the tray, NOT cropped
+[ ]  0  PRINTER content types READ and RECORDED with a date (live-printer-check
+        -DiagnoseOnly). Raster-only or dual-format? It decides Flow A's body
 [ ]  0  az reaches Azure through the truststore wrapper (az group list works)
 [ ]  0  az account show = dev-Document Intelligence (28e61545-...); role = Owner
 [ ]  0  did NOT run az upgrade
 [ ]  1  Entra app: public client flows ON, 5 delegated permissions, admin consent
-[ ]  2  SharePoint: 4 columns exist, Print_Status INDEXED (approval already checked: off)
+[ ]  2  SharePoint: 5 columns exist, Print_Status INDEXED (approval already checked: off)
+[ ]  2  Print_Time is Date and Time with INCLUDE TIME on, friendly format off,
+        NOT indexed -- wrong settings fail quietly, a missing column does not
 [ ]  3  PORTAL, all WEST US: RG, storage, Flex Consumption app (Python 3.14,
         2048 MB, App Insights ENABLED in the wizard), Key Vault on the RBAC
         permission model -- 5 resources in the group
@@ -958,23 +1095,33 @@ cause and verified the fix.
 [ ]  5  bootstrap_token.py run as the SERVICE ACCOUNT; secret exists in the vault
 [ ]  6  App settings set incl. PRINT_RASTER_*; PRINT_REFRESH_TOKEN absent;
         APPLICATIONINSIGHTS_CONNECTION_STRING present (from 3.4); sampling off
-[ ]  7  pytest green (487); token pre-warmed; publish --build remote; THREE
+[ ]  7  pytest green (570); token pre-warmed; publish --build remote; THREE
         functions listed -- check_printer_health, poll_print_status,
         submit_print_jobs (fewer means an old build)
-[ ]  8  Settings read BACK; defaultHostName captured; key captured
+[ ]  8  Settings read BACK; defaultHostName captured; key captured; sampling
+        query returned NOTHING (empty is the pass -- host.json is the authority)
 [ ]  9  badpayload 400 · dryrun shows conversion=pdf-to-pwg-raster · one real file ·
         READ THE COLUMNS · READ THE PAPER · PRINT_EVENT in AI
+[ ]  9  verify_print_time.py: column resolves, a written value returns the SAME
+        INSTANT, null clears it. FakeGraph cannot prove this -- only the live list
 [ ]  9  e2e-testing.md Part C: printer off -> status shows requeued=1 and the host
         logs `cancelled` THEN `requeued`; printer on -> exactly ONE sheet
 [ ]  9  e2e-testing.md B5a: dryrun --print-format image/pwg-raster echoes
-        `requested fmt: image/pwg-raster`; --print-format application/pdf is a
-        400 on THIS printer (raster only). Flow A carries NO printFormat
-[ ]  9  e2e-testing.md B0a: health is healthy:True; --print-format application/pdf
-        is a 200/unhealthy (NOT a 400); image/png IS a 400; printer OFF gives
-        PRINTER_NOT_ACCEPTING_JOBS -- and RECORD the observed `state` into
-        design.md's status.state row
+        `requested fmt: image/pwg-raster`. On a RASTER-ONLY printer
+        --print-format application/pdf is a 400; on a DUAL-FORMAT one it is
+        accepted and selects passthrough -- which is the whole reason to decide
+[ ]  9  e2e-testing.md B0a: health is healthy:True; a format the PRINTER does not
+        report is a 200/unhealthy FORMAT_NOT_SUPPORTED, never a 400 (so on a
+        raster-only printer that is application/pdf; on a dual-format one that
+        format is simply healthy); an UNKNOWN format like image/png IS a 400;
+        printer OFF gives PRINTER_NOT_ACCEPTING_JOBS -- and RECORD the observed
+        `state` into design.md's status.state row
 [ ] 10  Flows A, B, D created -- there is NO Flow C; A loops on remainingReady
         with an iteration cap; B carries stallMinutes/giveUpDays (NOT maxRetries)
+[ ] 10  Flow A's printFormat matches the step-0 reading: OMITTED on a raster-only
+        printer, "image/pwg-raster" on one that also accepts PDF (else Flow A
+        runs passthrough, which Part A never proved)
+[ ] 10  Every flow body carries share 5f488e73-... -- NOT the retired 4429bf4e-...
 [ ] 10  BOTH flow bodies carry sharepointHostname + sharepointSitePath -- without
         them Submit and Poll are 400. Health is the signal during the cutover
 [ ] 10  BOTH flows call /api/print/health first: A TERMINATES on healthy==false,

@@ -7,7 +7,7 @@ the **code**, not the other docs — a few of those have drifted.
 
 | | Owner | Change it by | Redeploy? |
 |---|---|---|---|
-| 🎛️ | **Power Automate request body** | edit the flow's HTTP body (app setting is the fallback) | no |
+| 🎛️ | **Power Automate request body** | edit the flow's HTTP body — **the only place**; there is no app-setting fallback | no |
 | 🔧 | **App — setting** | Function App application setting | no |
 | 🛠 | **App — code** | edit the constant in source | **yes** |
 | 📄 | **App — host.json** | edit `functionapp/host.json` | **yes** |
@@ -53,7 +53,7 @@ sized against. See note **[1]**.
 | Timer | Value | Range | Owner | Defined in |
 |---|---|---|---|---|
 | `GRAPH_TIMEOUT_SECONDS` | **30.0 s** | 1–300 | 🔧 setting | [graph_client.py:45](../functionapp/graph_client.py#L45) |
-| `PRINT_BUDGET_SECONDS` | **90.0 s** | >0–600 | 🔧 setting | [print_policy.py:91](../functionapp/print_policy.py#L91) |
+| `PRINT_BUDGET_SECONDS` | **90.0 s** | >0–600 | 🔧 setting | [print_policy.py:113](../functionapp/print_policy.py#L113) |
 | Power Automate HTTP connector | **~120 s** | — | 🔒 **fixed** | not ours |
 | `functionTimeout` | **30 min** (Flex Consumption default) | — | 📄 **unset** | [host.json](../functionapp/host.json) |
 

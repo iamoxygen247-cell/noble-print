@@ -49,13 +49,13 @@ cd "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"
 .\.venv\Scripts\python.exe scripts\test.py dryrun `
     --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "Documents" --folder "/Invoices/ToPrint" `
-    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
+    --printer-share-id "5f488e73-ab80-4a6b-a60a-a0f883e17e2e"
 
 # 6. One real file, then mark it complete once the page is out.
 .\.venv\Scripts\python.exe scripts\test.py submit `
     --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "Documents" --folder "/Invoices/ToPrint" `
-    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5" --batch-size 1
+    --printer-share-id "5f488e73-ab80-4a6b-a60a-a0f883e17e2e" --batch-size 1
 .\.venv\Scripts\python.exe scripts\test.py status `
     --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --library "Documents" --folder "/Invoices/ToPrint"
@@ -173,27 +173,44 @@ Copy-Item functionapp\local.settings.json.template functionapp\local.settings.js
 .\.venv\Scripts\python.exe scripts\test.py dryrun --library "Documents" `
     --hostname noblehomes.sharepoint.com --site-path /sites/PM `
     --folder "/Invoices/ToPrint" `
-    --printer-share-id "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
+    --printer-share-id "5f488e73-ab80-4a6b-a60a-a0f883e17e2e"
 ```
 
 ## This tenant's printer
 
 | | |
 |---|---|
-| Printer | **Brother MFC-L5800DW series [3c2af401eecf]** (registered 2026-08-31) |
-| **Share Id** | `4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5` — pass this as `printerShareId`; it addresses jobs |
-| **Printer Id** | `cf8d9fa1-0502-4b0d-b28e-22a52cdde8a1` — used only to cancel a job; the app resolves it itself |
+| Printer | **Noble Home MFC** |
+| **Share Id** | `5f488e73-ab80-4a6b-a60a-a0f883e17e2e` — pass this as `printerShareId`; it addresses jobs |
+| **Printer Id** | *(read it from the share — the app resolves it itself)* |
+| Content types | **unrecorded — read them, see below** |
 
-> ## This printer takes raster only — the app converts
+> ## ⚠️ Read this printer's content types — they change what the app does
 >
-> It reports **`image/pwg-raster` and nothing else** (verified against the live
-> API). Universal Print will not convert for us: it performs exactly one
-> conversion, **OXPS → PDF**, and only for printers that already accept PDF. So
-> the app rasterizes each PDF before upload — see **Printer profiles** below.
+> Universal Print will not convert for us: it performs exactly one conversion,
+> **OXPS → PDF**, and only for printers that already accept PDF. So whether the
+> app rasterizes is decided by what the device reports — and so is what an
+> omitted `printFormat` selects, because `PwgRasterProfile.matches` stands aside
+> as soon as the printer accepts PDF (see **Printer profiles** below):
 >
-> The predecessor, a Brother DCP-L2540DW, accepted `application/pdf` directly. It
-> was retired because it is not a Universal Print ready device, and its
-> identifiers have been removed from this repo.
+> | Reports | No `printFormat` | `printFormat: image/pwg-raster` |
+> |---|---|---|
+> | `image/pwg-raster` only | `pdf-to-pwg-raster` | `pdf-to-pwg-raster` |
+> | **both** | **`passthrough`** — PDF uploaded unconverted | `pdf-to-pwg-raster` |
+>
+> ```powershell
+> .\scripts\live-printer-check.ps1 -DiagnoseOnly    # prints the real list
+> ```
+>
+> **Record the answer here with a date**, then set Flow A's body to match —
+> `docs/deploy-to-azure.md` step 10 has the two branches.
+>
+> **Do not carry the previous printer's answer over.** This share replaced the
+> **Brother MFC-L5800DW series [3c2af401eecf]** (share `4429bf4e-…`, printer
+> `cf8d9fa1-…`), which reported `image/pwg-raster` and nothing else — verified
+> 2026-08-31, on a device that is no longer the target. Its predecessor in turn, a
+> Brother DCP-L2540DW, accepted `application/pdf` directly and was retired for not
+> being Universal Print ready.
 
 They are different GUIDs and are **not** interchangeable. Jobs live at
 `/print/shares/{shareId}/jobs`, but cancel is documented only at
@@ -210,29 +227,39 @@ disagreement is counted as `printerOverridden` with a WARNING. Tracked as **F3-R
 in `docs/ai/open-defects.md`; the row-follows-its-own-printer default is pinned by
 `tests/test_poll.py::test_the_cancel_uses_the_printer_named_on_the_row`.
 
-### Its capabilities and defaults (content types verified against the live API, 2026-08-31)
+### Its capabilities and defaults
+
+> **These rows were measured on the previous printer (share `4429bf4e-…`) and are
+> kept as the shape of the answer, not as this device's answer.** Re-read them
+> against `5f488e73-…` and re-date this heading.
 
 | Setting | Value | Why it matters here |
 |---|---|---|
-| **Content types (capability)** | **`image/pwg-raster` — only** | Read from the API, not the portal. The document must be rasterized before upload; see the warning above |
+| **Content types (capability)** | **re-read — was `image/pwg-raster` only** | Read from the API, not the portal. It decides whether the document is rasterized *and* what an omitted `printFormat` selects; see the warning above |
 | Colour mode (default) | Grayscale | Device is mono |
 | DPI | default 600; **300 also supported** | 300 is the conversion target: ~8.4 MB/page raw at Letter versus ~33.7 MB at 600 |
-| Copies per job | 1 | Matches the only setting we send, so they can never disagree |
-| Duplex mode | **None** | Single-sided: a 40-page batch is 40 sheets. A printer-side setting, not a code change |
+| Copies per job | 1 | Matches what both profiles send, so they can never disagree |
+| Duplex mode | **None** | Single-sided: a 40-page batch is 40 sheets. A printer-side setting on the passthrough path; the raster profile sends `duplexMode: oneSided` explicitly |
 | Fit PDF to page / Multipage layout / Pages per impression | *greyed out* | Unsupported. `JOB_CONFIGURATION` must never send them — a test enforces that |
 
 > The rows above other than content types come from the portal's **Printer
 > defaults** page, which shows defaults rather than the capability list. Those two
 > are different fields, and confusing them is what made an earlier version of this
 > table wrong for the previous printer. Read capabilities from the API.
->
-> **`dpi` is deliberately not sent in `printJobConfiguration`.** For a
-> pre-rasterized document the resolution that matters is the one written into the
-> PWG page header; a job-level value that disagrees invites the printer to rescale
-> a bitmap that is already correct.
 
-The app sends **only** `{"copies": 1}` and lets these device defaults decide the
-rest. That is why changing duplex or colour is a printer setting, not a release.
+**What the app actually sends depends on the profile, and the two differ sharply.**
+
+| Profile | `printJobConfiguration` | So the device defaults… |
+|---|---|---|
+| `passthrough` | `{"copies": 1}` — `print_policy.JOB_CONFIGURATION` | …decide everything else. Duplex and colour are a printer setting, not a release |
+| `pdf-to-pwg-raster` | **twelve keys**, including `dpi`, `orientation`, `duplexMode: oneSided`, `colorMode: grayscale`, `mediaSize`, `scaling` and `margin` (`printing/profiles.py`) | …are **overridden**. Changing duplex or colour on this path *is* a code change |
+
+> **`scaling: fit` and `margin` are load-bearing on the raster path.** The
+> converter renders full-bleed at the media size and does not inset the printer's
+> unprintable margins; the job configuration compensates. Send different scaling,
+> or no margins, and the page prints cropped — while Graph still reports
+> `completed`. `dpi` is sent and **must equal the render dpi**, or the printer
+> rescales a bitmap that is already correct.
 
 ### No connector — settled for the old printer, not yet for this one
 
