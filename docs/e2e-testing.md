@@ -84,7 +84,7 @@ Overview*; the script lists the ids that do exist.
 ## A3. Dry run — converts, prints nothing
 
 ```powershell
-.\scripts\live-print-test.ps1 -PdfPath ".\samples\invoice.pdf" -PlanOnly
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\invoice.pdf" -PrintFormat image/pwg-raster -PlanOnly
 ```
 
 | Line | Expect |
@@ -207,6 +207,16 @@ $FLD = "/Backup/Invoice"
 #Noble Home MFC Printer
 $SHARE = "5f488e73-ab80-4a6b-a60a-a0f883e17e2e"
 
+# The upload format, splatted into every health / submit / dryrun call below.
+# This printer reports BOTH image/pwg-raster and application/pdf, and with no
+# format named the capabilities pick passthrough -- the PDF goes up unchanged.
+# This is the one line that decides the format for every step below.
+#
+#   @("--print-format", "image/pwg-raster")   raster  <- default
+#   @("--print-format", "application/pdf")    PDF, explicitly
+#   @()                                       let the capabilities choose
+$FMT = @("--print-format", "image/pwg-raster")
+
 ```
 
 > **PowerShell syntax:** the leading `&` in every Python command below is the
@@ -245,7 +255,7 @@ and Poll, so it is what you should call before the rest of Part B: if it is
 unhealthy, everything below fails for a reason it already told you.
 
 ```powershell
-& $Python $TestScript health --printer-share-id $SHARE --print-format image/pwg-raster
+& $Python $TestScript health --printer-share-id $SHARE @FMT
 ```
 
 Expect exactly this on the real printer:
@@ -289,7 +299,7 @@ was malformed and 500 means Health itself broke. Prove that distinction:
 
 ```powershell
 # power the printer down, wait ~30s for Universal Print to notice, then:
-& $Python $TestScript health --printer-share-id $SHARE --print-format image/pwg-raster
+& $Python $TestScript health --printer-share-id $SHARE @FMT
 ```
 
 Expect `healthy : False` with `PRINTER_NOT_ACCEPTING_JOBS`:
@@ -310,7 +320,7 @@ Compare against Submit for the same state — this is the whole argument for the
 endpoint:
 
 ```powershell
-& $Python $TestScript submit @Site --library $LIB --folder $FLD --printer-share-id $SHARE --batch-size 1
+& $Python $TestScript submit @Site --library $LIB --folder $FLD --printer-share-id $SHARE --batch-size 1 @FMT
 #   -> HTTP 200, submitted: 0, failed: 0, printerAvailable: False
 #      A 200 with no failures. Health says False in one field instead.
 ```
@@ -330,7 +340,7 @@ would lock files out until its own retry.
 ## B2. Dry run — resolves everything, prints nothing
 
 ```powershell
-& $Python $TestScript dryrun @Site --library $LIB --folder $FLD --printer-share-id $SHARE
+& $Python $TestScript dryrun @Site --library $LIB --folder $FLD --printer-share-id $SHARE @FMT
 ```
 
 The highest-value call here. Expected shape:
@@ -366,7 +376,7 @@ Check four things:
 
 ```powershell
 & $Python $TestScript submit @Site --library $LIB --folder $FLD `
-    --printer-share-id $SHARE --batch-size 1
+    --printer-share-id $SHARE --batch-size 1 @FMT
 ```
 
 `--batch-size 1` is not caution for its own sake: if the configuration is wrong
@@ -459,7 +469,7 @@ it, **you** choose, and the printer's preference does not get a vote.
 ```powershell
 # 1. What WOULD be uploaded. Prints nothing.
 & $Python $TestScript dryrun @Site --library $LIB --folder $FLD `
-    --printer-share-id $SHARE --print-format image/pwg-raster
+    --printer-share-id $SHARE @FMT
 ```
 
 Expect exactly this, on the real printer:
@@ -471,11 +481,14 @@ conversion   : pdf-to-pwg-raster  (application/pdf -> image/pwg-raster)
 ```
 
 `requested fmt` is **echoed by the endpoint**, so it is the proof the flag arrived
-rather than that you typed it correctly. Run it once more with the flag omitted:
-everything stays the same except
+rather than that you typed it correctly. Run it once more with `$FMT = @()` — the
+"let the capabilities choose" setting from B0 — and on a printer that reports PDF
+the profile changes with it:
 
 ```
 requested fmt: (none -- the printer's capabilities choose)
+conversion   : passthrough
+  converts   : False
 ```
 
 **If `requested fmt` still says `(none ...)` when you passed the flag, it is not
@@ -508,7 +521,7 @@ misconfigured flow and a damaged queue.
 ```powershell
 # 3. For real, one file, naming the format explicitly.
 & $Python $TestScript submit @Site --library $LIB --folder $FLD `
-    --printer-share-id $SHARE --batch-size 1 --print-format image/pwg-raster
+    --printer-share-id $SHARE --batch-size 1 @FMT
 ```
 
 **A page comes out.** On this printer that is the same page the run without the
@@ -571,7 +584,7 @@ $KEY  = az functionapp keys list --resource-group rg-noble-print `
     --name func-noble-print --query "functionKeys.default" -o tsv
 
 & $Python $TestScript dryrun @Site --base-url $BASE --key $KEY `
-    --library $LIB --folder $FLD --printer-share-id $SHARE
+    --library $LIB --folder $FLD --printer-share-id $SHARE @FMT
 ```
 
 Flex Consumption hashes the default hostname, so read `defaultHostName` rather
@@ -650,7 +663,7 @@ The cleanest test, and the one that pins the double-print guard. No hand editing
 
 ```powershell
 & $Python $TestScript submit @Site --library $LIB --folder $FLD `
-    --printer-share-id $SHARE --batch-size 1
+    --printer-share-id $SHARE --batch-size 1 @FMT
 ```
 
 Note the `Print_JobId` SharePoint now shows. The job is queued and going nowhere.
