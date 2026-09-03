@@ -189,7 +189,12 @@ foreach ($RequiredFile in @($Python, $TestScript, $BootstrapScript)) {
 $Site = @("--hostname", "noblehomes.sharepoint.com", "--site-path", "/sites/PM")
 $LIB = "AI_DropBox_V2026"
 $FLD = "/Backup/Invoice"
-$SHARE = "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5"
+# George MFC Printer
+# $SHARE = "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5" 
+
+#Noble Home MFC Printer
+$SHARE = "5f488e73-ab80-4a6b-a60a-a0f883e17e2e"
+
 ```
 
 > **PowerShell syntax:** the leading `&` in every Python command below is the
@@ -212,6 +217,7 @@ if (-not (Test-Path -LiteralPath ".\functionapp\local.settings.json")) {
 
 # 2. a refresh token. Locally you may use PRINT_REFRESH_TOKEN instead of a vault:
 & $Python $BootstrapScript --print-only
+
 #    paste the value into local.settings.json as PRINT_REFRESH_TOKEN
 #    (it logs a warning on every use -- that is deliberate, and it must NEVER
 #     be set in Azure)

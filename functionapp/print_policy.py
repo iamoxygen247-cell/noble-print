@@ -94,7 +94,7 @@ MAX_GIVE_UP_DAYS = 365
 # as stalled. Measured from printJob.createdDateTime -- the job's own clock, not
 # ours, so a SharePoint edit cannot reset it. Doubles as the base of the retry
 # backoff below, so one number rescales the whole schedule coherently.
-DEFAULT_STALL_MINUTES = 5
+DEFAULT_STALL_MINUTES = 1
 MIN_STALL_MINUTES = 1
 MAX_STALL_MINUTES = 1440  # one day
 
