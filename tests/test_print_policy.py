@@ -413,14 +413,131 @@ def test_append_message_never_leaves_half_an_entry():
 def test_the_requeue_message_names_the_job_it_cancelled():
     """Print_JobId is cleared on requeue, so this is the only surviving record of
     which job was killed."""
-    assert "1825" in policy.requeue_message("1825", 3)
+    assert "1825" in policy.requeue_message("1825", 3, policy.CANCEL_OK)
 
 
 def test_the_give_up_message_says_how_many_attempts_and_how_long():
     """PRINT_FAILED is terminal and a human acts on it, so the last thing written
     has to be worth reading."""
-    message = policy.give_up_message(9, 10)
+    message = policy.give_up_message(9, 10, policy.CANCEL_OK)
     assert "9" in message and "10" in message
+
+
+# --- what the cancel actually achieved ----------------------------------------
+# These exist because the messages used to say "cancelled" unconditionally while
+# the caller held -- and discarded -- the answer. Confirmed live on 2026-09-02:
+# Print_Message read "Job Id 38 cancelled" while the portal read `stopped`.
+
+
+def test_a_requeue_message_only_claims_a_cancel_that_happened():
+    ok = policy.requeue_message("38", 11, policy.CANCEL_OK)
+    failed = policy.requeue_message("38", 11, policy.CANCEL_FAILED)
+
+    assert "cancelled" in ok
+    assert "CANCEL FAILED" in failed
+    assert "cancelled" not in failed, \
+        "the audit trail must not claim a cancel that did not take"
+
+
+def test_a_requeue_message_does_not_claim_a_cancel_when_there_was_no_job():
+    """A crashed submission (rule 1) has no job. Saying "cancelled" about nothing
+    is noise in the one column a human reads to work out what happened -- and so
+    is naming an id that does not exist."""
+    message = policy.requeue_message("", 1, policy.CANCEL_NOTHING)
+    assert message == "No job to cancel. Retry job (1)"
+
+
+@pytest.mark.parametrize("result", [policy.CANCEL_OK, policy.CANCEL_FAILED])
+def test_the_requeue_message_keeps_its_shape_whenever_there_was_a_job(result):
+    """The job id leads and the retry number trails, either side of the cancel
+    clause. Both are what a reader scans for, and Tier C asserts them.
+
+    CANCEL_NOTHING is excluded because it cannot co-occur with a job id:
+    `_cancel_outstanding` returns it only when Print_JobId is empty.
+    """
+    message = policy.requeue_message("1825", 3, result)
+    assert "1825" in message and "Retry job (3)" in message
+
+
+def test_the_give_up_message_warns_when_the_job_outlived_the_row():
+    """Nothing follows a give-up: PRINT_FAILED is terminal and Print_JobId is
+    gone. A job left alive prints days later against a column saying it never
+    did."""
+    ok = policy.give_up_message(9, 10, policy.CANCEL_OK)
+    failed = policy.give_up_message(9, 10, policy.CANCEL_FAILED)
+
+    assert "outstanding job cancelled" in ok
+    assert "NOT CANCELLED" in failed and "may still print" in failed
+
+
+def test_a_failed_cancel_warns_about_a_duplicate():
+    warning = policy.duplicate_warning("38", policy.CANCEL_FAILED)
+    assert "38" in warning and "duplicate" in warning
+
+
+def test_an_accepted_cancel_the_job_ignored_is_reported_as_an_observation():
+    """Cancel is asynchronous, so a job still reading `stopped` may yet settle.
+    The sentence has to say what was SEEN, not rule on what it means."""
+    warning = policy.duplicate_warning("39", policy.CANCEL_OK, "stopped")
+    assert "39" in warning and "stopped" in warning
+    assert "accepted" in warning
+
+
+def test_only_a_confirmed_cancel_earns_the_word_cancelled():
+    """THE DIRECTION THIS WHOLE CHANGE TURNS ON. An unrecognised result -- a typo,
+    a fourth constant added without updating these -- must under-claim, not
+    over-claim. Saying CANCEL FAILED about a cancel that worked costs someone a
+    glance at the printer; the reverse hides a duplicate, which is what happened.
+    """
+    assert "cancelled" in policy.requeue_message("38", 1, policy.CANCEL_OK)
+    assert "CANCEL FAILED" in policy.requeue_message("38", 1, "typo")
+    assert "NOT CANCELLED" in policy.give_up_message(1, 10, "typo")
+    assert policy.duplicate_warning("38", "typo") != ""
+
+
+def test_the_cancel_results_are_three_distinct_values():
+    assert len(set(policy.ALL_CANCEL_RESULTS)) == 3
+
+
+@pytest.mark.parametrize("state_after,confirmed", [
+    ("canceled", True),   # the cancel landed
+    ("", True),           # Graph no longer has the job -- a 404 is success here
+    ("stopped", False),   # what jobs 38 and 39 did on the live run
+    ("processing", False),
+    ("pending", False),
+    ("COMPLETED", False),  # it printed: emphatically not a confirmed cancel
+])
+def test_only_a_dead_job_confirms_a_cancel(state_after, confirmed):
+    """The predicate the route asks after re-reading a cancelled job. It lives in
+    print_policy because a job state is a rule, and function_app holds none."""
+    assert policy.cancel_confirmed(state_after) is confirmed
+
+
+@pytest.mark.parametrize("result", [policy.CANCEL_OK, policy.CANCEL_NOTHING])
+def test_no_warning_when_no_duplicate_is_possible(result):
+    """A clean cancel and an absent job are both silence. A warning that cries
+    on the ordinary path is one nobody reads on the day it matters."""
+    assert policy.duplicate_warning("1825", result, "") == ""
+
+
+# --- why Poll left a row alone ------------------------------------------------
+
+
+def test_the_still_running_message_carries_the_stall_clock():
+    message = policy.still_running_message("processing", 3.2, 5)
+    assert "processing" in message and "3.2" in message and "5" in message
+
+
+def test_a_job_whose_age_is_unknown_says_so_rather_than_looking_healthy():
+    """THE CASE THIS MESSAGE EXISTS FOR. `job_is_stalled` abstains on an
+    undeterminable age, so the row sits at PRINT_PENDING for ever. It used to
+    report the same bare word as a job ten seconds old."""
+    message = policy.still_running_message("processing", None, 5)
+    assert "age unknown" in message and "not stalled" in message
+
+
+def test_no_job_still_reads_as_no_job():
+    assert policy.still_running_message("", None, 5) == "no job"
 
 
 # --- Print_Time on the wire ---------------------------------------------------

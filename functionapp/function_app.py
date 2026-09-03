@@ -287,9 +287,31 @@ def _share_for(client: GraphClient, cache: Dict[str, Any], share_id: str):
     return cache[share_id]
 
 
+def _flag_possible_duplicate(entry: Dict[str, Any], item: PrintFile,
+                             cancel_result: str, lingering_state: str) -> None:
+    """Mark a response entry whose old job may still print, and log it.
+
+    The row is about to lose its Print_JobId, so nothing looks at that job again;
+    this is the last moment it can be named. `warning` is the field the live
+    harness already surfaces (scripts/test.py prints it as `!! ...`), and the same
+    field rule 1 uses for the unrecorded-job-id case.
+
+    NOT written to Print_Message: the message says what the cancel achieved, which
+    is fact. A lingering state is a snapshot of an asynchronous operation and can
+    resolve itself a second later, so it belongs in the run's output and the log --
+    where a human reads it now -- rather than in a permanent column.
+    """
+    warning = print_policy.duplicate_warning(item.job_id, cancel_result,
+                                             lingering_state)
+    if not warning:
+        return
+    entry["warning"] = warning
+    logging.error("%s (item %s)", warning, item.item_id)
+
+
 def _cancel_outstanding(client: GraphClient, cache: Dict[str, Any],
                         item: PrintFile, endpoint: str = EP_POLL,
-                        printer: str = "") -> bool:
+                        printer: str = "") -> Tuple[str, str]:
     """Kill the job behind a row before its status is rewritten. Best-effort.
 
     `printer` is the share to cancel against, defaulting to the row's own
@@ -307,29 +329,78 @@ def _cancel_outstanding(client: GraphClient, cache: Dict[str, Any],
 
     Cancel is documented ONLY on /print/printers/{id}/jobs/{id}/cancel, so it
     needs the printer id behind the share, not the share id held in
-    Printer_Name. Returns False when there is nothing to cancel or the cancel did
-    not take; the caller proceeds regardless, because a stuck document is worse
-    than a possible duplicate -- but `cancel_job` logs it, and that log line is
-    the only warning a duplicate may appear.
+    Printer_Name. The caller proceeds whatever comes back, because a stuck
+    document is worse than a possible duplicate -- but it must now SAY which it
+    got, instead of writing "cancelled" over both.
+
+    Returns (cancel_result, lingering_state):
+
+        cancel_result   one of print_policy.CANCEL_OK / CANCEL_FAILED /
+                        CANCEL_NOTHING. CANCEL_NOTHING means there was no job in
+                        the first place -- a crashed submission, rule 1 -- and is
+                        the only one of the three that is not a worry. A job we
+                        cannot ADDRESS (no share, no printer id) is CANCEL_FAILED,
+                        not CANCEL_NOTHING: the job is alive and we just failed to
+                        reach it, which is Health's NO_PRINTER_ID arriving too late
+                        to help.
+
+        lingering_state the job's own state read back AFTER an accepted cancel,
+                        when that state is still not `canceled`. Empty otherwise.
+                        Graph accepting the cancel is not the job dying --
+                        observed live 2026-09-02, jobs 40/41 reached `canceled`
+                        while 38/39 went on reading `stopped`, cause never
+                        established -- and once the requeue clears
+                        Print_JobId nothing ever looks at that job again. This is
+                        the last chance to notice. It is an OBSERVATION, not a
+                        verdict: cancel is asynchronous, so a job still reading
+                        `stopped` here may yet settle.
     """
     share_id = printer or item.printer
-    if not item.job_id or not share_id:
-        return False
+    if not item.job_id:
+        return print_policy.CANCEL_NOTHING, ""
+    if not share_id:
+        logging.warning("cannot cancel job %s: the row names no printer. "
+                        "Continuing anyway -- a duplicate print is possible.",
+                        item.job_id)
+        return print_policy.CANCEL_FAILED, ""
     origin = _share_for(client, cache, share_id)
     printer_id = origin.printer_id if origin else ""
     cancelled = universal_print.cancel_job(client, printer_id, item.job_id)
-    if cancelled:
-        # A cancel is a per-file outcome in its own right, and this line is the
-        # ONLY record that a particular job was killed -- Print_JobId is cleared
-        # on the requeue that follows. `cancelled` is part of the closed result
-        # vocabulary the weekly report counts (design.md §13).
-        # The share the cancel was actually SENT to, which is not always the one
-        # on the row -- an override makes them differ, and when a duplicate turns
-        # up this line is what says which printer was addressed.
-        _print_event(endpoint, item.item_id, from_status=item.status,
-                     job=item.job_id, printer=share_id,
-                     result="cancelled", file_name=item.file_name)
-    return cancelled
+    if not cancelled:
+        return print_policy.CANCEL_FAILED, ""
+
+    # A cancel is a per-file outcome in its own right, and this line is the
+    # ONLY record that a particular job was killed -- Print_JobId is cleared
+    # on the requeue that follows. `cancelled` is part of the closed result
+    # vocabulary the weekly report counts (design.md §13).
+    # The share the cancel was actually SENT to, which is not always the one
+    # on the row -- an override makes them differ, and when a duplicate turns
+    # up this line is what says which printer was addressed.
+    _print_event(endpoint, item.item_id, from_status=item.status,
+                 job=item.job_id, printer=share_id,
+                 result="cancelled", file_name=item.file_name)
+
+    # One extra GET, only on the path that just cancelled something. A job Graph
+    # no longer has (None) is exactly what a cancel should produce, so that is
+    # silence, not a finding.
+    #
+    # IT MUST NEVER RAISE, AND THE GUARD IS NOT DEFENSIVE HABIT. This sits between
+    # the cancel and the PATCH to PRINT_READY, and nothing wraps the row loop --
+    # an escape unwinds the whole route to a 500 with the row still PRINT_PENDING
+    # and its job now `canceled`, so the NEXT run reads a terminal state and writes
+    # PRINT_FAILED. That would spend a document to improve a log message. The read
+    # is a diagnostic: when it cannot be done, the answer is simply no observation.
+    try:
+        after = universal_print.get_job(client, share_id, item.job_id)
+    except Exception as exc:
+        logging.warning("could not re-read job %s after cancelling it: %s. "
+                        "The cancel was accepted; whether it took is unverified.",
+                        item.job_id, exc)
+        return print_policy.CANCEL_OK, ""
+    state_after = universal_print.job_state(after) if after else ""
+    if print_policy.cancel_confirmed(state_after):
+        return print_policy.CANCEL_OK, ""
+    return print_policy.CANCEL_OK, state_after
 
 
 class Budget:
@@ -998,11 +1069,13 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                 #
                 # Cancel is documented only on the PRINTER route, so it needs the
                 # printer id behind the share -- not the share id in Printer_Name.
-                _cancel_outstanding(client, shares, item, printer=printer)
+                cancel_result, lingering = _cancel_outstanding(
+                    client, shares, item, printer=printer)
 
                 message = print_policy.append_message(
                     item.message,
-                    print_policy.requeue_message(item.job_id, attempt))
+                    print_policy.requeue_message(item.job_id, attempt,
+                                                 cancel_result))
                 # WHEN THE NEXT ATTEMPT FALLS DUE -- the backoff, written down.
                 # Clamped to the give-up deadline, so the last attempt always lands
                 # inside the window rather than against a row that will already
@@ -1027,10 +1100,12 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                     continue
 
                 requeued += 1
-                items.append({"itemId": item.item_id, "fileName": item.file_name,
-                              "result": "requeued", "jobId": item.job_id,
-                              "retry": attempt, "printTime": due_at,
-                              "message": message})
+                entry = {"itemId": item.item_id, "fileName": item.file_name,
+                         "result": "requeued", "jobId": item.job_id,
+                         "retry": attempt, "printTime": due_at,
+                         "message": message}
+                _flag_possible_duplicate(entry, item, cancel_result, lingering)
+                items.append(entry)
                 _print_event(EP_POLL, item.item_id, from_status=item.status,
                              to_status=print_policy.READY, job=item.job_id,
                              printer=printer, result="requeued",
@@ -1041,20 +1116,24 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                 # abandoned job could print days later against a row that reads
                 # PRINT_FAILED -- the column would be lying about paper that came
                 # out of the tray.
-                _cancel_outstanding(client, shares, item, printer=printer)
+                cancel_result, lingering = _cancel_outstanding(
+                    client, shares, item, printer=printer)
 
                 message = print_policy.append_message(
                     item.message,
-                    print_policy.give_up_message(attempt, give_up_days))
+                    print_policy.give_up_message(attempt, give_up_days,
+                                                 cancel_result))
                 sharepoint.patch_fields(client, context, item.item_id, {
                     print_policy.COLUMN_STATUS: print_policy.FAILED,
                     print_policy.COLUMN_MESSAGE: message,
                     print_policy.COLUMN_PRINT_TIME: None,
                 })
                 gave_up += 1
-                items.append({"itemId": item.item_id, "fileName": item.file_name,
-                              "result": "gave_up", "jobId": item.job_id,
-                              "message": message})
+                entry = {"itemId": item.item_id, "fileName": item.file_name,
+                         "result": "gave_up", "jobId": item.job_id,
+                         "message": message}
+                _flag_possible_duplicate(entry, item, cancel_result, lingering)
+                items.append(entry)
                 _print_event(EP_POLL, item.item_id, from_status=item.status,
                              to_status=print_policy.FAILED, job=item.job_id,
                              printer=printer, result="gave_up",
@@ -1071,7 +1150,10 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                 still_running += 1
                 items.append({"itemId": item.item_id, "fileName": item.file_name,
                               "result": "still_running", "jobId": item.job_id,
-                              "message": state or "no job"})
+                              "message": print_policy.still_running_message(
+                                  state,
+                                  print_policy.minutes_between(job_created, now),
+                                  stall_minutes)})
 
         _run_summary(EP_POLL, library=library, folder=folder,
                      printer=printer_override or "-", found=len(ordered),

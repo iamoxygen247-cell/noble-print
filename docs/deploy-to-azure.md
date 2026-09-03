@@ -563,7 +563,7 @@ az functionapp config appsettings list --resource-group $RG --name $APP `
 ## 7. Deploy the code
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest        # 543 tests must be green FIRST
+.\.venv\Scripts\python.exe -m pytest        # 570 tests must be green FIRST
 
 # func shells out to the RAW az.cmd for an ARM token and cannot refresh it over
 # the network through the inspecting proxy. Pre-warm the cache through the

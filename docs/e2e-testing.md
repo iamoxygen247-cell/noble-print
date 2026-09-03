@@ -63,7 +63,7 @@ Paper in the tray, printer awake.
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-Expect **543 passed** in about a second. Red here means stop — do not spend
+Expect **570 passed** in about a second. Red here means stop — do not spend
 paper diagnosing something the suite already knows about.
 
 ## A2. Is the printer reachable and still the printer we think?
@@ -102,7 +102,19 @@ and the four `margin` values are the load-bearing pair; `dpi` here must equal th
 ## A4. Print it
 
 ```powershell
-.\scripts\live-print-test.ps1 -PdfPath ".\samples\invoice.pdf"
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\invoice.pdf" -PrintFormat image/pwg-raster
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\260901_13001076570d.pdf" -PrintFormat image/pwg-raster
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\260902_110010864758.pdf" -PrintFormat image/pwg-raster
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\260831_0001.pdf" -PrintFormat image/pwg-raster
+
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\260831_1100115214b1.pdf" -PrintFormat image/pwg-raster
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\260902_0001.pdf" -PrintFormat image/pwg-raster
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\260902_0002.pdf" -PrintFormat image/pwg-raster
+
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\260901_110020873909.pdf" -PrintFormat image/pwg-raster
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\260831_1100248508cd.pdf" -PrintFormat image/pwg-raster
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\260831_110031403c0f.pdf" -PrintFormat image/pwg-raster
+.\scripts\live-print-test.ps1 -PdfPath ".\samples\260831_110039431a8c.pdf" -PrintFormat image/pwg-raster
 ```
 
 Watch for `Job id`, `Upload : HTTP 201`, then polling to `state=completed` —
@@ -655,7 +667,7 @@ Expect `requeued : 1`, and in SharePoint:
 |---|---|
 | `Print_Status` | back to **`PRINT_READY`** |
 | `Print_JobId` | **empty** — the job it named was cancelled |
-| `Print_Message` | `Job Id <the id from step 3> cancelled. Retry job (n)` |
+| `Print_Message` | `Job Id <the id from step 3> cancelled. Retry job (n)` — and `cancelled` is now a **claim the app verified**, not a fixed word. `CANCEL FAILED` there means the job is still alive; cross-check it in the portal |
 | `Printer_Name` | unchanged |
 | `Print_Time` | **a timestamp, in local time** — when the next attempt falls due. This is the new column, and the point of the whole change: the backoff is now something you read rather than infer |
 
@@ -675,6 +687,38 @@ PRINT_EVENT ep=poll ... result=requeued  ...
 job is still alive, and when you switch the printer back on it prints *alongside*
 its replacement. That is defect D1, and this is the only place you can watch the
 guard work.
+
+### A `!!` line means a duplicate may be coming
+
+The `cancelled` event says the cancel was **sent and accepted**. It does not say
+the device let go. After an accepted cancel Poll re-reads the job once, and if it
+still reports a live state the run says so:
+
+```
+  2651     requeued   Job Id 39 cancelled. Retry job (9)
+    !! cancel of job 39 was accepted but it still reads 'stopped' -- it may still print
+```
+
+Observed on 2026-09-02, one Poll pass cancelling four jobs:
+
+| Job | Before | After |
+|---|---|---|
+| 40, 41 | `Pending` | `Canceled` |
+| 39 | `Processing` | `Stopped` |
+| 38 | `Stopped` | `Stopped` |
+
+Poll reported all four as cancelled. **Why 38 and 39 did not move is not
+established** — the portal shows state, not cause — but the two that were
+`Pending` died and the two that were not did not, which is the pattern to expect.
+
+**Cross-check every `requeued` line against the portal's Jobs blade** — a row
+whose job did not reach `Canceled` must carry a `!!` line, and if it does not,
+that is a regression.
+
+Treat it as an observation, not a verdict: cancel is asynchronous, so a job may
+still settle to `canceled` a moment later. Refresh the blade before acting. A
+`CANCEL FAILED` in `Print_Message` is the stronger signal — there the call itself
+did not take.
 
 The `(n)` is the retry NUMBER the schedule is up to, derived from the file's age
 — not a count of your attempts. With `--stall-minutes 1` on a three-minute-old
@@ -741,7 +785,7 @@ it does not care whether the job is stalled or how long ago you edited the row.
 | Column | Expect |
 |---|---|
 | `Print_Status` | **`PRINT_FAILED`** |
-| `Print_Message` | `gave up after 1 day(s) and N retries; outstanding job cancelled` |
+| `Print_Message` | `gave up after 1 day(s) and N retries; outstanding job cancelled` — or `OUTSTANDING JOB NOT CANCELLED -- it may still print`, which on a terminal row is the one worth acting on |
 | `Print_JobId` | **kept** — the audit trail on a failed row |
 | `Print_Time` | **emptied** — a terminal row carries no schedule, so a human resetting it to `PRINT_READY` gets an immediate print rather than a silent wait |
 

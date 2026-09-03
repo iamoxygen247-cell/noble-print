@@ -151,6 +151,33 @@ def test_an_in_flight_job_is_not_touched(graph, frozen_now, state):
     assert not graph.calls_to("/items/1/fields", method="PATCH")
 
 
+def test_a_row_left_alone_reports_the_clock_it_was_judged_against(graph,
+                                                                  frozen_now):
+    """`processing` alone did not say WHY Poll declined -- a healthy young job and
+    one whose age cannot be read looked identical in the response."""
+    pending_item(graph)
+    graph.add_job("1825", state="processing", created=iso(minutes=2))
+
+    payload = as_json(post(POLL, body()))
+
+    message = result_for(payload, "1")["message"]
+    assert "processing" in message and "2.0 min old" in message
+    assert "stall 5" in message
+
+
+def test_a_row_whose_job_age_is_unknown_says_so_in_the_response(graph, frozen_now):
+    """THE CASE WORTH SEEING. This row is not stalled and never will be -- it sits
+    at PRINT_PENDING for ever -- and it used to report the bare word `stopped`,
+    indistinguishable from a job ten seconds into its life."""
+    pending_item(graph)
+    graph.add_job("1825", state="stopped")  # note: no `created`
+
+    payload = as_json(post(POLL, body()))
+
+    assert payload["stillRunning"] == 1
+    assert "age unknown" in result_for(payload, "1")["message"]
+
+
 def test_a_stopped_job_is_never_marked_failed(graph, frozen_now):
     """`stopped` means the printer needs attention but the job can still
     continue, so it is not a failure. Poll requeues it rather than failing it --
@@ -404,6 +431,94 @@ def test_a_failed_cancel_still_requeues(graph, frozen_now):
     assert graph.field("1", "Print_Status") == print_policy.READY
 
 
+# --- the cancel the row CLAIMS versus the one that happened -------------------
+# THE REGRESSION THESE EXIST FOR, seen live on 2026-09-02. Poll wrote "Job Id 38
+# cancelled" into Print_Message while the portal showed job 38 as `stopped`. The
+# answer was available -- `_cancel_outstanding` returns it -- and both callers
+# threw it away. A requeue then clears Print_JobId, so nothing looks at that job
+# again and the false claim is the only record left.
+
+
+def test_a_failed_cancel_is_not_recorded_as_a_cancel(graph, frozen_now):
+    """The row still requeues -- that is rule 2 and unchanged -- but the audit
+    trail must not assert something nobody checked."""
+    stalled(graph)
+    graph.fail_next("POST", "/cancel", status=500)
+
+    payload = as_json(post(POLL, body()))
+
+    message = graph.field("1", "Print_Message")
+    assert "CANCEL FAILED" in message
+    assert "cancelled" not in message, \
+        "Print_Message claimed a cancel that did not take"
+    assert "duplicate" in result_for(payload, "1")["warning"]
+
+
+def test_a_cancel_the_device_ignores_is_flagged_as_a_possible_duplicate(
+        graph, frozen_now):
+    """Graph accepting the cancel is not the job dying. On the live run of
+    2026-09-02 one Poll pass cancelled four jobs: 40 and 41 reached `canceled`,
+    while 38 and 39 went on reading `stopped`. Poll reported all four as cancelled
+    and said nothing about the difference."""
+    stalled(graph, state="stopped")
+    graph.jobs_held_by_device.append("1825")
+
+    payload = as_json(post(POLL, body()))
+
+    assert payload["requeued"] == 1, "the file must still be requeued"
+    warning = result_for(payload, "1")["warning"]
+    assert "1825" in warning and "stopped" in warning
+    assert "accepted" in warning, "an observation, not a verdict -- cancel is async"
+
+
+def test_the_verification_read_can_never_fail_the_requeue(graph, frozen_now):
+    """THE RE-READ IS A DIAGNOSTIC AND MUST NOT BE LOAD-BEARING.
+
+    It happens AFTER the cancel and BEFORE the PATCH to PRINT_READY. Left
+    unguarded, a transient Graph error there unwinds the whole route to a 500 with
+    the row still PRINT_PENDING -- and its job now `canceled`, so the NEXT Poll run
+    reads a terminal state and writes PRINT_FAILED. A blip on a call that exists
+    only to improve a log message would cost the document its print.
+
+    `skip=1` lets Poll's own decision read succeed and fails only the read that
+    follows the cancel.
+    """
+    stalled(graph)
+    graph.fail_next("GET", "/jobs/1825", status=500, skip=1)
+
+    payload = as_json(post(POLL, body()))
+
+    assert payload["requeued"] == 1
+    assert graph.field("1", "Print_Status") == print_policy.READY
+    assert graph.cancelled == ["1825"], "the cancel still happened"
+
+
+def test_a_clean_cancel_raises_no_warning(graph, frozen_now):
+    """The ordinary path must stay silent, or the warning is noise by the time it
+    matters."""
+    stalled(graph)
+
+    payload = as_json(post(POLL, body()))
+
+    assert graph.cancelled == ["1825"]
+    assert "warning" not in result_for(payload, "1")
+    assert "cancelled" in graph.field("1", "Print_Message")
+
+
+def test_giving_up_does_not_claim_a_cancel_that_failed(graph, frozen_now):
+    """Worse here than on a requeue: PRINT_FAILED is terminal, nothing follows it,
+    and an abandoned job prints days later against a row saying it never did."""
+    stalled(graph, file_minutes_old=40 * DAY)
+    graph.fail_next("POST", "/cancel", status=500)
+
+    payload = as_json(post(POLL, body()))
+
+    assert payload["gaveUp"] == 1
+    message = graph.field("1", "Print_Message")
+    assert "NOT CANCELLED" in message and "may still print" in message
+    assert "warning" in result_for(payload, "1")
+
+
 # --- requeue ------------------------------------------------------------------
 
 
@@ -521,6 +636,11 @@ def test_a_crashed_submission_is_requeued(graph, frozen_now):
     assert payload["requeued"] == 1
     assert graph.field("1", "Print_Status") == print_policy.READY
     assert graph.cancelled == [], "there is no job to cancel"
+    # ...and the row must not claim one was. This used to read "Job Id (none)
+    # cancelled", which asserted a cancel about a job that never existed.
+    assert graph.field("1", "Print_Message").startswith("No job to cancel")
+    assert "warning" not in result_for(payload, "1"), \
+        "a submission that crashed before creating a job cannot duplicate"
 
 
 def test_a_job_purged_from_universal_print_is_requeued(graph, frozen_now):

@@ -39,11 +39,27 @@
 .PARAMETER PlanOnly
     Stop after step 4. Converts and reports, prints nothing.
 
+.PARAMETER PrintFormat
+    The format to UPLOAD, mirroring Submit's `printFormat`. Omit it and the
+    printer's capabilities choose, which is what the deployed app does when a
+    flow sends no printFormat.
+
+    This is the ONLY way to exercise the raster path on a printer that also
+    accepts PDF: PwgRasterProfile.matches deliberately stands aside there,
+    because rasterizing what the device takes natively is wasted work. Naming
+    image/pwg-raster overrules that -- the profile that PRODUCES the format is
+    chosen instead of the one the capabilities imply.
+
 .EXAMPLE
     .\scripts\live-print-test.ps1 -PdfPath .\samples\invoice.pdf
 
 .EXAMPLE
     .\scripts\live-print-test.ps1 -PdfPath .\samples\invoice.pdf -PlanOnly
+
+.EXAMPLE
+    # force the raster path on a printer that would otherwise take the PDF
+    .\scripts\live-print-test.ps1 -PdfPath .\samples\invoice.pdf `
+        -PrintFormat image/pwg-raster
 #>
 
 [CmdletBinding()]
@@ -54,10 +70,18 @@ param(
     # Local George's Brother MFC-L5800DW, registered 2026-08-31. Print Format is image/pwg-raster
 #    [string] $ShareId = "4429bf4e-6294-4bcf-bd92-b5f3c3ff47c5",
 
-# Noble Homes office Brother Printer MFC-L5915DW. Print Format is application/pdf.
+# Noble Homes office Brother Printer MFC-L5915DW. Reports BOTH application/pdf
+# and image/pwg-raster, so the capabilities pick passthrough; -PrintFormat
+# image/pwg-raster is what reaches the raster path on this one.
     [string] $ShareId = "5f488e73-ab80-4a6b-a60a-a0f883e17e2e",
     [switch] $KeepRaster,
     [switch] $PlanOnly,
+
+    # "" means "let the capabilities choose" -- the behaviour this script had
+    # before the parameter existed. The set matches printing.SUPPORTED_PRINT_FORMATS;
+    # plan.py rejects anything else anyway, but failing here costs no sign-in.
+    [ValidateSet("", "application/pdf", "image/pwg-raster")]
+    [string] $PrintFormat = "",
 
     [ValidateRange(30, 1800)]
     [int] $PollSeconds = 180
@@ -142,6 +166,20 @@ if (-not $Share["isAcceptingJobs"]) {
     throw "The printer share is not accepting jobs."
 }
 
+# The same refusal Submit makes before claiming anything (its `share.supports`
+# check). plan.py does NOT make it -- PwgRasterProfile.produces only asks whether
+# the source is a PDF -- so without this the script would happily convert and
+# upload a raster to a printer that cannot take one, and the only symptom would be
+# `aborted` at step 8. A printer reporting NO content types gets the benefit of
+# the doubt here, exactly as ShareInfo.supports does.
+$Reported = @($Capabilities["contentTypes"]) |
+    ForEach-Object { ($_ -split ";")[0].Trim().ToLowerInvariant() }
+if ($PrintFormat -and $Reported -and $Reported -notcontains $PrintFormat) {
+    throw "printer $($Share['displayName']) does not accept $PrintFormat " +
+          "(supports: $($Reported -join ', ')). Omit -PrintFormat and let the " +
+          "capabilities choose."
+}
+
 # --- 3. ask the app what it would do ------------------------------------------
 
 Write-Step "3. The app's decision  (functionapp/printing)"
@@ -151,11 +189,17 @@ $Capabilities | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $CapsFile -E
 
 Push-Location $AppDir
 try {
-    $PlanJson = & $Python -m printing.plan `
-        --capabilities $CapsFile `
-        --share-id $ShareId `
-        --printer-id $PrinterId `
-        --display-name $Share["displayName"]
+    # Splatted rather than backtick-continued because --print-format must be
+    # ABSENT, not empty, when no format was named.
+    $PlanArgs = @(
+        "--capabilities", $CapsFile,
+        "--share-id",     $ShareId,
+        "--printer-id",   $PrinterId,
+        "--display-name", $Share["displayName"]
+    )
+    if ($PrintFormat) { $PlanArgs += @("--print-format", $PrintFormat) }
+
+    $PlanJson = & $Python -m printing.plan @PlanArgs
     $PlanExit = $LASTEXITCODE
 } finally {
     Pop-Location
@@ -171,6 +215,12 @@ if ($PlanExit -ne 0) {
     throw "No conversion path exists for this printer. The app would fail every file."
 }
 
+# Printed first because it is the only line that distinguishes a run that named a
+# format from one that did not: ask for the format the capabilities would have
+# chosen anyway and every other line below is identical.
+$Requested = if ($Plan.requestedFormat) { $Plan.requestedFormat }
+             else { "(none -- the capabilities choose)" }
+Write-Host "  Requested format : $Requested"
 Write-Host "  Profile          : $($Plan.profile)" -ForegroundColor Green
 Write-Host "  Upload as        : $($Plan.uploadContentType)"
 Write-Host "  Conversion needed: $($Plan.conversionRequired)"

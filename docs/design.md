@@ -392,10 +392,29 @@ uses the pair, and so does every log correlation (§13.3).
 | Poll — `completed` | `PRINT_COMPLETED` | — | — | `printed on YYYY-MM-DD HH:MM:SS` | **cleared** |
 | Poll — `canceled` / `aborted` | `PRINT_FAILED` | — | — | job `description` + `details` | **cleared** |
 | Poll — in flight, inside the stall threshold | — | — | — | — | — |
-| **Poll — stalled** | `PRINT_READY` | — | **cleared** | **append** `Job Id N cancelled. Retry job` | **next due time** |
-| **Poll — past the give-up threshold** | `PRINT_FAILED` | — | — | **append** the give-up reason | **cleared** |
+| **Poll — stalled** | `PRINT_READY` | — | **cleared** | **append** `Job Id N <cancel outcome>. Retry job (n)`, or `No job to cancel. Retry job (n)` when there was none | **next due time** |
+| **Poll — past the give-up threshold** | `PRINT_FAILED` | — | — | **append** the give-up reason, **including what the cancel achieved** | **cleared** |
 
 This table **is** the Tier C test suite: one assertion per row.
+
+**The cancel outcome is written, not assumed.** Both rows above cancel the
+outstanding job first (rule 2), and the message says which of three things
+happened — `cancelled`, `CANCEL FAILED`, or there being no job at all. It used to say
+`cancelled` unconditionally while `_cancel_outstanding` returned the real answer
+and both callers discarded it. Confirmed live on 2026-09-02: `Print_Message` read
+`Job Id 38 cancelled` while Universal Print still showed job 38 as `stopped`.
+Since a requeue clears `Print_JobId`, that false claim was the only surviving
+record of the job.
+
+Only `CANCEL_OK` earns the word `cancelled`; an unrecognised result under-claims,
+because a needless "check the printer" costs a glance and the reverse hides a
+duplicate.
+
+A **lingering job** — the cancel accepted but the job still reporting a live state
+— is reported as a `warning` on the run's response item and an `ERROR` log line,
+**not** in `Print_Message`. Cancel is asynchronous, so that state is a snapshot
+that may resolve itself; the column records what was done, the run records what
+was seen.
 
 **`Print_Time` is only ever set on a `PRINT_READY` row.** That invariant is why it is
 cleared on the claim and on every terminal write, and it is asserted directly. Without

@@ -197,7 +197,7 @@ everywhere" will break both, one silently.
 
 ### 4. `print_policy.py` imports only the standard library
 
-That constraint is what keeps 543 tests offline and sub-second, and what makes the
+That constraint is what keeps 570 tests offline and sub-second, and what makes the
 utility reusable — another workflow keeps the adapters and replaces only the
 rules. `test_print_policy_imports_only_the_standard_library` enforces it.
 
@@ -209,7 +209,7 @@ in a route belongs in `print_policy`.
 ## Standard Commands
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest              # 543 tests, offline, ~1.0s
+.\.venv\Scripts\python.exe -m pytest              # 570 tests, offline, ~1.0s
 .\scripts\start-local.ps1                         # venv + TLS shim + func start
 .\.venv\Scripts\python.exe scripts\bootstrap_token.py
 .\.venv\Scripts\python.exe scripts\test.py dryrun --hostname noblehomes.sharepoint.com --site-path /sites/PM --library "AI_DropBox_V2026" --folder "/Backup/Invoice" --printer-share-id <guid>

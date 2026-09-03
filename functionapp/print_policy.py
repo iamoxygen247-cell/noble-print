@@ -94,7 +94,7 @@ MAX_GIVE_UP_DAYS = 365
 # as stalled. Measured from printJob.createdDateTime -- the job's own clock, not
 # ours, so a SharePoint edit cannot reset it. Doubles as the base of the retry
 # backoff below, so one number rescales the whole schedule coherently.
-DEFAULT_STALL_MINUTES = 1
+DEFAULT_STALL_MINUTES = 5
 MIN_STALL_MINUTES = 1
 MAX_STALL_MINUTES = 1440  # one day
 
@@ -155,6 +155,21 @@ POLL_NONE = "none"           # nothing to do -- write NOTHING
 POLL_REQUEUE = "requeue"     # cancel the job, then write PRINT_READY
 POLL_GIVE_UP = "give_up"     # cancel the job, then write PRINT_FAILED
 
+# --- Cancel outcomes ----------------------------------------------------------
+# What the cancel before a requeue or a give-up actually achieved. A plain bool
+# used to carry this and CONFLATED THE LAST TWO: "the call failed" and "there was
+# nothing to cancel" are both False, but only the first means a duplicate may
+# print. The messages below key on these, so the audit trail can stop asserting a
+# cancel nobody checked.
+CANCEL_OK = "ok"            # Graph accepted it, or answered 404 -- already gone
+CANCEL_FAILED = "failed"    # the call did not take, OR the job could not be
+                            # addressed at all; either way it is alive and a
+                            # duplicate is possible
+CANCEL_NOTHING = "nothing"  # there was no job -- a crashed submission (rule 1).
+                            # The only one of the three that is not a worry
+
+ALL_CANCEL_RESULTS = (CANCEL_OK, CANCEL_FAILED, CANCEL_NOTHING)
+
 
 def job_is_stalled(state: Optional[str], has_job: bool,
                    job_age_minutes: Optional[float], stall_minutes: int) -> bool:
@@ -182,6 +197,22 @@ def job_is_stalled(state: Optional[str], has_job: bool,
     if job_age_minutes is None:
         return False
     return job_age_minutes >= stall_minutes
+
+
+def cancel_confirmed(state_after: Optional[str]) -> bool:
+    """Whether a job read back AFTER a cancel can be treated as dead.
+
+    Two ways it can be, and both are silence rather than a finding:
+
+      * it reports `canceled` -- the cancel landed;
+      * it is gone entirely (no state), which is what Graph answering 404 means
+        and is exactly what a cancel should produce.
+
+    Anything else is still reporting a live state, and the caller says so. The
+    comparison lives here rather than in the route because a job state is a rule,
+    and `function_app` holds none of those (CLAUDE.md rule 4).
+    """
+    return (state_after or "").strip().lower() in ("", JOB_CANCELED)
 
 
 def retries_due(file_age_minutes: Optional[float], base_minutes: int) -> int:
@@ -699,13 +730,51 @@ def append_message(existing: Any, addition: Any,
     return truncate_message(MESSAGE_SEPARATOR.join(parts), limit)
 
 
-def requeue_message(job_id: Any, attempt: int) -> str:
-    """The entry appended when Poll cancels a stalled job and requeues the file."""
+def _cancel_clause(cancel_result: str) -> str:
+    """How the cancel went, in the words the audit trail should carry.
+
+    THIS USED TO BE THE WORD "cancelled", UNCONDITIONALLY, and it was wrong. The
+    caller had the answer -- `_cancel_outstanding` returns it -- and threw it away,
+    so `Print_Message` asserted a cancel nobody had checked. A requeue clears
+    Print_JobId, so that job is never looked at again; the claim in this string is
+    the only lasting record of it, and a false one hides the exact duplicate rule 2
+    exists to prevent.
+
+    ONLY CANCEL_OK EARNS THE WORD "cancelled". Everything else -- including a
+    value this function does not recognise -- falls to the cautious branch. An
+    unrecognised result is a programming error, and the safe direction for one is
+    to under-claim: a message that says CANCEL FAILED when the cancel worked costs
+    somebody a look at the printer, while the reverse hides a duplicate.
+    """
+    if cancel_result == CANCEL_OK:
+        return "cancelled"
+    if cancel_result == CANCEL_NOTHING:
+        return "no job to cancel"
+    return "CANCEL FAILED"
+
+
+def requeue_message(job_id: Any, attempt: int, cancel_result: str) -> str:
+    """The entry appended when Poll cancels a stalled job and requeues the file.
+
+    The job id leads and `Retry job (n)` trails, either side of the cancel clause:
+    both are what a reader scans for, and both are asserted by the Tier C tests.
+
+    `cancel_result` IS REQUIRED, WITH NO DEFAULT, and that is the point. This
+    message asserted a cancel unconditionally until 2026-09-02 because the caller
+    had the answer and dropped it; a default here would be that same assumption
+    wearing a keyword, and the next caller would inherit the bug in silence.
+    """
+    if cancel_result == CANCEL_NOTHING:
+        # A crashed submission (rule 1): the row was claimed but no job id was
+        # ever written, so there is no id to name. "Job Id (none) no job to
+        # cancel" said it twice and read like a fault in the app.
+        return f"No job to cancel. Retry job ({attempt})"
     label = str(job_id or "").strip() or "(none)"
-    return f"Job Id {label} cancelled. Retry job ({attempt})"
+    return (f"Job Id {label} {_cancel_clause(cancel_result)}. "
+            f"Retry job ({attempt})")
 
 
-def give_up_message(retries: int, give_up_days: int) -> str:
+def give_up_message(retries: int, give_up_days: int, cancel_result: str) -> str:
     """The entry appended when Poll stops trying.
 
     This is the last thing written to the row and PRINT_FAILED is terminal, so it
@@ -713,9 +782,66 @@ def give_up_message(retries: int, give_up_days: int) -> str:
     was allowed. `retries` counts REQUEUES, not attempts -- 0 is legitimate and
     means the original submission was the only one, which is what a row that was
     never seen to stall looks like.
+
+    The cancel clause matters more here than on a requeue: nothing follows this
+    write, so a job left alive behind a row reading PRINT_FAILED prints days later
+    against a column that says it never did.
     """
+    if cancel_result == CANCEL_OK:
+        tail = "outstanding job cancelled"
+    elif cancel_result == CANCEL_NOTHING:
+        tail = "no outstanding job to cancel"
+    else:
+        tail = "OUTSTANDING JOB NOT CANCELLED -- it may still print"
     return (f"gave up after {give_up_days} day(s) and {retries} retr"
-            f"{'y' if retries == 1 else 'ies'}; outstanding job cancelled")
+            f"{'y' if retries == 1 else 'ies'}; {tail}")
+
+
+def duplicate_warning(job_id: Any, cancel_result: str,
+                      lingering_state: str = "") -> str:
+    """The warning a row carries when its old job may still print. "" if it may not.
+
+    Two different ways that happens, and they read differently on purpose:
+
+      * the cancel never took -- we know the job is alive;
+      * the cancel was ACCEPTED but the job still reports a live state. That is an
+        OBSERVATION, not a verdict. Cancel is asynchronous, so the job may yet
+        settle to `canceled`; the sentence says what was seen and when, and lets
+        the reader check the printer rather than asserting a duplicate.
+
+    Either way the row is about to be rewritten and Print_JobId cleared, so this is
+    the last moment anything knows the job existed (CLAUDE.md rule 2).
+    """
+    if cancel_result == CANCEL_NOTHING:
+        return ""
+    label = str(job_id or "").strip() or "(none)"
+    if cancel_result != CANCEL_OK:
+        # CANCEL_FAILED, and anything unrecognised with it: warn rather than
+        # assume, for the same reason `_cancel_clause` under-claims.
+        return (f"job {label} could not be cancelled and may still print -- "
+                f"check the printer for a duplicate")
+    if lingering_state:
+        return (f"cancel of job {label} was accepted but it still reads "
+                f"'{lingering_state}' -- it may still print")
+    return ""
+
+
+def still_running_message(state: Optional[str],
+                          job_age_minutes: Optional[float],
+                          stall_minutes: int) -> str:
+    """Why Poll left this row alone -- the state AND the clock behind it.
+
+    The state alone was ambiguous in the one case that matters: a job whose age
+    CANNOT BE DETERMINED is not stalled (see `job_is_stalled`), so its row sits at
+    PRINT_PENDING for ever, and it reported the same bare word as a healthy job
+    ten seconds old. These now read differently.
+    """
+    label = (state or "").strip().lower()
+    if not label:
+        return "no job"
+    if job_age_minutes is None:
+        return f"{label}, job age unknown - not stalled"
+    return f"{label}, job {job_age_minutes:.1f} min old (stall {stall_minutes})"
 
 
 # --- Selection ----------------------------------------------------------------

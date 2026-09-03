@@ -107,6 +107,16 @@ class FakeGraph:
         self.jobs: Dict[str, Dict[str, Any]] = {}
         self.calls: List[Call] = []
         self.cancelled: List[str] = []
+        # Job ids whose state does not move when cancelled: the call is accepted
+        # (204) and the job goes on reporting what it reported before.
+        #
+        # Observed on a live run, 2026-09-02, with one Poll pass cancelling four
+        # jobs. Before: 40 and 41 `pending`, 39 `processing`, 38 `stopped`. After:
+        # 40 and 41 `canceled`, 39 and 38 still `stopped`. Why the last two did not
+        # move was never established -- the portal shows state, not cause. What is
+        # certain is the gap this models: Graph accepting a cancel is not the same
+        # as the job dying, and that gap is where a duplicate hides.
+        self.jobs_held_by_device: List[str] = []
         self.page_size = 100
         self.drop_columns: List[str] = []
         self._next_job = 1800
@@ -229,13 +239,20 @@ class FakeGraph:
             self.jobs[job_id]["createdDateTime"] = created
 
     def fail_next(self, method: str, url_contains: str, *, status: int = 500,
-                  payload: Any = None, times: int = 1) -> None:
+                  payload: Any = None, times: int = 1, skip: int = 0) -> None:
         """Make the next `times` matching calls fail, so each failure branch of
-        the submission runs through the real error handling."""
+        the submission runs through the real error handling.
+
+        `skip` lets the first N matches through untouched. Poll reads the same
+        job URL twice in one pass -- once to decide, once after cancelling to see
+        whether the job actually died -- so isolating the second read is the only
+        way to test the failure of one without the other.
+        """
         self._failures.append({
             "method": method.upper(),
             "match": url_contains,
             "times": times,
+            "skip": skip,
             "response": FakeResponse(status, payload or {
                 "error": {"code": "injected",
                           "message": "injected {}".format(status)}}),
@@ -273,6 +290,9 @@ class FakeGraph:
         for failure in self._failures:
             if (failure["times"] > 0 and failure["method"] == method
                     and failure["match"] in url):
+                if failure.get("skip", 0) > 0:
+                    failure["skip"] -= 1
+                    continue
                 failure["times"] -= 1
                 return failure["response"]
 
@@ -460,6 +480,8 @@ class FakeGraph:
             return FakeResponse(404, {"error": {"code": "printerNotFound",
                                                 "message": "no such printer"}})
         self.cancelled.append(job_id)
+        if job_id in self.jobs_held_by_device:
+            return FakeResponse(204)
         if job_id in self.jobs:
             self.jobs[job_id]["status"] = {
                 "state": "canceled", "description": "Canceled.",
