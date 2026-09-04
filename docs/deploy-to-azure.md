@@ -403,15 +403,38 @@ invoice project that shares the subscription.
 | Resource group | `rg-noble-print` |
 | Storage account name | `stnobleprint` (3–24 lowercase alphanumerics, globally unique) |
 | Region | **West US** |
+| Primary service | **Azure Blob Storage or Azure Data Lake Storage Gen 2** — **required**, despite the blade saying it "doesn't restrict your storage to this resource type". That sentence describes what the choice *does*, not whether you must make one: leave it blank and **Review + create fails** with "Required information is missing or not valid" and a ❌ on Basics. Every option creates the same account; Blob is the honest one, since the deployment package and the host's state and leases are all blobs |
 | Performance | Standard |
-| Redundancy | **LRS** (Locally-redundant) |
+| Redundancy | **LRS (Locally-redundant)** — ⚠️ **change this.** The blade defaults to **GRS** and pre-ticks the read-access box under it, making it RA-GRS. Selecting LRS removes the checkbox with it |
 
-On the **Advanced** tab: **Allow blob public access → Disabled**.
-
-→ **Review + create** → **Create**.
+> Choosing that option does **not** enable hierarchical namespace, despite "Data
+> Lake Storage Gen 2" appearing in its name. HNS is the separate **Advanced**
+> checkbox in the table below, and it must stay **Disabled**.
 
 The Function App needs this for its own host state and for the deployment package.
-LRS is deliberate — this holds no business data, only runtime bookkeeping.
+LRS is deliberate — this holds no business data, only runtime bookkeeping. The
+queue and the audit trail are in SharePoint. Geo-replication would roughly double
+the storage rate, permanently, to keep a second copy of host lock blobs and a
+deployment package that `func azure functionapp publish` rebuilds in a minute —
+and it protects nothing, because if West US is unavailable the Function App is
+down with it. There is no failover to take.
+
+### The other tabs — verify, do not change
+
+Every remaining tab is correct on its defaults (observed 2026-09-03). Two are
+worth *looking* at, and one of those has moved:
+
+| Tab | Setting | Want | Why it is here |
+|---|---|---|---|
+| **Security** | *Allow enabling anonymous access on individual containers* | **unchecked** | This is the "Allow blob public access → Disabled" this runbook used to send you to the **Advanced** tab for. It moved to **Security**, and Microsoft has since made unchecked the default — so **verify it, there is nothing to toggle** |
+| **Security** | *Enable storage account key access* | **checked** | Leave it on. `AzureWebJobsStorage` connects with a key-based connection string, so turning this off stops the host starting. It reads like the hardening choice and is the one setting on that tab that breaks the deploy |
+| **Security** | *Enable Defender for Storage* | **off** | Billed per storage account, and it exists to catch malicious uploads and exfiltration. This account holds host locks and a deployment package; the invoices are in SharePoint and never touch it |
+| **Advanced** | *Enable hierarchical namespace* | **unchecked** | Functions does not support ADLS Gen2 / HNS for `AzureWebJobsStorage`, and it **cannot be changed after creation** — getting it wrong means deleting the account and starting again. Access tier stays **Hot**: Cool or Cold add per-transaction charges and early-deletion penalties to state that is read constantly |
+
+Networking, Data protection, Encryption and Tags: defaults, nothing to read.
+
+→ **Review + create** → **Create**. Confirm the summary says `stnobleprint`,
+West US, Standard, **LRS**.
 
 ### 3.3 Which Python version?
 
