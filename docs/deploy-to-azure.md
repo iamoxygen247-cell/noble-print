@@ -849,8 +849,13 @@ Confirm nothing local leaked in:
 
 ```powershell
 az functionapp config appsettings list --resource-group $RG --name $APP `
-    --query "[?name=='PRINT_REFRESH_TOKEN']" -o table    # must be empty
+    --query "length([?name=='PRINT_REFRESH_TOKEN'])" -o tsv    # must print 0
 ```
+
+> **It counts rather than filters, deliberately.** A filter that matches nothing
+> prints nothing — and so does a command that never ran. The local TLS proxy
+> resets `az` handshakes often enough (§0) that "no output" is a genuinely
+> ambiguous result here. `0` is not ambiguous.
 
 ---
 
@@ -951,8 +956,13 @@ The query above filters by prefix, so widen it to see the App Insights row:
 
 ```powershell
 az functionapp config appsettings list --resource-group $RG --name $APP `
-    --query "[?name=='APPLICATIONINSIGHTS_CONNECTION_STRING'].name" -o tsv
+    --query "length([?name=='APPLICATIONINSIGHTS_CONNECTION_STRING'])" -o tsv
 ```
+
+**`1` is the pass; `0` is the failure this check exists to catch.** It counts
+instead of printing the name for the same reason as step 6 — a dropped `az`
+handshake and a genuinely missing setting used to look identical, and this is the
+one where the difference matters.
 
 Or read the whole set in the portal: **`func-noble-print` → Settings →
 Environment variables**.
@@ -962,13 +972,13 @@ report is quietly wrong:
 
 ```powershell
 az functionapp config appsettings list --resource-group $RG --name $APP `
-    --query "[?contains(name,'Sampling')]" -o table
+    --query "length([?contains(name,'Sampling')])" -o tsv
 ```
 
-> **An empty table is the pass.** The authority is `host.json`
+> **`0` is the pass.** The authority is `host.json`
 > (`samplingSettings.isEnabled: false`), which ships with the code in step 7 — this
-> query only looks for an app setting that would *override* it. Nothing returned
-> means nothing overrides it. A row here is the failure.
+> query only looks for an app setting that would *override* it. `0` means nothing
+> overrides it. Anything above `0` is the failure.
 
 Get the host name and a function key:
 
@@ -1310,6 +1320,7 @@ immediately and leaves the queue intact.
 | Stuck `PRINT_PENDING`, nothing prints | Nothing is delivering jobs to the device | [`e2e-testing.md`](e2e-testing.md) Part A |
 | Prints, but not the pipeline Part A proved | Flow A omitted `printFormat` on a printer that also accepts PDF, so passthrough won | Step 10, [`printFormat` in Flow A's body](#printformat-in-flow-as-body) |
 | Counts in the workbook look low | Adaptive sampling got enabled | Step 8 |
+| `ConnectionResetError [WinError 10054]` or `Connection aborted` from any `az` command | Local TLS interception on the **workstation**, not Azure. Heavier responses hit it more often | **Retry.** The `az` wrapper in the PowerShell profile already retries five times and is *silent on success*, so `az attempt N failed … retrying…` followed by nothing — and no `az failed after 5 attempts` warning — means a later attempt worked. §0, [`ai/troubleshooting.md`](ai/troubleshooting.md) |
 
 Anything not on this list belongs in
 [`docs/ai/troubleshooting.md`](ai/troubleshooting.md) once you have confirmed the
@@ -1346,7 +1357,7 @@ cause and verified the fix.
         functions listed -- check_printer_health, poll_print_status,
         submit_print_jobs (fewer means an old build)
 [ ]  8  Settings read BACK; defaultHostName captured; key captured; sampling
-        query returned NOTHING (empty is the pass -- host.json is the authority)
+        query returned 0 (host.json is the authority); App Insights count = 1
 [ ]  9  badpayload 400 · dryrun shows conversion=pdf-to-pwg-raster · one real file ·
         READ THE COLUMNS · READ THE PAPER · PRINT_EVENT in AI
 [ ]  9  verify_print_time.py: column resolves, a written value returns the SAME
