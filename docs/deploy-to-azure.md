@@ -131,7 +131,7 @@ $APP       = "func-noble-print"          # must be globally unique
 $STORAGE   = "stnobleprint"              # 3-24 lowercase alphanumerics, globally unique
 $VAULT     = "kv-noble-print"            # globally unique
 $INSIGHTS  = "appinsight-noble-print"
-$WORKSPACE = "log-noble-print"
+$WORKSPACE = "log-analytics-noble-print"
 $SECRET    = "up-print-refresh-token"
 
 # The printer share. PERISHABLE -- see "The printer" below before using it.
@@ -466,7 +466,7 @@ from `requirements.txt` server-side against *its* runtime, so no local wheel shi
 > |---|---|
 > | Subscription | `dev-Document Intelligence` |
 > | Resource group | **`rg-noble-print`** |
-> | Name | **`log-noble-print`** |
+> | Name | **`log-analytics-noble-print`** |
 > | Region | **West US** |
 >
 > → **Review + create** → **Create**. Takes about a minute.
@@ -490,7 +490,7 @@ receives no new language versions.
 | Region | **West US** |
 | Runtime stack | **Python** |
 | Version | **3.14** |
-| Instance size / memory | **2048 MB** |
+| Instance size / memory | **4096 MB** |
 
 **Storage** — select the existing `stnobleprint`.
 
@@ -500,7 +500,7 @@ the wizard proposes**:
 | Field | The wizard offers | Set it to |
 |---|---|---|
 | Application Insights | a new resource named after the app, `func-noble-print` | **Create new**, renamed to **`appinsight-noble-print`** |
-| Log Analytics workspace *(inside that flyout)* | the shared `DefaultWorkspace-…-WUS` in `DefaultResourceGroup-WUS` — and **nothing else, until you have done the pre-step above** | select **`log-noble-print`** |
+| Log Analytics workspace *(inside that flyout)* | the shared `DefaultWorkspace-…-WUS` in `DefaultResourceGroup-WUS` — and **nothing else, until you have done the pre-step above** | select **`log-analytics-noble-print`** |
 
 > **The workspace row is the one that gets skimmed past.** Accepting the default
 > puts this app's telemetry in a resource group the sibling invoice project also
@@ -516,18 +516,47 @@ the wizard proposes**:
 > standalone, you have to copy the connection string across by hand in step 6, and
 > a missed one produces an app that runs and reports nothing.
 
+**Authentication** — **leave it on secrets.** This tab chooses how three
+connections authenticate: host storage (`AzureWebJobsStorage`), deployment
+storage, and Application Insights. On the summary they read *"Not applicable when
+using secrets"*, which is what you want, and two other steps depend on it:
+
+* §3.2 keeps **Allow storage account key access enabled** *because* the host
+  connects with a key-based connection string.
+* §4 grants the app's managed identity **only `Key Vault Secrets Officer`** — and
+  nothing at all on `stnobleprint`.
+
+So switching these to managed identity here leaves the host with no way to reach
+its own storage, and it will not start. The failure is at runtime, not at create
+time. Hardening this tab is the natural instinct and it is the wrong move **unless
+you also** add three role assignments on `stnobleprint` in §4 — *Storage Blob Data
+Owner*, *Storage Queue Data Contributor*, *Storage Table Data Contributor* — and
+only then disable key access. The §4.1 managed identity is still required either
+way: it is what reaches Key Vault.
+
 **Networking** — defaults. Public access is fine; the endpoints are protected by
 the function key.
 
 → **Review + create** → **Create**. This takes a few minutes.
 
-**Instance memory** is 2048 MB deliberately: rasterizing a PDF page holds a bitmap
-in memory, and 512 MB is tight for a multi-page invoice. It can be changed later
-under **Settings → Scale and concurrency**.
+> **The summary does not show the Log Analytics workspace.** *Monitoring (New)*
+> lists only the App Insights name and region, so the workspace you picked cannot
+> be confirmed here. Verify it after creation: **`appinsight-noble-print` →
+> Properties → Workspace** must read `log-analytics-noble-print`, not
+> `DefaultWorkspace-…-WUS`. **Change workspace** on that same blade is the fix.
+
+**Instance memory** is **4096 MB** for headroom: rasterizing a PDF page holds a
+bitmap in memory — 512 MB is genuinely tight for a multi-page invoice — and 4 GB
+leaves room for higher page counts or a higher `PRINT_RASTER_DPI` later. It is not
+free: Flex Consumption bills **memory × execution seconds**, so 4 GB costs twice
+2 GB per second of run time. At this volume that is pennies, and it can be changed
+either way later under **Settings → Scale and concurrency**.
 
 ### 3.5 Key Vault
 
 **Portal → Key Vaults → + Create**
+
+**Basics**
 
 | Field | Value |
 |---|---|
@@ -535,25 +564,96 @@ under **Settings → Scale and concurrency**.
 | Key vault name | `kv-noble-print` (globally unique) |
 | Region | **West US** |
 | Pricing tier | Standard |
-| **Permission model** | **Azure role-based access control (RBAC)** |
+| Soft-delete | **Enabled** — not a choice; it is forced on, 90 days by default |
+| Purge protection | **Disable** — see below |
 
-→ **Review + create** → **Create**.
+**Access configuration** *(the next tab — the permission model is NOT on Basics)*
 
-> **The permission model matters.** Step 4 grants a *role*; if the vault is left on
-> the legacy **access policy** model those role assignments have no effect and the
-> app gets 403 at runtime, with nothing in the code to blame.
+| Field | Value |
+|---|---|
+| **Permission model** | **Azure role-based access control** |
+| Resource access — all three | **unchecked**: *Azure VMs for deployment*, *ARM for template deployment*, *Azure Disk Encryption* |
+
+**Networking** — defaults. → **Review + create** → **Create**.
+
+> **The permission model matters, and it is on its own tab.** Follow the Basics
+> table to Review + create and you never see the control. Azure RBAC is now the
+> **default**, labelled *recommended*, so the risk today is picking *Vault access
+> policy* rather than failing to escape it — but the consequence is unchanged:
+> step 4 grants a *role*, and on the access-policy model that role has no effect,
+> surfacing as a 403 at runtime with nothing in the code to blame.
+
+> **Leave the three Resource access boxes unchecked.** Each one lets an Azure
+> platform service read this vault, and this vault holds a live credential. None
+> applies: there are no VMs, step 6 sets app settings with `az` rather than an ARM
+> template, and no disks are encrypted.
+
+> **Purge protection off, deliberately.** Soft-delete cannot be turned off, so a
+> deleted vault **reserves its name** for the retention period. With purge
+> protection *off* you can reclaim `kv-noble-print` early by purging manually;
+> with it *on* nobody can, including Microsoft, for the full 90 days — which would
+> defeat §3.1's reason for a dedicated resource group (delete the whole experiment
+> in one action) and §12's rollback. The cost of that choice: after deleting the
+> vault, **Key Vaults → Manage deleted vaults → Purge** before recreating, or the
+> name is rejected as taken.
+
+### What goes in this vault, and who can read it
+
+**One secret, ever.**
+
+| | |
+|---|---|
+| Name | `up-print-refresh-token` — `$SECRET`, i.e. `graph_auth.DEFAULT_SECRET_NAME`, overridable by the `PRINT_REFRESH_TOKEN_SECRET` app setting |
+| Holds | the delegated OAuth **refresh token** for the print service account |
+| Written by | `bootstrap_token.py` at step 5 (as you), then **rewritten on every rotation** by the app — Entra issues a new refresh token on each redemption and `graph_auth.write_refresh_token` stores it back |
+
+That rotation is *why* step 4 grants **Secrets Officer** and not Secrets User:
+read-only works for about 90 days, then the token expires unrotated and the
+pipeline stops.
+
+**Two principals reach it**, both through `DefaultAzureCredential` — which
+resolves to the managed identity in Azure and to your `az login` on your machine:
+
+| Who | Role | Why |
+|---|---|---|
+| `func-noble-print` managed identity | Key Vault Secrets Officer | reads at runtime, writes the rotated token |
+| you | Key Vault Secrets Officer | step 5 writes the secret from your machine |
+
+Anyone holding **Owner** or **User Access Administrator** on the vault, resource
+group or subscription can grant themselves that role. Owner alone does not *read*
+secrets — that is the management/data-plane split in §4.3 — but it can *assign*
+the right to. This is inherent to Azure RBAC; it is stated here so nobody reads
+"two principals" as a hard boundary.
+
+> **This secret is not print-only, and that is the part worth knowing.** The token
+> carries the service account's delegated scopes (`graph_auth.SCOPES`), and the
+> broadest by far is **`Sites.ReadWrite.All`** — read and write **every SharePoint
+> site collection that account can reach** — alongside the four print scopes.
+> Whoever holds it can act as that account across SharePoint generally. It lasts
+> 90 days rolling and is revoked by a password change or reset, **not** by password
+> expiry; see the service-account note in §1.
+
+**Two exposures this vault does not cover.** `PRINT_REFRESH_TOKEN` as an app
+setting bypasses it completely — a local-development escape hatch that must never
+be set in Azure (§6), which is why it logs a warning on every use. And the
+**function key** grants no vault access at all, but it lets its holder invoke the
+endpoints, make the app use the token, and choose which SharePoint site it acts
+on — the trade recorded in CLAUDE.md.
 
 ### 3.6 Confirm what exists
 
-**Portal → Resource groups → `rg-noble-print` → Overview.** Expect five resources,
-all **West US**:
+**Portal → Resource groups → `rg-noble-print` → Overview.** Expect **six**
+resources, all **West US**. Leave *Show hidden types* **unchecked** — enabling
+App Insights also creates a *Failure Anomalies* smart-detector alert rule, which
+is a hidden type and is not counted here.
 
 | Resource | Type |
 |---|---|
 | `stnobleprint` | Storage account |
 | `func-noble-print` | Function App |
+| `ASP-rgnobleprint-…` | App Service plan — **the Flex Consumption plan.** You never create this; the Function App wizard does, and it names it itself, so the four-character suffix differs on any rebuild. It is a resource like any other and it is easy to mistake for something that does not belong |
 | `appinsight-noble-print` | Application Insights |
-| `log-noble-print` | Log Analytics workspace — **in this group.** If it is missing, the wizard's default shared workspace was accepted in 3.4; the app still reports, but see the callout there |
+| `log-analytics-noble-print` | Log Analytics workspace — **in this group.** If it is missing, the wizard's default shared workspace was accepted in 3.4; the app still reports, but see the callout there |
 | `kv-noble-print` | Key vault |
 
 ---
@@ -757,6 +857,7 @@ problem — and the deploy will otherwise look like it succeeded.
 | `Can't find app with name "<app>"` — but it exists | A dropped TLS handshake on the tool's lookup call, which has **no retry**. | **Just retry**, up to ~8 times. Publish is idempotent. This message means "try again", not "wrong name". |
 | `Unable to connect to Azure… az CLI` while `az account show` works | The tool shells out to a **child** `az` process; a shell-profile wrapper is invisible to it. `az account show` only reads the local cache and proves nothing. | `az account get-access-token --query expiresOn -o tsv` — the only check that touches the network. |
 | A TLS error printed *after* `The deployment was successful!`, non-zero exit | The final invoke-URL fetch failed. The deploy already landed. | **Read the log, not the exit code.** |
+| **401 or 403 from the SCM endpoint** (not a TLS error) | The app is created with **Basic authentication: Disabled**, which is correct and more secure — Core Tools authenticates to Flex Consumption with an **ARM token**, the one the command above pre-warms. A 401/403 here means it fell back to Kudu instead. | `func-noble-print` → **Settings → Configuration → General settings → SCM Basic Auth Publishing Credentials → On**, retry, then turn it back off. |
 
 ---
 
@@ -1163,9 +1264,13 @@ cause and verified the fix.
 [ ]  2  SharePoint: 5 columns exist, Print_Status INDEXED (approval already checked: off)
 [ ]  2  Print_Time is Date and Time with INCLUDE TIME on, friendly format off,
         NOT indexed -- wrong settings fail quietly, a missing column does not
-[ ]  3  PORTAL, all WEST US: RG, storage, Flex Consumption app (Python 3.14,
-        2048 MB, App Insights ENABLED in the wizard), Key Vault on the RBAC
-        permission model -- 5 resources in the group
+[ ]  3  PORTAL, all WEST US: RG, storage, Log Analytics workspace FIRST, Flex
+        Consumption app (Python 3.14, 4096 MB, App Insights ENABLED in the wizard,
+        Authentication left on SECRETS), Key Vault on the RBAC permission model
+        -- SIX resources in the group: the App Service plan (ASP-rgnobleprint-...)
+        is created by the wizard and counts too
+[ ]  3  App Insights -> Properties -> Workspace reads log-analytics-noble-print,
+        NOT DefaultWorkspace-... (the create summary never shows this)
 [ ]  4  PORTAL: app managed identity ON; app AND you = Key Vault Secrets OFFICER
         (not User) on the vault
 [ ]  5  bootstrap_token.py run as the SERVICE ACCOUNT; secret exists in the vault
