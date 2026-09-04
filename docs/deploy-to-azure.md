@@ -204,11 +204,13 @@ documented `Application: Not supported`.
    - → **Register**
 
 2. **Authentication → Allow public client flows → Enabled.**
-   On the classic blade this is under *Advanced settings* as a Yes/No radio; on
-   **Authentication (Preview)** it is a toggle on the **Settings** tab. Both have
-   **Save / Discard** at the foot of the blade — **greyed out means saved**, so if
-   Save is still active you have not committed it, and you will not find that out
-   until step 5.
+   On the classic blade this is under *Advanced settings* as a Yes/No radio with
+   **Save / Discard** at the foot — **greyed out means saved**, so if Save is still
+   active you have not committed it, and you will not find that out until step 5.
+   On **Authentication (Preview)** it is a toggle on the **Settings** tab with
+   **no Save button at all** (observed 2026-09-03): the toggle commits itself and
+   reads `Enabled` beside it. Trust the toggle's own label there, not the absence
+   of a greyed-out Save.
 
    The app is a public client with no secret, so Entra refuses the device-code
    grant outright without this. Leave **Redirect URI** blank: device code flow does
@@ -228,15 +230,24 @@ documented `Application: Not supported`.
    → **Grant admin consent for &lt;tenant&gt;** and confirm every row reads
    *Granted*.
 
-   > **`offline_access` may not be listed, and that is not a blocker.** It is an
-   > OpenID Connect scope, so it lives under the **OpenId permissions** group, not
-   > with the Graph resource groups — and some portal builds omit it from the
-   > picker entirely. Add it if the search box finds it; otherwise carry on.
-   > `graph_auth.SCOPES` deliberately **excludes** it (MSAL injects
-   > `offline_access` / `openid` / `profile` itself and rejects them if passed —
-   > pinned by `test_the_scopes_exclude_the_reserved_ones`), and it is
+   > **`offline_access` may not be listed under *Configured permissions*, and that
+   > is not a blocker.** It is an OpenID Connect scope, so it lives under the
+   > **OpenId permissions** group rather than with the Graph resource groups, and
+   > some portal builds omit it from the picker entirely. Add it if the search box
+   > finds it; otherwise carry on. `graph_auth.SCOPES` deliberately **excludes** it
+   > (MSAL injects `offline_access` / `openid` / `profile` itself and rejects them
+   > if passed — pinned by `test_the_scopes_exclude_the_reserved_ones`), and it is
    > user-consentable rather than declared. Step 5 is the real check: if no refresh
    > token comes back, `bootstrap_token.py` says so in as many words.
+
+   > **Expect nine rows, not five, and do not go hunting for the extra four.**
+   > Azure adds **`User.Read`** at registration — it is not in `SCOPES`, it is
+   > harmless, leave it. And once anyone has signed in, `offline_access`, `openid`
+   > and `profile` appear under **Other permissions granted**, consented but not
+   > configured. That block is the *desired* state, not a warning: `offline_access`
+   > granted is what mints the refresh token. Ignore the portal's suggestion to
+   > move them into the configured list — declaring them changes nothing, and MSAL
+   > re-requests them at every sign-in regardless.
 
    > Do **not** add `PrintConnector.Read.All`. Only the diagnostic script wants
    > it; the app deliberately does not.
@@ -251,9 +262,16 @@ $CLIENT_ID = "bb707828-6e0e-4c2a-9f4d-329aa10c66a5"   # "Noble Universal Print"
 Neither is a secret — a client id and a tenant id are public identifiers. The
 secret is the refresh token, and it never leaves Key Vault.
 
-**Registration completed 2026-08-31**, verified from Overview: supported account
-types *My organization only*, state *Activated*, all five delegated permissions
-granted tenant-wide, public client flows enabled.
+**Registration completed 2026-08-31; re-verified 2026-09-03**, each fact read from
+the blade that actually shows it. Permissions and public client flows are **not**
+visible on Overview, so an earlier version of this line cited a screen that could
+not have confirmed them:
+
+| Blade | Confirmed |
+|---|---|
+| **Overview** | client id `bb707828-…`, tenant `ce21d3c3-…`, *My organization only*, state *Activated*, **no** redirect URI and **no** client secret — both correct for a public client doing device code |
+| **API permissions** | all five delegated Graph permissions *Granted*, `Printer.Read.All` being the one whose *Admin consent required* is Yes. Plus the default `User.Read`, and `offline_access` / `openid` / `profile` granted under *Other permissions granted* |
+| **Authentication (Preview) → Settings** | **Allow public client flows: Enabled** |
 
 ### The service account
 
