@@ -130,7 +130,7 @@ $LOC       = "westus"                    # portal shows this as "West US"
 $APP       = "func-noble-print"          # must be globally unique
 $STORAGE   = "stnobleprint"              # 3-24 lowercase alphanumerics, globally unique
 $VAULT     = "kv-noble-print"            # globally unique
-$INSIGHTS  = "appi-noble-print"
+$INSIGHTS  = "appinsight-noble-print"
 $WORKSPACE = "log-noble-print"
 $SECRET    = "up-print-refresh-token"
 
@@ -454,6 +454,27 @@ from `requirements.txt` server-side against *its* runtime, so no local wheel shi
 
 ### 3.4 Function App — Flex Consumption
 
+> **First, create the Log Analytics workspace. The Function App wizard cannot.**
+> Its *Create new Application Insights* flyout has a required **Workspace**
+> dropdown that lists only workspaces that **already exist**, and offers no way to
+> make one — so if you start the wizard without this, the shared
+> `DefaultWorkspace-…-WUS` is the only thing you can pick.
+>
+> **Portal → Log Analytics workspaces → + Create**
+>
+> | Field | Value |
+> |---|---|
+> | Subscription | `dev-Document Intelligence` |
+> | Resource group | **`rg-noble-print`** |
+> | Name | **`log-noble-print`** |
+> | Region | **West US** |
+>
+> → **Review + create** → **Create**. Takes about a minute.
+>
+> Already past this and stuck on the default? It is recoverable, not permanent:
+> **App Insights → Properties → Change workspace**. Telemetry goes to the shared
+> workspace until you do it.
+
 **Portal → Function App → + Create → Flex Consumption**
 
 The first screen asks you to pick a hosting option. Choose **Flex Consumption**,
@@ -473,8 +494,22 @@ receives no new language versions.
 
 **Storage** — select the existing `stnobleprint`.
 
-**Monitoring** — **Enable Application Insights: Yes**, and let it create
-`appi-noble-print` (it also creates the Log Analytics workspace).
+**Monitoring** — **Enable Application Insights: Yes**, then **override both names
+the wizard proposes**:
+
+| Field | The wizard offers | Set it to |
+|---|---|---|
+| Application Insights | a new resource named after the app, `func-noble-print` | **Create new**, renamed to **`appinsight-noble-print`** |
+| Log Analytics workspace *(inside that flyout)* | the shared `DefaultWorkspace-…-WUS` in `DefaultResourceGroup-WUS` — and **nothing else, until you have done the pre-step above** | select **`log-noble-print`** |
+
+> **The workspace row is the one that gets skimmed past.** Accepting the default
+> puts this app's telemetry in a resource group the sibling invoice project also
+> uses, which defeats both halves of §3.1's reason for a dedicated group: deleting
+> `rg-noble-print` would strand the telemetry rather than take it with it, and the
+> two projects entangle in exactly the place §3.1 keeps them apart. §3.6 would also
+> then find **four** resources where it expects five. Log Analytics bills on
+> ingested data, not on how many workspaces hold it, so a dedicated one costs
+> nothing extra.
 
 > Doing App Insights here rather than separately is worth it: the portal wires
 > `APPLICATIONINSIGHTS_CONNECTION_STRING` into the app settings for you. Created
@@ -517,8 +552,8 @@ all **West US**:
 |---|---|
 | `stnobleprint` | Storage account |
 | `func-noble-print` | Function App |
-| `appi-noble-print` | Application Insights |
-| `log-noble-print` (or an auto-generated name) | Log Analytics workspace |
+| `appinsight-noble-print` | Application Insights |
+| `log-noble-print` | Log Analytics workspace — **in this group.** If it is missing, the wizard's default shared workspace was accepted in 3.4; the app still reports, but see the callout there |
 | `kv-noble-print` | Key vault |
 
 ---
