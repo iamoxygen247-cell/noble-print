@@ -640,6 +640,66 @@ be set in Azure (§6), which is why it logs a warning on every use. And the
 endpoints, make the app use the token, and choose which SharePoint site it acts
 on — the trade recorded in CLAUDE.md.
 
+### How the secret stays current — nobody refreshes it by hand
+
+**There are two tokens, and only one of them lives in the vault.**
+
+| | Access token | Refresh token |
+|---|---|---|
+| Kept in | the worker process's **memory** | **Key Vault** |
+| Lasts | ~60–90 minutes | **90 days** |
+| Used for | every Graph call | obtaining the next access token |
+
+Every Graph call needs an access token, and `graph_auth.get_access_token` is what
+hands one over — it is `GraphClient`'s token provider, called where the
+`Authorization` header is built, so it runs **once per HTTP attempt**. One Submit
+run makes 15–20 Graph calls, so it is called 15–20 times.
+
+Almost every one of those returns the token already in memory and touches nothing
+— no Key Vault, no Entra. Only when the cache is **empty** or the access token is
+**within 5 minutes of expiring** does the slow path run:
+
+1. read the refresh token **from the vault**
+2. redeem it with Entra, which returns a new access token **and a new refresh
+   token**
+3. **write that new refresh token back to the vault** ← the rotation
+4. cache the access token in memory
+
+So at most **one** rotation per invocation, regardless of how many Graph calls it
+makes. The 90-day clock resets every time step 3 runs.
+
+**What decides how often that happens is the worker process, not the call rate.**
+The cache is a module-level global, so a fresh Python process starts empty and
+rotates on its first Graph call; a process already warm reuses memory for 55–85
+minutes. Flex Consumption scales to zero when idle, so at Flow A's 15 minutes and
+Flow B's 10 minutes expect a mix of both. Either way the token is rotated many
+times a day and **no human ever touches it**.
+
+Rotation is also safe to race: Entra does not revoke an old refresh token when it
+is used to fetch a new one, so two overlapping runs both succeed and last-write-
+wins leaves a valid token.
+
+> **Two ways this silently stops, both worth knowing before they happen.**
+>
+> **The write-back fails and says almost nothing.** Step 3 is best-effort by
+> design — it logs a warning and carries on, because the access token from step 2
+> is valid and failing the run over the *next* token would turn a warning into an
+> outage. But if every write fails — which is exactly what **Secrets User instead
+> of Secrets Officer** produces (§4.2) — the stored token never advances and the
+> pipeline stops dead at 90 days.
+>
+> **An idle app never rotates.** Rotation only happens when the app runs. §12's
+> advice to switch off Flows A and B is the right first move in an incident and is
+> safe indefinitely for the *queue* — files simply sit at `PRINT_READY`. It is not
+> safe indefinitely for the *token*: past 90 days with no runs, it expires and
+> recovery is a manual step 5.
+
+Only that recovery is manual. It cannot be automated — a dead refresh token needs
+a human at an interactive sign-in — so every endpoint answers 500 with
+`remedy: run scripts/bootstrap_token.py` until someone does. Being revoked by a
+password change or reset (not expiry) is the other way to get there; see the
+service-account note in §1.
+
 ### 3.6 Confirm what exists
 
 **Portal → Resource groups → `rg-noble-print` → Overview.** Expect **six**
@@ -1225,6 +1285,12 @@ cd functionapp; func azure functionapp publish $APP --build remote; cd ..
 
 Turning the flows off is the safer first move in an incident: it stops new work
 immediately and leaves the queue intact.
+
+> **Safe indefinitely for the queue, not for the token.** Files sit at
+> `PRINT_READY` for as long as you like — the library is the queue and nothing
+> ages out. But the refresh token is only rotated *when the app runs* (§3.5), so
+> flows left off for more than **90 days** let it expire, and the first run after
+> that 500s until someone re-runs step 5. Anything shorter costs nothing.
 
 ---
 
