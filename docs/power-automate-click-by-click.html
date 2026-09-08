@@ -1,0 +1,1381 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Noble Print — Power Automate Click-by-Click Build Specification</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172033;
+      --muted: #5d687b;
+      --line: #d9deea;
+      --panel: #f5f7fb;
+      --brand: #1f5faa;
+      --brand-dark: #17477f;
+      --accent: #e9f2ff;
+      --warning: #fff7dc;
+      --warning-line: #d6a900;
+      --danger: #fff0f0;
+      --danger-line: #cb3b3b;
+      --success: #eef9f1;
+      --success-line: #25834b;
+      --code-bg: #111827;
+      --code-ink: #f8fafc;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #eef2f8;
+      font: 16px/1.58 "Segoe UI", Arial, sans-serif;
+    }
+
+    .page {
+      width: min(1120px, calc(100% - 32px));
+      margin: 28px auto;
+      padding: 54px 64px 70px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: 0 12px 35px rgba(30, 48, 80, 0.10);
+    }
+
+    h1, h2, h3, h4 {
+      line-height: 1.22;
+      color: #10213b;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(2rem, 4vw, 3rem);
+      letter-spacing: -0.035em;
+    }
+
+    h2 {
+      margin-top: 50px;
+      padding-bottom: 9px;
+      border-bottom: 2px solid var(--line);
+      font-size: 1.65rem;
+    }
+
+    h3 { margin-top: 32px; font-size: 1.27rem; }
+    h4 { margin-top: 24px; font-size: 1.06rem; }
+
+    p, li { max-width: 88ch; }
+    a { color: var(--brand); }
+    a:hover { color: var(--brand-dark); }
+
+    .eyebrow {
+      margin: 0 0 9px;
+      color: var(--brand);
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .subtitle {
+      margin: 0;
+      color: var(--muted);
+      font-size: 1.08rem;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 22px;
+      margin: 24px 0 0;
+      padding: 14px 18px;
+      background: var(--panel);
+      border-radius: 9px;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .toc {
+      margin: 34px 0 12px;
+      padding: 22px 26px;
+      background: var(--accent);
+      border-left: 5px solid var(--brand);
+      border-radius: 8px;
+    }
+
+    .toc h2 {
+      margin: 0 0 12px;
+      padding: 0;
+      border: 0;
+      font-size: 1.2rem;
+    }
+
+    .toc ol {
+      columns: 2;
+      margin: 0;
+      padding-left: 22px;
+    }
+
+    .toc li { break-inside: avoid; margin: 4px 0; }
+
+    .flow {
+      overflow-x: auto;
+      margin: 22px 0;
+      padding: 20px 24px;
+      background: var(--code-bg);
+      border-radius: 10px;
+      color: var(--code-ink);
+      font: 0.95rem/1.6 Consolas, "Courier New", monospace;
+      white-space: pre;
+    }
+
+    .callout {
+      margin: 22px 0;
+      padding: 16px 20px;
+      border-left: 5px solid var(--brand);
+      border-radius: 7px;
+      background: var(--accent);
+    }
+
+    .callout.warning {
+      border-left-color: var(--warning-line);
+      background: var(--warning);
+    }
+
+    .callout.danger {
+      border-left-color: var(--danger-line);
+      background: var(--danger);
+    }
+
+    .callout.success {
+      border-left-color: var(--success-line);
+      background: var(--success);
+    }
+
+    .callout > :first-child { margin-top: 0; }
+    .callout > :last-child { margin-bottom: 0; }
+
+    table {
+      width: 100%;
+      margin: 18px 0 28px;
+      border-collapse: collapse;
+      font-size: 0.94rem;
+    }
+
+    th, td {
+      padding: 11px 13px;
+      border: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: #132746;
+      background: var(--panel);
+      font-weight: 700;
+    }
+
+    tr:nth-child(even) td { background: #fbfcfe; }
+
+    code {
+      padding: 0.12em 0.34em;
+      background: #edf1f7;
+      border-radius: 4px;
+      color: #22344f;
+      font: 0.92em Consolas, "Courier New", monospace;
+    }
+
+    pre {
+      overflow-x: auto;
+      margin: 14px 0 24px;
+      padding: 18px 20px;
+      background: var(--code-bg);
+      border-radius: 9px;
+      color: var(--code-ink);
+      font: 0.88rem/1.55 Consolas, "Courier New", monospace;
+      tab-size: 2;
+    }
+
+    pre code {
+      padding: 0;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+    }
+
+    ol.steps {
+      padding-left: 26px;
+      counter-reset: item;
+    }
+
+    ol.steps > li { margin: 10px 0; padding-left: 5px; }
+    ul { padding-left: 23px; }
+    li + li { margin-top: 6px; }
+
+    .action {
+      margin: 24px 0;
+      padding: 20px 22px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+    }
+
+    .action h4 { margin-top: 0; }
+
+    .checklist {
+      padding-left: 0;
+      list-style: none;
+    }
+
+    .checklist li {
+      position: relative;
+      margin: 9px 0;
+      padding-left: 30px;
+    }
+
+    .checklist li::before {
+      position: absolute;
+      left: 0;
+      top: 0.08em;
+      content: "☐";
+      color: var(--brand);
+      font-size: 1.1rem;
+    }
+
+    .small { color: var(--muted); font-size: 0.9rem; }
+
+    footer {
+      margin-top: 58px;
+      padding-top: 20px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    @media (max-width: 760px) {
+      .page {
+        width: 100%;
+        margin: 0;
+        padding: 32px 22px 48px;
+        border: 0;
+        border-radius: 0;
+      }
+      .toc ol { columns: 1; }
+    }
+
+    @media print {
+      body { background: #fff; font-size: 10.5pt; }
+      .page {
+        width: 100%;
+        margin: 0;
+        padding: 0;
+        border: 0;
+        box-shadow: none;
+      }
+      h2 { break-before: page; }
+      h2:first-of-type { break-before: auto; }
+      h3, h4 { break-after: avoid; }
+      table, pre, .action, .callout { break-inside: avoid; }
+      a { color: inherit; text-decoration: none; }
+      .toc { background: #fff; border: 1px solid #aaa; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <p class="eyebrow">Noble Print</p>
+      <h1>Power Automate Click-by-Click Build Specification</h1>
+      <p class="subtitle">One scheduled cloud flow calling the Health, Submit, and Status Azure Function endpoints.</p>
+      <div class="meta">
+          <span><strong>Version:</strong> 2.9</span>
+        <span><strong>Date:</strong> September 4, 2026</span>
+        <span><strong>Schedule:</strong> Every 5 minutes</span>
+        <span><strong>Scope:</strong> Weekly digest excluded</span>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="Table of contents">
+      <h2>Contents</h2>
+      <ol>
+        <li><a href="#decisions">Confirmed design</a></li>
+        <li><a href="#recommendations">Security and retry recommendations</a></li>
+        <li><a href="#configuration">Flow-scoped configuration</a></li>
+        <li><a href="#build">Click-by-click build</a></li>
+        <li><a href="#schemas">Parse JSON schemas</a></li>
+        <li><a href="#tests">Test plan</a></li>
+        <li><a href="#checklist">Go-live checklist</a></li>
+        <li><a href="#references">References</a></li>
+      </ol>
+    </nav>
+
+    <section id="decisions">
+      <h2>1. Confirmed design</h2>
+
+      <div class="flow">Recurrence — every 5 minutes
+  └─ Health
+      ├─ unhealthy → Teams placeholder → Terminate
+      └─ healthy
+          ├─ Submit — one request, batch size 5
+          └─ Status — one request, after the Submit attempt
+              └─ Consolidated Teams placeholder</div>
+
+      <table>
+        <thead>
+          <tr><th>Decision</th><th>Configured behavior</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Flow type</td><td>Solution-aware scheduled cloud flow</td></tr>
+          <tr><td>Recurrence</td><td>Every 5 minutes</td></tr>
+          <tr><td>Order</td><td>Health → Submit → Status</td></tr>
+          <tr><td>Health gate</td><td>Do not call Submit or Status when <code>healthy</code> is false</td></tr>
+          <tr><td>Submit format</td><td>Explicitly send <code>image/pwg-raster</code></td></tr>
+          <tr><td>Status printer</td><td>Explicitly send <code>printerShareId</code></td></tr>
+          <tr><td>Digest</td><td>Outside this specification</td></tr>
+          <tr><td>Notification destination</td><td>Placeholder until the Microsoft Teams team and channel are selected</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout warning">
+        <strong>Intentional differences from the repository reference.</strong>
+        <p>The reference recommends continuing Status during an unhealthy-printer condition and, when the operations are combined, running Status before Submit. This specification follows the requested behavior instead. Pending rows will not be reconciled while Health is false, and files requeued by Status will wait until the next five-minute run before Submit can pick them up.</p>
+      </div>
+
+      <div class="callout">
+        <strong>Submit capacity.</strong>
+        <p>This design calls Submit once per recurrence with <code>batchSize: 5</code>. At twelve runs per hour, the nominal capacity is 60 submissions per hour. Add a bounded Submit loop only if the observed queue requires more capacity.</p>
+      </div>
+    </section>
+
+    <section id="recommendations">
+      <h2>2. Security and retry recommendations</h2>
+
+      <h3>2.1 Function-key authentication</h3>
+      <ol class="steps">
+        <li>Create a dedicated host key named <code>power-automate-invoice-print-flow-key</code>.</li>
+        <li>Do not use the Azure Functions master key.</li>
+        <li>Copy the dedicated key into Azure Key Vault as a secret named <code>flow-noble-print-function-key</code>.</li>
+        <li>Use the Azure Key Vault connector directly in the flow to retrieve <code>flow-noble-print-function-key</code>.</li>
+        <li>Enable Secure outputs on the Key Vault action.</li>
+        <li>Send the key in the <code>x-functions-key</code> HTTP header, not in the URL.</li>
+        <li>Enable Secure outputs on the secret-retrieval action and Secure inputs on every HTTP action.</li>
+      </ol>
+
+      <div class="callout success">
+        <strong>Recommended header</strong>
+        <pre><code>x-functions-key: @{body('Get_Function_Key')?['value']}</code></pre>
+      </div>
+
+      <p>The HTTP action's Authentication field remains <strong>None</strong>. Azure Functions performs the authentication using the <code>x-functions-key</code> header.</p>
+
+      <h3>2.2 Retry and asynchronous settings</h3>
+      <table>
+        <thead>
+          <tr><th>Action</th><th>Retry policy</th><th>Asynchronous pattern</th><th>Rationale</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Health</td><td>Exponential; 2 retries; 10-second base interval</td><td>Off</td><td>Health performs no writes and is safe to retry.</td></tr>
+          <tr><td>Submit</td><td>None</td><td>Off</td><td>Submit creates print jobs and must not be automatically replayed after an ambiguous timeout.</td></tr>
+          <tr><td>Status</td><td>None</td><td>Off</td><td>Status can cancel jobs, requeue files, and write SharePoint state.</td></tr>
+        </tbody>
+      </table>
+
+      <p>The next five-minute recurrence is the controlled retry for Submit and Status. Power Automate outbound synchronous HTTP requests have a 120-second limit; the Function App is designed to return within that boundary.</p>
+
+      <h3>2.3 Trigger concurrency</h3>
+      <p>Enable trigger concurrency and set the degree of parallelism to <code>1</code>. This preserves one global Health → Submit → Status sequence. Monitor for waiting runs if an execution lasts longer than five minutes.</p>
+      <div class="callout warning">
+        <strong>Power Automate limitation.</strong>
+        <p>After concurrency is enabled on a trigger, removing it requires deleting and recreating the trigger.</p>
+      </div>
+    </section>
+
+    <section id="configuration">
+      <h2>3. Flow-scoped configuration</h2>
+
+      <p>No Power Platform environment variables are required by this design. The six non-secret configuration values are initialized as literal values inside this flow. The Function key remains outside the flow in Azure Key Vault and is retrieved at run time with the Azure Key Vault connector.</p>
+
+      <div class="callout success">
+        <strong>Selected configuration boundary.</strong>
+        <p>The six ordinary settings belong only to <code>AI - Print Invoice Flow</code>. Other flows do not receive or discover them. The Function key is not embedded in the flow definition.</p>
+      </div>
+
+      <h3>3.1 Flow-scoped values</h3>
+      <p>Step 4.2 creates these values with Power Automate <strong>Initialize variable</strong> actions.</p>
+      <table>
+        <thead>
+          <tr><th>Flow variable</th><th>Type</th><th>Literal value</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>cfgBaseUrl</code></td><td>String</td><td><code>https://func-noble-print-ebdgbwfmfpd2h3f4.westus-01.azurewebsites.net</code></td></tr>
+          <tr><td><code>cfgSharePointHostname</code></td><td>String</td><td><code>noblehomes.sharepoint.com</code></td></tr>
+          <tr><td><code>cfgSharePointSitePath</code></td><td>String</td><td><code>/sites/PM</code></td></tr>
+          <tr><td><code>cfgLibrary</code></td><td>String</td><td><code>AI_DropBox_V2026</code></td></tr>
+          <tr><td><code>cfgFolder</code></td><td>String</td><td><code>/Backup/Invoice</code></td></tr>
+          <tr><td><code>cfgPrinterShareId</code></td><td>String</td><td><code>5f488e73-ab80-4a6b-a60a-a0f883e17e2e</code></td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout warning">
+        <strong>Flow-scoped values are not deployment parameters.</strong>
+        <p>They are visible to people who can edit or export the flow. That is acceptable for the non-secret URLs, paths, and identifiers above. Moving the flow to another environment requires editing the literal values. Never add the Function key to this table or to an Initialize variable action.</p>
+      </div>
+
+      <h3>3.2 Prepare the Function key</h3>
+      <p>Complete these steps only if a dedicated Function key has not already been created.</p>
+      <ol class="steps">
+        <li>Open the Azure portal and open Function App <code>func-noble-print</code>.</li>
+        <li>In the Function App navigation, expand <strong>Functions</strong>, and select <strong>App keys</strong>.</li>
+        <li>Under <strong>Host keys</strong>, select <strong>New host key</strong>.</li>
+        <li>For the key name, enter <code>power-automate-invoice-print-flow-key</code>.</li>
+        <li>Allow Azure to generate the value, and select <strong>Save</strong> or <strong>OK</strong>.</li>
+        <li>Copy the new key value. Do not use the <code>_master</code> key.</li>
+        <li>Keep the value only long enough to create or update the Key Vault secret in section 3.3. Do not paste it into this document or the flow.</li>
+      </ol>
+
+      <h3>3.3 Store the Function key in Azure Key Vault</h3>
+      <ol class="steps">
+        <li>In the Azure portal, open the Key Vault that the Power Automate connection will use.</li>
+        <li>In the left navigation, select <strong>Objects → Secrets</strong>.</li>
+        <li>If <code>flow-noble-print-function-key</code> already exists, open it and create a new version containing the dedicated Function key.</li>
+        <li>If it does not exist, select <strong>Generate/Import</strong>.</li>
+        <li>For <strong>Upload options</strong>, select <strong>Manual</strong>.</li>
+        <li>For <strong>Name</strong>, enter <code>flow-noble-print-function-key</code>.</li>
+        <li>For <strong>Secret value</strong>, paste the Function key copied in section 3.2.</li>
+        <li>Leave <strong>Enabled</strong> set to <strong>Yes</strong>, and select <strong>Create</strong>.</li>
+        <li>Return to the Key Vault <strong>Overview</strong> page and record the <strong>Vault name</strong>. The connector asks for the name, not the full vault URL.</li>
+      </ol>
+
+      <table>
+        <thead><tr><th>Connector setting</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Key vault name</td><td><code>kv-noble-print</code></td></tr>
+          <tr><td>Secret name</td><td><code>flow-noble-print-function-key</code></td></tr>
+        </tbody>
+      </table>
+
+      <h3>3.4 Grant the connector identity access</h3>
+      <p>The identity authenticated by the Azure Key Vault <strong>connection</strong> must be able to read the secret. Flow ownership alone does not select or authorize that identity.</p>
+      <div class="callout success">
+        <strong>Production identity for this flow.</strong>
+        <p>If <strong>System User</strong> will own the flow and the Azure Key Vault connection will also be created while signed in as System User, assign <strong>Key Vault Secrets User</strong> to System User. Then bind the solution's Azure Key Vault connection reference to System User's connection. If the connection is authenticated as another user or a service principal, assign the role to that identity instead.</p>
+      </div>
+      <ol class="steps">
+        <li>In the Azure portal, open the Key Vault.</li>
+        <li>Select <strong>Settings → Access configuration</strong> and identify whether the vault uses Azure role-based access control or vault access policies.</li>
+        <li>If it uses Azure role-based access control, select <strong>Access control (IAM) → Add → Add role assignment</strong>.</li>
+        <li>Select <strong>Key Vault Secrets User</strong>.</li>
+        <li>On <strong>Members</strong>, select only the identity that will authenticate the production Azure Key Vault connection. For the planned setup, select <strong>System User</strong>.</li>
+        <li>Do not add personal maker accounts unless they require their own Key Vault connections for testing or support.</li>
+        <li>Select <strong>Review + assign</strong>, review the vault scope and member, and then select <strong>Review + assign</strong> again to create the assignment.</li>
+        <li>If it uses vault access policies, add an access policy for the connection account with the Secret permission <strong>Get</strong>. Add <strong>List</strong> only if your organization's connector setup requires browsing secret names.</li>
+        <li>If the Key Vault firewall is enabled, confirm with the Azure administrator that the Azure Key Vault connector can reach the vault.</li>
+        <li>Allow several minutes for a new role assignment to propagate before testing the connector.</li>
+      </ol>
+
+      <div class="callout warning">
+        <strong>Screenshot checkpoint.</strong>
+        <p>The shown role and vault scope are suitable, but the pending assignment lists George Tsang, System User, and Chris Xu. If only System User will own the production Key Vault connection, return to <strong>Members</strong> and remove the two personal accounts before completing the assignment.</p>
+      </div>
+
+      <h3>3.5 Connector and licensing checkpoint</h3>
+      <ul>
+        <li><strong>Azure Key Vault</strong> — used in step 4.3 to retrieve the Function key. This is a Premium Power Automate connector.</li>
+        <li><strong>HTTP</strong> — used for the three Function App calls.</li>
+        <li><strong>Microsoft Teams</strong> — added after the notification team and channel are known.</li>
+      </ul>
+      <p>The System User must have licensing that covers the Premium connectors used by the scheduled flow.</p>
+      <p>Because the flow is inside a solution, adding Azure Key Vault may create a connection reference in that solution. The connection reference is not an environment variable and does not publish the secret as reusable configuration. Access to the secret remains controlled by the connector identity's Key Vault permissions.</p>
+
+      <h3>3.6 Behavioral settings kept inside the flow</h3>
+      <ul>
+        <li><code>batchSize: 5</code></li>
+        <li><code>printFormat: image/pwg-raster</code></li>
+        <li><code>giveUpDays: 3</code></li>
+        <li><code>stallMinutes: 5</code></li>
+      </ul>
+    </section>
+
+    <section id="build">
+      <h2>4. Click-by-click build</h2>
+
+      <h3>4.1 Create the solution and scheduled flow</h3>
+      <ol class="steps">
+        <li>Open Power Automate and select the target environment.</li>
+        <li>Select <strong>Solutions</strong>.</li>
+        <li>Create or open the Noble Print solution.</li>
+        <li>Confirm that the Key Vault secret and access described in sections 3.2 through 3.4 are ready.</li>
+        <li>Select <strong>New → Automation → Cloud flow → Scheduled</strong>. If the flow already exists, open it from the solution and select <strong>Edit</strong>.</li>
+        <li>Name the flow <code>Noble Print - Scheduled Processor</code>.</li>
+        <li>Set Frequency to <strong>Minute</strong> and Interval to <strong>5</strong>.</li>
+        <li>Open the Recurrence trigger's settings.</li>
+        <li>Turn Concurrency control on and set Degree of parallelism to <code>1</code>.</li>
+      </ol>
+
+      <h3>4.2 Initialize configuration and state</h3>
+      <p>Add the following Initialize variable actions immediately below the Recurrence trigger. Enter the listed values as literal text; do not select environment variables from Dynamic content.</p>
+      <table>
+        <thead>
+          <tr><th>Action name</th><th>Variable</th><th>Type</th><th>Value</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>Initialize_Base_URL</code></td><td><code>cfgBaseUrl</code></td><td>String</td><td><code>https://func-noble-print-ebdgbwfmfpd2h3f4.westus-01.azurewebsites.net</code></td></tr>
+          <tr><td><code>Initialize_SP_Hostname</code></td><td><code>cfgSharePointHostname</code></td><td>String</td><td><code>noblehomes.sharepoint.com</code></td></tr>
+          <tr><td><code>Initialize_SP_Site_Path</code></td><td><code>cfgSharePointSitePath</code></td><td>String</td><td><code>/sites/PM</code></td></tr>
+          <tr><td><code>Initialize_Library</code></td><td><code>cfgLibrary</code></td><td>String</td><td><code>AI_DropBox_V2026</code></td></tr>
+          <tr><td><code>Initialize_Folder</code></td><td><code>cfgFolder</code></td><td>String</td><td><code>/Backup/Invoice</code></td></tr>
+          <tr><td><code>Initialize_Printer_Share_ID</code></td><td><code>cfgPrinterShareId</code></td><td>String</td><td><code>5f488e73-ab80-4a6b-a60a-a0f883e17e2e</code></td></tr>
+          <tr><td><code>Initialize_Alert_Text</code></td><td><code>varAlertText</code></td><td>String</td><td>Empty</td></tr>
+          <tr><td><code>Initialize_Technical_Failure</code></td><td><code>varTechnicalFailure</code></td><td>Boolean</td><td><code>false</code></td></tr>
+        </tbody>
+      </table>
+
+      <h3>4.3 Build the Health phase</h3>
+
+      <div class="callout info">
+        <strong>Checkpoint before starting.</strong>
+        <p>Confirm that the eight Initialize variable actions from step 4.2 are already above this phase. In particular, <code>cfgBaseUrl</code> must contain only the Function App base URL, with no trailing slash, and <code>cfgPrinterShareId</code> must contain the target printer share ID.</p>
+        <p>The Function key must not be typed directly into this flow. The steps below retrieve <code>flow-noble-print-function-key</code> directly from Azure Key Vault at run time.</p>
+      </div>
+
+      <div class="action">
+        <h4>A. Add the Health try scope</h4>
+        <ol>
+          <li>Below <code>Initialize_Technical_Failure</code>, select the <strong>+</strong> button.</li>
+          <li>Select <strong>Add an action</strong>.</li>
+          <li>In the search box, enter <code>Scope</code>.</li>
+          <li>Select <strong>Control → Scope</strong>.</li>
+          <li>Open the new scope's <strong>…</strong> menu and select <strong>Rename</strong>.</li>
+          <li>Enter <code>Scope_Health_Try</code>, and press Enter.</li>
+        </ol>
+        <p>The scope is initially empty. Every action in parts B, C, and D must be added using the <strong>+</strong> button <em>inside</em> this scope.</p>
+      </div>
+
+      <div class="action">
+        <h4>B. Add <code>Get_Function_Key</code> inside the scope</h4>
+        <div class="callout warning">
+          <strong>The screenshot is showing the wrong authentication type for this design.</strong>
+          <p><strong>Client Certificate Auth</strong> requires an app registration and a PFX certificate. Do not enter a Client ID, Tenant ID, certificate, or certificate password unless your Azure administrator intentionally selected that design.</p>
+        </div>
+        <ol>
+          <li>Select the <strong>+</strong> button inside <code>Scope_Health_Try</code>.</li>
+          <li>Select <strong>Add an action</strong>.</li>
+          <li>Search for <code>Azure Key Vault</code>.</li>
+          <li>Select the <strong>Azure Key Vault</strong> connector.</li>
+          <li>Select the <strong>Get secret</strong> action. Do not select <strong>Get secret metadata</strong>.</li>
+          <li>When the <strong>Create connection</strong> panel opens, set <strong>Connection name</strong> to <code>Azure Key Vault - Noble Print - System User</code>.</li>
+          <li>Open the <strong>Authentication type</strong> list. Change <strong>Client Certificate Auth</strong> to <strong>Default Microsoft Entra ID application for OAuth</strong>.</li>
+          <li>After changing the authentication type, confirm that the Client ID and PFX certificate inputs disappear.</li>
+          <li>For <strong>Key vault name</strong>, enter <code>kv-noble-print</code>. Enter only the vault name, not <code>https://</code> and not <code>.vault.azure.net</code>.</li>
+          <li>If an optional <strong>Tenant ID</strong> field is displayed, leave it empty unless your Azure administrator directs you to a specific tenant. If the field is required by your tenant's connection policy, enter the Microsoft Entra tenant ID that contains <code>kv-noble-print</code>.</li>
+          <li>Before creating the connection, confirm which Power Automate account is signed in. For the production design, System User should create and own this connection.</li>
+          <li>Select <strong>Create new</strong> or <strong>Sign in</strong>.</li>
+          <li>In the Microsoft sign-in window, sign in as <strong>System User</strong>. If George Tsang is selected automatically, choose <strong>Use another account</strong>.</li>
+          <li>After authentication succeeds, return to the <strong>Get secret</strong> action.</li>
+          <li>Set <strong>Name of the secret</strong> to <code>flow-noble-print-function-key</code>. Use the secret name only; do not enter its version ID or URL.</li>
+          <li>Open the action's <strong>…</strong> menu, select <strong>Rename</strong>, and enter <code>Get_Function_Key</code>.</li>
+        </ol>
+
+        <table>
+          <thead><tr><th>Create connection field</th><th>Value</th></tr></thead>
+          <tbody>
+            <tr><td>Connection name</td><td><code>Azure Key Vault - Noble Print - System User</code></td></tr>
+            <tr><td>Authentication type</td><td><strong>Default Microsoft Entra ID application for OAuth</strong></td></tr>
+            <tr><td>Key vault name</td><td><code>kv-noble-print</code></td></tr>
+            <tr><td>Client ID</td><td>Not shown for the selected authentication type</td></tr>
+            <tr><td>Client certificate</td><td>Not shown; do not upload a PFX file</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout danger">
+          <strong>If the error says “The browser has blocked the connection authentication popup window.”</strong>
+          <p>The connection values are not the cause. The OAuth sign-in window was prevented from opening.</p>
+          <ol>
+            <li>Do not change the Authentication type or Key vault name.</li>
+            <li>Look at the right end of the browser address bar for a blocked-popup icon.</li>
+            <li>Select the icon, choose <strong>Always allow pop-ups and redirects from https://make.powerautomate.com</strong>, and select <strong>Done</strong>.</li>
+            <li>Return to the connection panel and select <strong>Sign in</strong> again.</li>
+            <li>If there is no blocked-popup icon in Microsoft Edge, open <strong>Settings → Privacy, search, and services → Site permissions → All permissions → Pop-ups and redirects</strong>. Under <strong>Allowed to send pop-ups and use redirects</strong>, add <code>https://make.powerautomate.com</code>.</li>
+            <li>In Google Chrome, open <strong>Settings → Privacy and security → Site settings → Pop-ups and redirects</strong>. Under sites allowed to send pop-ups, add <code>[*.]powerautomate.com</code>.</li>
+            <li>If the browser is managed and the setting cannot be changed, ask the Microsoft 365 administrator to allow authentication pop-ups for Power Automate.</li>
+            <li>If a sign-in window opens but authentication still fails, allow third-party cookies for Power Automate and <code>login.microsoftonline.com</code>, temporarily disable any popup-blocking extension for the site, and retry.</li>
+          </ol>
+        </div>
+
+        <div class="callout info">
+          <strong>If you are currently editing as George Tsang.</strong>
+          <p>For clean production ownership, save the draft and have System User create the Azure Key Vault connection, or sign into Power Automate as System User before creating it. A connector can authenticate as a different account during its OAuth prompt, but the Power Platform connection object is owned by the maker who creates it. Afterward, ensure the solution connection reference points to the System User-owned connection.</p>
+        </div>
+
+        <div class="callout info">
+          <strong>Non-interactive System User alternative.</strong>
+          <p>If System User cannot complete an interactive Microsoft sign-in, stop here and use an approved service-principal connection instead. Select <strong>Service principal authentication</strong>, grant <strong>Key Vault Secrets User</strong> to that service principal, and obtain its Tenant ID, Client ID, and credential from the Azure administrator. Do not substitute George Tsang's personal connection for the production connection.</p>
+        </div>
+
+        <div class="callout warning">
+          <strong>Protect the connector output.</strong>
+          <p>The Azure Key Vault connector documentation notes that the Get secret output can appear in run history unless it is secured. Complete the next settings before testing the flow.</p>
+        </div>
+
+        <ol start="18">
+          <li>Open the action's <strong>…</strong> menu and select <strong>Settings</strong>.</li>
+          <li>Under <strong>Security</strong>, turn <strong>Secure outputs</strong> on.</li>
+          <li>Leave <strong>Secure inputs</strong> off for this action; the input contains only the secret name.</li>
+          <li>Select <strong>Done</strong>.</li>
+        </ol>
+        <p>Do not paste the actual Function key into any action. The Get secret result exposes it through the output property <code>value</code>, which the HTTP header uses in the next part.</p>
+      </div>
+
+      <div class="action">
+        <h4>C. Add <code>HTTP_Health</code> below <code>Get_Function_Key</code></h4>
+        <ol>
+          <li>Inside <code>Scope_Health_Try</code>, select the <strong>+</strong> immediately below <code>Get_Function_Key</code>.</li>
+          <li>Select <strong>Add an action</strong>.</li>
+          <li>Search for <code>HTTP</code>.</li>
+          <li>Select the built-in <strong>HTTP</strong> action. Do not select <strong>HTTP with Microsoft Entra ID</strong>.</li>
+          <li>Rename the action to <code>HTTP_Health</code>.</li>
+          <li>For <strong>Method</strong>, select <code>POST</code>.</li>
+          <li>Select the <strong>URI</strong> field, select <strong>fx</strong> or the <strong>Expression</strong> tab, and paste the expression below without adding <code>@{ }</code> around it.</li>
+        </ol>
+        <pre><code>concat(variables('cfgBaseUrl'), '/api/print/health')</code></pre>
+        <p>Choose <strong>Add</strong> or <strong>Update</strong> to insert the expression. The designer should display an expression token in the URI field. At run time it should resolve to:</p>
+        <pre><code>https://func-noble-print-ebdgbwfmfpd2h3f4.westus-01.azurewebsites.net/api/print/health</code></pre>
+
+        <h5>Enter the HTTP headers</h5>
+        <ol start="8">
+          <li>Expand <strong>Headers</strong>. If it is hidden, select <strong>Add new parameter</strong>, and enable <strong>Headers</strong>.</li>
+          <li>Add the three header rows shown in the table. Header names go in the left column; values go in the right column.</li>
+        </ol>
+        <table>
+          <thead><tr><th>Header name</th><th>Header value</th><th>How to enter it</th></tr></thead>
+          <tbody>
+            <tr><td><code>Content-Type</code></td><td><code>application/json</code></td><td>Plain text</td></tr>
+            <tr><td><code>Accept</code></td><td><code>application/json</code></td><td>Plain text</td></tr>
+            <tr><td><code>x-functions-key</code></td><td><code>body('Get_Function_Key')?['value']</code></td><td>Select the value field, open <strong>Expression</strong>, paste the expression without <code>@{ }</code>, and select <strong>Add</strong>. Alternatively, select the <strong>Value</strong> output from <code>Get_Function_Key</code> in Dynamic content.</td></tr>
+          </tbody>
+        </table>
+        <p>Do not paste a JSON object into the header controls. Create three separate name/value rows.</p>
+
+        <h5>Enter the request body</h5>
+        <ol start="10">
+          <li>If <strong>Body</strong> is hidden, select <strong>Add new parameter</strong>, and enable <strong>Body</strong>.</li>
+          <li>Paste the following JSON into <strong>Body</strong>.</li>
+        </ol>
+        <pre><code>{
+  "printerShareId": "@{variables('cfgPrinterShareId')}",
+  "printFormat": "image/pwg-raster"
+}</code></pre>
+        <p>After pasting, confirm that <code>@{variables('cfgPrinterShareId')}</code> is recognized as an expression token. If the designer leaves it as ordinary text, delete only that value, place the cursor between the quotation marks, select <strong>Dynamic content → Variables → cfgPrinterShareId</strong>, and remove any duplicate quotation marks added around the token.</p>
+
+        <h5>Configure connection and action settings</h5>
+        <ol start="12">
+          <li>If the action shows an <strong>Authentication</strong> parameter, select <strong>None</strong>. The <code>x-functions-key</code> header handles Function-level authorization.</li>
+          <li>Open the action's <strong>…</strong> menu and select <strong>Settings</strong>.</li>
+          <li>Under <strong>Retry policy</strong>, select <strong>Exponential interval</strong>.</li>
+          <li>Enter <code>2</code> for <strong>Count</strong>.</li>
+          <li>Enter <code>PT10S</code> for <strong>Interval</strong>.</li>
+          <li>If the designer displays the fields, enter <code>PT5S</code> for <strong>Minimum interval</strong> and <code>PT30S</code> for <strong>Maximum interval</strong>.</li>
+          <li>Turn <strong>Asynchronous pattern</strong> off.</li>
+          <li>Under <strong>Security</strong>, turn <strong>Secure inputs</strong> on. This prevents the Function key header from appearing in run history.</li>
+          <li>Leave <strong>Secure outputs</strong> off so the Health response remains available for troubleshooting and parsing.</li>
+          <li>Select <strong>Done</strong>.</li>
+        </ol>
+      </div>
+
+      <div class="action">
+        <h4>D. Add <code>Parse_Health</code> below <code>HTTP_Health</code></h4>
+        <ol>
+          <li>Inside <code>Scope_Health_Try</code>, select the <strong>+</strong> immediately below <code>HTTP_Health</code>.</li>
+          <li>Select <strong>Add an action</strong>.</li>
+          <li>Search for <code>Parse JSON</code>, and select <strong>Data Operation → Parse JSON</strong>.</li>
+          <li>Rename the action to <code>Parse_Health</code>.</li>
+          <li>Select the <strong>Content</strong> field.</li>
+          <li>From <strong>Dynamic content</strong>, expand <code>HTTP_Health</code> and select <strong>Body</strong>. If Body is not listed, select <strong>Expression</strong>, enter <code>body('HTTP_Health')</code> without <code>@{ }</code>, and select <strong>Add</strong>.</li>
+          <li>Paste the complete schema below into the <strong>Schema</strong> field.</li>
+        </ol>
+        <pre><code>{
+  "type": "object",
+  "properties": {
+    "healthy": { "type": "boolean" },
+    "printerShareId": { "type": "string" },
+    "printFormat": { "type": ["string", "null"] },
+    "printer": { "type": ["object", "null"] },
+    "conversion": { "type": ["object", "null"] },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "remedy": { "type": "string" }
+        },
+        "required": ["code", "message"]
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "remedy": { "type": "string" }
+        },
+        "required": ["code", "message"]
+      }
+    },
+    "message": { "type": "string" }
+  },
+  "required": ["healthy", "printerShareId", "errors", "warnings", "message"]
+}</code></pre>
+        <p>Do not select <strong>Generate from sample</strong>; the schema above already permits nullable optional objects and preserves the required Health fields.</p>
+      </div>
+
+      <div class="callout info">
+        <strong>Check the nesting and order.</strong>
+        <p>Before adding error handling, the designer must show this exact structure:</p>
+        <pre><code>Scope_Health_Try
+├── Get_Function_Key
+├── HTTP_Health
+└── Parse_Health</code></pre>
+        <p>If any of those actions appear below the scope rather than inside its border, move or recreate the action inside the scope before continuing.</p>
+      </div>
+
+      <div class="action">
+        <h4>E. Add <code>Scope_Health_Catch</code> outside the try scope</h4>
+        <div class="callout danger">
+          <strong>Screenshot correction: the catch scope is currently nested inside the try scope.</strong>
+          <p>The right border of <code>Scope_Health_Try</code> surrounds <code>Scope_Health_Catch</code> in the screenshot. That structure cannot serve as a catch for the outer scope. Create or move <code>Scope_Health_Catch</code> below the bottom border of <code>Scope_Health_Try</code>, at the same indentation level.</p>
+        </div>
+        <ol>
+          <li>Select the <strong>+</strong> below the outer border of <code>Scope_Health_Try</code>. Do not use a plus sign inside the try scope.</li>
+          <li>Select <strong>Add an action → Control → Scope</strong>.</li>
+          <li>Rename the new scope to <code>Scope_Health_Catch</code>.</li>
+          <li>Open <code>Scope_Health_Catch</code>'s <strong>…</strong> menu and select <strong>Configure run after</strong>. In some designer versions this option appears inside <strong>Settings</strong>.</li>
+          <li>For <code>Scope_Health_Try</code>, select only <strong>has failed</strong> and <strong>has timed out</strong>.</li>
+          <li>Clear <strong>is successful</strong> and <strong>is skipped</strong>.</li>
+          <li>Select <strong>Done</strong>.</li>
+        </ol>
+        <p>The catch scope should now have a red/orange run-after connector from the try scope. During a normal successful Health call, the catch scope is expected to be skipped.</p>
+
+        <h5>Add the temporary Teams notification placeholder</h5>
+        <ol start="8">
+          <li>Select the <strong>+</strong> inside <code>Scope_Health_Catch</code>.</li>
+          <li>Select <strong>Add an action → Data Operation → Compose</strong>.</li>
+          <li>Rename it to <code>TODO_Notify_Teams_Health_Failure</code>.</li>
+          <li>Select <strong>Inputs → Expression</strong>, paste the expression below without <code>@{ }</code>, and select <strong>Add</strong>.</li>
+        </ol>
+        <pre><code>concat(
+  'Noble Print Health request failed or timed out.',
+  decodeUriComponent('%0A'),
+  'UTC: ', utcNow(),
+  decodeUriComponent('%0A'),
+  'Run ID: ', workflow()?['run']?['name']
+)</code></pre>
+        <p>This Compose action is only a placeholder. It records the message in run history but does not post to Teams until a Team and Channel are supplied.</p>
+
+        <h5>Add Terminate after the placeholder</h5>
+        <ol start="12">
+          <li>Select the <strong>+</strong> below the Compose action, still inside <code>Scope_Health_Catch</code>.</li>
+          <li>Select <strong>Add an action → Control → Terminate</strong>.</li>
+          <li>Rename it to <code>Terminate_Health_Request_Failed</code>.</li>
+          <li>Set <strong>Status</strong> to <strong>Failed</strong>.</li>
+          <li>Set <strong>Code</strong> to <code>HEALTH_REQUEST_FAILED</code>.</li>
+          <li>Set <strong>Message</strong> to <code>The Function App Health request failed or timed out.</code></li>
+        </ol>
+        <p><code>HEALTH_REQUEST_FAILED</code> is plain text entered directly in the Terminate action. It is a custom workflow error identifier for this flow run—not an HTTP status code—so it does not need to be numeric. It is not a variable, expression, Azure setting, or predefined Power Automate value and requires no separate declaration.</p>
+      </div>
+
+      <div class="action">
+        <h4>F. Save and validate step 4.3</h4>
+        <ol>
+          <li>Select <strong>Save</strong>.</li>
+          <li>Select <strong>Flow checker</strong>.</li>
+          <li>Resolve any error that names <code>Get_Function_Key</code>, <code>HTTP_Health</code>, or <code>Parse_Health</code> before proceeding.</li>
+          <li>If the flow can be tested at this stage, select <strong>Test → Manually → Test</strong>, and then select <strong>Run flow</strong>.</li>
+          <li>Open the run and expand <code>Scope_Health_Try</code>.</li>
+        </ol>
+        <table>
+          <thead><tr><th>Action</th><th>Expected result</th></tr></thead>
+          <tbody>
+            <tr><td><code>Get_Function_Key</code></td><td>Succeeded. Its output is hidden because Secure outputs is on.</td></tr>
+            <tr><td><code>HTTP_Health</code></td><td>Succeeded with HTTP status <code>200</code>. Its inputs are hidden because Secure inputs is on.</td></tr>
+            <tr><td><code>Parse_Health</code></td><td>Succeeded, with a parsed Boolean value for <code>healthy</code>.</td></tr>
+            <tr><td><code>Scope_Health_Catch</code></td><td>Skipped when the try scope succeeds.</td></tr>
+          </tbody>
+        </table>
+        <p>A successful HTTP response may contain either <code>"healthy": true</code> or <code>"healthy": false</code>. Step 4.4 handles that business result. The catch scope is for request failures or timeouts, not for a valid <code>healthy: false</code> response.</p>
+        <p>If the test fails: <code>400</code> usually points to the request body or printer identifier; <code>401</code> or <code>403</code> points to the Function key retrieval/header; <code>500</code> points to the Function App or a downstream dependency. Open the failed action's output before changing the flow.</p>
+      </div>
+
+      <h3>4.4 Apply the Health gate</h3>
+      <div class="callout danger">
+        <strong>If the designer reports an invalid reference to <code>Parse_Health</code>.</strong>
+        <p>The displayed action may be named <strong>Parse Health</strong> while its internal workflow name is different, commonly after the action was deleted, recreated, copied, or renamed. Do not guess the internal name. Remove the broken formula and insert fields from the <strong>Parse Health</strong> Dynamic content group so Power Automate creates valid references.</p>
+      </div>
+
+      <div class="action">
+        <h4>A. Configure <code>Condition_Printer_Healthy</code></h4>
+        <ol>
+          <li>Add the Condition below <code>Scope_Health_Catch</code>, outside both Health scopes. Use the <strong>+</strong> below the Catch scope's bottom border, not the <strong>+</strong> inside the border beneath its last action.</li>
+          <li>Open the Condition's <strong>… → Configure run after</strong>.</li>
+          <li>For <code>Scope_Health_Catch</code>, clear the other choices, select only <strong>is skipped</strong>, and then select <strong>Done</strong>. A successful Health Try causes the Catch scope to be skipped; a technical failure runs the Catch and then terminates the flow.</li>
+          <li>Delete every incomplete extra condition row. In the screenshot, use the second row's <strong>…</strong> menu to delete the row containing two <strong>Choose a value</strong> fields.</li>
+          <li>In the first row's left value, remove the existing purple <code>equals(...)</code> expression token. Do not put a complete <code>equals()</code> expression into one side of a three-field condition row.</li>
+          <li>In the first Condition value, open <strong>Dynamic content</strong>.</li>
+          <li>Under the <strong>Parse Health</strong> action, select <strong>healthy</strong>. Selecting the token lets Power Automate use the action's actual internal name.</li>
+          <li>Set the operator to <strong>is equal to</strong>.</li>
+          <li>For the right value, select <strong>Expression</strong>, enter <code>true</code>, and insert it. It must be the Boolean value <code>true</code>, not the quoted text <code>"true"</code>.</li>
+          <li>Rename the action to <code>Condition_Printer_Healthy</code>.</li>
+        </ol>
+        <p>The finished row must read <strong>healthy | is equal to | true</strong>. It is logically equivalent to the expression below, using this flow's actual internal Parse Health action name:</p>
+        <pre><code>equals(body('Parse_Health_')?['healthy'], true)</code></pre>
+        <div class="callout warning">
+          <strong>If the save banner names <code>Parse_Health</code> without the trailing underscore, the condition still contains the obsolete reference.</strong>
+          <p>Delete the left-hand token and reinsert <strong>healthy</strong> from the <strong>Parse Health</strong> Dynamic content section. Do not repair the old token by typing over its displayed label.</p>
+        </div>
+        <div class="callout">
+          <strong>Clean recovery when the obsolete token persists</strong>
+          <ol>
+            <li>Record the few actions currently inside the True and False branches, then delete the entire <code>Condition_Printer_Healthy</code> action. At this stage, the screenshot shows only <code>Terminate_Printer_Unhealthy</code> in the False branch, so recreate that action afterward.</li>
+            <li>Use the <strong>+</strong> below the bottom border of <code>Scope_Health_Catch</code> to add a new <strong>Control → Condition</strong>, and rename it <code>Condition_Printer_Healthy</code>. Confirm the new Condition has its own card below the Catch scope and is not enclosed by the Catch border.</li>
+            <li>Configure its run-after settings for <code>Scope_Health_Catch</code>: clear the other choices and select only <strong>is skipped</strong>.</li>
+            <li>Click the left value, open <strong>Dynamic content</strong>, and select the top-level <strong>healthy</strong> value under <strong>Parse Health</strong>. Do not select or type an <code>equals(...)</code> expression.</li>
+            <li>Set the middle operator to <strong>is equal to</strong>. For the right value, use <strong>Expression</strong>, enter <code>true</code>, and insert it.</li>
+            <li>Confirm there is only one row: <strong>healthy | is equal to | true</strong>.</li>
+            <li>In the False branch, recreate <strong>Control → Terminate</strong>, rename it <code>Terminate_Printer_Unhealthy</code>, and set its status to <strong>Cancelled</strong>.</li>
+            <li>Save the draft before selecting Test.</li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="action">
+        <h4>B. Repair or create the unhealthy-message Compose action</h4>
+        <p>In the <strong>False</strong> branch, use the existing purple Compose action named <code>Notify_Teams_Printer_Unhealthy</code>, or add <strong>Data Operation → Compose</strong> and give it that name.</p>
+        <ol>
+          <li>Open <code>Notify_Teams_Printer_Unhealthy</code>.</li>
+          <li>In the large Expression editor shown in the screenshot, press <strong>Ctrl+A</strong>, and delete everything. Remove both <code>items('For_each')</code> and the separate text lines.</li>
+          <li>Paste the complete expression below as one expression. Do not add <code>@{ }</code> around it.</li>
+        </ol>
+        <pre><code>concat(
+  'Noble Print processing was skipped because Health reported unhealthy.',
+  decodeUriComponent('%0A'),
+  'Message: ', body('Parse_Health_')?['message'],
+  decodeUriComponent('%0A'),
+  'Errors: ', string(body('Parse_Health_')?['errors']),
+  decodeUriComponent('%0A'),
+  'Warnings: ', string(body('Parse_Health_')?['warnings'])
+)</code></pre>
+        <ol start="4">
+          <li>Keep the trailing underscore in <code>Parse_Health_</code>. The Dynamic content inserted in the screenshot reveals that this is the current action's actual internal name.</li>
+          <li>Select <strong>Add</strong> at the bottom of the expression panel.</li>
+          <li>Confirm that the Compose action's <strong>Inputs</strong> field now contains one purple <strong>fx</strong> expression token and no “Inputs is required” error.</li>
+          <li>Select <strong>Save draft</strong>.</li>
+        </ol>
+        <div class="callout warning">
+          <strong>Do not select the nested <code>message</code> Dynamic content item.</strong>
+          <p>The Health schema contains a top-level <code>message</code> and also a <code>message</code> inside each Errors and Warnings array item. The item selected in the screenshot generated <code>items('For_each')?['message']</code>, which is invalid here because this Compose action is not inside that array loop.</p>
+        </div>
+      </div>
+
+      <div class="action">
+        <h4>C. Post the unhealthy message to Teams</h4>
+        <ol>
+          <li>Keep the existing <strong>Post message to Admin</strong> action below the Compose action in the False branch.</li>
+          <li>Keep <strong>Post as</strong> set to <strong>Flow bot</strong> and <strong>Post in</strong> set to <strong>Channel</strong>.</li>
+          <li>Team: <code>IT Development (Everyone)</code>.</li>
+          <li>Channel: <code>AI Development Channel</code>.</li>
+          <li>For <strong>Message</strong>, select the <strong>Outputs</strong> token from <code>Notify_Teams_Printer_Unhealthy</code>. The screenshot shows this part configured correctly.</li>
+        </ol>
+      </div>
+
+      <div class="action">
+        <h4>D. Terminate the unhealthy branch</h4>
+        <ol>
+          <li>Below the Teams action in the False branch, add <strong>Control → Terminate</strong>.</li>
+          <li>Rename it to <code>Terminate_Printer_Unhealthy</code>.</li>
+          <li>Set <strong>Status</strong> to <strong>Cancelled</strong>.</li>
+        </ol>
+      </div>
+
+      <div class="action">
+        <h4>E. Save and recheck</h4>
+        <ol>
+          <li>Select <strong>Save draft</strong>.</li>
+          <li>Confirm that the red invalid-reference banner disappears.</li>
+          <li>Open <strong>Flow checker</strong>. If it now reports the same issue on <code>Condition_Printer_Healthy</code>, repeat part A and reinsert <strong>healthy</strong> from Dynamic content.</li>
+          <li>Leave the <strong>True</strong> branch empty until building the Submit and Status phases below.</li>
+        </ol>
+      </div>
+
+      <h3>4.5 Build the Submit phase</h3>
+      <div class="callout">
+        <strong>Expression-entry rule for this section</strong>
+        <ul>
+          <li>When these instructions say to select the blue <strong>fx</strong> button or the <strong>Expression</strong> tab, paste only the function, such as <code>concat(...)</code>. Do not type a leading <code>@</code> and do not wrap it in <code>@{ }</code>.</li>
+          <li>The Submit Body is built as one typed object with documented workflow functions: <code>union(...)</code>, <code>addProperty(...)</code>, and <code>json(...)</code>. This avoids raw-JSON quoting problems and preserves numbers and Booleans.</li>
+          <li>When using <strong>Filter array → Edit in advanced mode</strong>, keep the leading <code>@</code> required by that advanced-mode field.</li>
+        </ul>
+      </div>
+      <div class="action">
+        <h4>A. Add <code>Scope_Submit_Try</code></h4>
+        <p>Inside the Condition's <strong>True</strong> branch, add a Scope named <code>Scope_Submit_Try</code>. Inside that scope, add an HTTP action named <code>HTTP_Submit</code>.</p>
+        <p><strong>Method</strong></p>
+        <pre><code>POST</code></pre>
+        <p><strong>URI — select the URI field, select fx, paste this, and select Add:</strong></p>
+        <pre><code>concat(variables('cfgBaseUrl'), '/api/print/submit')</code></pre>
+        <p><strong>Headers — recommended key/value entry:</strong></p>
+        <ul>
+          <li><code>Content-Type</code> = <code>application/json</code></li>
+          <li><code>Accept</code> = <code>application/json</code></li>
+          <li><code>x-functions-key</code> = open <strong>Dynamic content</strong> and select <strong>Value</strong> under <code>Get Function Key</code>. Selecting the token avoids manually typing the action's internal name.</li>
+        </ul>
+        <p>If the designer presents Headers as a single JSON editor instead of key/value rows, paste this JSON; the inline expression requires <code>@{ }</code> in that context:</p>
+        <pre><code>{
+  "Content-Type": "application/json",
+  "Accept": "application/json",
+  "x-functions-key": "@{body('Get_Function_Key')?['value']}"
+}</code></pre>
+        <p><strong>Body — Power Automate-compatible typed-object expression:</strong></p>
+        <ol>
+          <li>Select the <strong>Body</strong> field and select the blue <strong>fx</strong> button.</li>
+          <li>Delete everything currently in the expression editor.</li>
+          <li>Paste the following single expression without a leading <code>@</code>:</li>
+        </ol>
+        <pre><code>union(
+  json('{"batchSize":5,"printFormat":"image/pwg-raster","dryRun":false}'),
+  addProperty(json('{}'), 'sharepointHostname', variables('cfgSharePointHostname')),
+  addProperty(json('{}'), 'sharepointSitePath', variables('cfgSharePointSitePath')),
+  addProperty(json('{}'), 'library', variables('cfgLibrary')),
+  addProperty(json('{}'), 'folder', variables('cfgFolder')),
+  addProperty(json('{}'), 'printerShareId', variables('cfgPrinterShareId'))
+)</code></pre>
+        <ol start="4">
+          <li>Select <strong>Add</strong>.</li>
+          <li>Confirm the HTTP action's Body field contains one purple <strong>fx</strong> token.</li>
+          <li>Optional debugging aid: if HTTP's <strong>Secure inputs</strong> setting hides the request in run history, put this same <code>union(...)</code> expression in a Compose action named <code>Compose_Submit_Request_Body</code> immediately before HTTP Submit, then select that Compose action's <strong>Outputs</strong> token for the HTTP Body. The request contains no secret; the Function key remains only in the secured HTTP action.</li>
+        </ol>
+        <div class="callout warning">
+          <strong>Do not paste a JSON object into the fx editor.</strong>
+          <p>The fx editor accepts one workflow expression, not raw JSON or an outer <code>@{ ... }</code> wrapper. The <code>union(...)</code> expression above is the complete Body value.</p>
+        </div>
+        <div class="callout">
+          <strong>Why this expression is used.</strong>
+          <p><code>createObject(...)</code> is not recognized by this Power Automate runtime and caused the shown <code>InvalidTemplate</code> failure. <code>union(...)</code>, <code>addProperty(...)</code>, and <code>json(...)</code> are documented workflow functions. Each variable is inserted as a value rather than concatenated into JSON text, so quote characters in configuration values cannot break the request object.</p>
+        </div>
+        <p><strong>Settings</strong></p>
+        <ul>
+          <li>Authentication: None</li>
+          <li>Retry policy: None</li>
+          <li>Asynchronous pattern: Off</li>
+          <li>Secure inputs: On</li>
+        </ul>
+      </div>
+
+      <div class="action">
+        <h4>B. Add <code>Parse_Submit</code></h4>
+        <ol>
+          <li>Add <strong>Data Operation → Parse JSON</strong> below <code>HTTP_Submit</code> and rename it <code>Parse_Submit</code>.</li>
+          <li>For <strong>Content</strong>, select the <strong>Body</strong> token under <code>HTTP_Submit</code> in Dynamic content. The screenshot shows this configured correctly.</li>
+          <li>Click directly inside the empty <strong>Schema</strong> box. Do not select fx.</li>
+          <li>Copy the entire Submit response schema from section 5.2, starting with its first <code>{</code> and ending with its final <code>}</code>, and paste it into the Schema box.</li>
+          <li>Confirm the red <strong>Schema is required</strong> message and the card's <strong>Invalid parameters</strong> message disappear.</li>
+        </ol>
+        <div class="callout warning">
+          <strong>This is the strict production-response schema.</strong>
+          <p>A request with <code>dryRun: true</code> returns a different diagnostic shape and intentionally omits several required production counters. During the safe dry-run test, insert a temporary successful Terminate action immediately after <code>HTTP_Submit</code> so the run stops before <code>Parse_Submit</code>. Remove that action and restore <code>dryRun: false</code> before the live test.</p>
+        </div>
+      </div>
+
+      <div class="action">
+        <h4>C. Add <code>Condition_Submit_Issue</code></h4>
+        <ol>
+          <li>Finish and save <code>Parse_Submit</code> first. Its schema creates the strongly typed Dynamic content used below.</li>
+          <li>Inside <code>Scope_Submit_Try</code>, select the <strong>+</strong> immediately below <code>Parse_Submit</code>.</li>
+          <li>Select <strong>Add an action → Control → Condition</strong>.</li>
+          <li>Rename the new action <code>Condition_Submit_Issue</code>.</li>
+          <li>At the top-left of the condition group, open the dropdown currently labeled <strong>And</strong> and change it to <strong>Or</strong>.</li>
+          <li>Configure row 1:
+            <ul>
+              <li>Left: open Dynamic content and select the top-level <strong>failed</strong> value under <code>Parse_Submit</code>.</li>
+              <li>Operator: <strong>is greater than</strong>.</li>
+              <li>Right: select fx, enter the number <code>0</code>, and select <strong>Add</strong>.</li>
+            </ul>
+          </li>
+          <li>Select <strong>+ Add row</strong> and configure row 2:
+            <ul>
+              <li>Left: select the top-level <strong>printerAvailable</strong> value under <code>Parse_Submit</code>.</li>
+              <li>Operator: <strong>is equal to</strong>.</li>
+              <li>Right: select fx, enter the Boolean <code>false</code>, and select <strong>Add</strong>.</li>
+            </ul>
+          </li>
+          <li>Select <strong>+ Add row</strong> and configure row 3:
+            <ul>
+              <li>Left: select the top-level <strong>budgetExhausted</strong> value under <code>Parse_Submit</code>.</li>
+              <li>Operator: <strong>is equal to</strong>.</li>
+              <li>Right: select fx, enter the Boolean <code>true</code>, and select <strong>Add</strong>.</li>
+            </ul>
+          </li>
+          <li>Delete any additional blank row. The Condition must contain exactly three rows under one <strong>Or</strong> group.</li>
+        </ol>
+        <p>The completed condition must read:</p>
+        <pre><code>failed &gt; 0
+OR printerAvailable = false
+OR budgetExhausted = true</code></pre>
+        <ol start="10">
+          <li>In the Condition's <strong>True</strong> branch, select <strong>+ → Add an action → Variables → Append to string variable</strong>.</li>
+          <li>Rename it <code>Append_Submit_Issue_To_Alert</code> and select <code>varAlertText</code> for <strong>Name</strong>.</li>
+          <li>For <strong>Value</strong>, type the labels below and insert each value from the top-level <code>Parse_Submit</code> Dynamic content section after its corresponding label. Do not select a value nested under <code>items</code>.</li>
+        </ol>
+        <pre><code>Submit issue detected.
+Submitted: [submitted token]
+Failed: [failed token]
+Remaining ready: [remainingReady token]
+Printer available: [printerAvailable token]
+Budget exhausted: [budgetExhausted token]
+</code></pre>
+        <ol start="13">
+          <li>Leave the Condition's <strong>False</strong> branch empty.</li>
+          <li>Select <strong>Save draft</strong> and confirm no invalid-reference or incomplete-condition error appears.</li>
+        </ol>
+        <div class="callout warning">
+          <strong>Use Parse Submit's top-level Dynamic content.</strong>
+          <p>Building three visual rows avoids manually typing the action's internal name and prevents the stale-reference problem encountered earlier with Parse Health.</p>
+        </div>
+      </div>
+
+      <div class="action">
+        <h4>D. Capture per-item Submit warnings</h4>
+        <p>Use the <strong>+</strong> below the entire <code>Condition_Submit_Issue</code> card—outside both of its branches but still inside <code>Scope_Submit_Try</code>—to add Filter array named <code>Filter_Submit_Warnings</code>.</p>
+        <ul>
+          <li>From: open Dynamic content and select the top-level <strong>items</strong> token under <code>Parse_Submit</code>.</li>
+          <li>Select <strong>Edit in advanced mode</strong> for the filter condition and enter <code>@not(empty(item()?['warning']))</code>. This advanced-mode field is the exception that keeps a leading <code>@</code>.</li>
+        </ul>
+        <p>Add a Condition named <code>Condition_Submit_Warnings_Found</code>. In its left field, use fx to enter <code>length(body('Filter_Submit_Warnings'))</code> without <code>@</code>; set the operator to <strong>is greater than</strong>; and use fx to enter the numeric value <code>0</code> in the right field.</p>
+        <p>In the True/Yes branch, append this expression to <code>varAlertText</code> by using fx without <code>@{ }</code>:</p>
+        <pre><code>concat(
+  'Submit warnings: ',
+  string(body('Filter_Submit_Warnings')),
+  decodeUriComponent('%0A')
+)</code></pre>
+      </div>
+
+      <div class="action">
+        <h4>E. Add <code>Scope_Submit_Catch</code></h4>
+        <p>Place it after and outside <code>Scope_Submit_Try</code>, while remaining inside <code>Condition_Printer_Healthy</code>'s True branch. Configure Run after for only <strong>has failed</strong> and <strong>has timed out</strong>.</p>
+        <ol>
+          <li>Set <code>varTechnicalFailure</code> to the Boolean <code>true</code>. If using fx, enter <code>true</code> without <code>@</code>.</li>
+          <li>Append the following to <code>varAlertText</code> by using fx. Do not include <code>@{ }</code>:</li>
+        </ol>
+        <pre><code>concat(
+  'Submit HTTP or response-schema failure; inspect run ',
+  workflow()?['run']?['name'],
+  '.',
+  decodeUriComponent('%0A')
+)</code></pre>
+      </div>
+
+      <h3>4.6 Build the Status phase</h3>
+      <p>Add <code>Scope_Status_Try</code> after <code>Scope_Submit_Catch</code>. Configure it to run after the catch is <strong>successful</strong> or <strong>skipped</strong>. This allows Status to run after either a successful Submit or a handled Submit failure.</p>
+
+      <div class="action">
+        <h4>A. Add <code>HTTP_Status</code></h4>
+        <p><strong>Method</strong></p>
+        <pre><code>POST</code></pre>
+        <p><strong>URI</strong></p>
+        <pre><code>@{concat(variables('cfgBaseUrl'), '/api/print/status')}</code></pre>
+        <p><strong>Headers</strong></p>
+        <pre><code>{
+  "Content-Type": "application/json",
+  "Accept": "application/json",
+  "x-functions-key": "@{body('Get_Function_Key')?['value']}"
+}</code></pre>
+        <p><strong>Body</strong></p>
+        <pre><code>{
+  "sharepointHostname": "@{variables('cfgSharePointHostname')}",
+  "sharepointSitePath": "@{variables('cfgSharePointSitePath')}",
+  "library": "@{variables('cfgLibrary')}",
+  "folder": "@{variables('cfgFolder')}",
+  "printerShareId": "@{variables('cfgPrinterShareId')}",
+  "giveUpDays": 3,
+  "stallMinutes": 5
+}</code></pre>
+        <p><strong>Settings</strong></p>
+        <ul>
+          <li>Authentication: None</li>
+          <li>Retry policy: None</li>
+          <li>Asynchronous pattern: Off</li>
+          <li>Secure inputs: On</li>
+        </ul>
+      </div>
+
+      <div class="action">
+        <h4>B. Add <code>Parse_Status</code></h4>
+        <p>Use <code>body('HTTP_Status')</code> as Content and the Status schema from section 5.3.</p>
+      </div>
+
+      <div class="action">
+        <h4>C. Add <code>Condition_Status_Issue</code></h4>
+        <pre><code>@or(
+  greater(int(body('Parse_Status')?['failed']), 0),
+  greater(int(body('Parse_Status')?['gaveUp']), 0),
+  greater(int(body('Parse_Status')?['notFound']), 0),
+  greater(int(body('Parse_Status')?['malformed']), 0),
+  greater(int(body('Parse_Status')?['printerOverridden']), 0),
+  greater(int(body('Parse_Status')?['uncheckedCount']), 0),
+  equals(body('Parse_Status')?['budgetExhausted'], true),
+  not(
+    equals(
+      add(
+        int(body('Parse_Status')?['checked']),
+        int(body('Parse_Status')?['uncheckedCount'])
+      ),
+      int(body('Parse_Status')?['pendingFound'])
+    )
+  )
+)</code></pre>
+        <p>In the Yes branch, append the Status counters to <code>varAlertText</code>. Include <code>printerOverridden</code>, <code>notFound</code>, <code>malformed</code>, <code>gaveUp</code>, <code>uncheckedCount</code>, and <code>budgetExhausted</code>.</p>
+      </div>
+
+      <div class="callout danger">
+        <strong>Printer override guard.</strong>
+        <p>Because the Status request explicitly supplies <code>printerShareId</code>, <code>printerOverridden</code> must remain <code>0</code>. A higher value means at least one row named a different printer and carries duplicate-print exposure.</p>
+      </div>
+
+      <div class="action">
+        <h4>D. Capture per-item Status warnings</h4>
+        <p>Add Filter array named <code>Filter_Status_Warnings</code>.</p>
+        <ul>
+          <li>From: <code>body('Parse_Status')?['items']</code></li>
+          <li>Advanced condition: <code>@not(empty(item()?['warning']))</code></li>
+        </ul>
+        <p>If the filtered array is nonempty, append it to <code>varAlertText</code>.</p>
+      </div>
+
+      <div class="action">
+        <h4>E. Add <code>Scope_Status_Catch</code></h4>
+        <p>Place it after <code>Scope_Status_Try</code>. Configure Run after for <strong>has failed</strong> and <strong>has timed out</strong>.</p>
+        <ol>
+          <li>Set <code>varTechnicalFailure</code> to <code>true</code>.</li>
+          <li>Append a Status failure message and the current run ID to <code>varAlertText</code>.</li>
+        </ol>
+      </div>
+
+      <h3>4.7 Add the consolidated notification</h3>
+      <p>Add <code>Condition_Send_Alert</code> after <code>Scope_Status_Catch</code>. Configure it to run after the catch is <strong>successful</strong> or <strong>skipped</strong>.</p>
+      <pre><code>@not(empty(variables('varAlertText')))</code></pre>
+
+      <p>In the Yes branch, add a Compose action named <code>TODO_Notify_Teams_Run_Summary</code>:</p>
+      <pre><code>@{concat(
+  'Noble Print scheduled-flow alert',
+  decodeUriComponent('%0A'),
+  'UTC: ', utcNow(),
+  decodeUriComponent('%0A'),
+  'Run ID: ', workflow()?['run']?['name'],
+  decodeUriComponent('%0A'),
+  variables('varAlertText')
+)}</code></pre>
+
+      <p>When the Teams destination is known, replace the Compose action with <strong>Microsoft Teams → Post message in a chat or channel</strong>:</p>
+      <ul>
+        <li>Team: <code>&lt;&lt;SELECT TEAM&gt;&gt;</code></li>
+        <li>Channel: <code>&lt;&lt;SELECT CHANNEL&gt;&gt;</code></li>
+        <li>Message: the expression above</li>
+      </ul>
+
+      <p>After the notification condition, add a final condition:</p>
+      <pre><code>@equals(variables('varTechnicalFailure'), true)</code></pre>
+      <p>In its Yes branch, terminate with Status <strong>Failed</strong>. Otherwise, allow the flow to finish successfully.</p>
+    </section>
+
+    <section id="schemas">
+      <h2>5. Parse JSON schemas</h2>
+
+      <h3>5.1 Health response</h3>
+      <pre><code>{
+  "type": "object",
+  "properties": {
+    "healthy": { "type": "boolean" },
+    "printerShareId": { "type": "string" },
+    "printFormat": { "type": ["string", "null"] },
+    "printer": { "type": ["object", "null"] },
+    "conversion": { "type": ["object", "null"] },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "remedy": { "type": "string" }
+        },
+        "required": ["code", "message"]
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "remedy": { "type": "string" }
+        },
+        "required": ["code", "message"]
+      }
+    },
+    "message": { "type": "string" }
+  },
+  "required": ["healthy", "printerShareId", "errors", "warnings", "message"]
+}</code></pre>
+
+      <h3>5.2 Submit response</h3>
+      <pre><code>{
+  "type": "object",
+  "properties": {
+    "remainingReady": { "type": "integer" },
+    "submitted": { "type": "integer" },
+    "failed": { "type": "integer" },
+    "skipped": { "type": "integer" },
+    "notYetDue": { "type": "integer" },
+    "budgetExhausted": { "type": "boolean" },
+    "printerAvailable": { "type": "boolean" },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "itemId": { "type": "string" },
+          "fileName": { "type": "string" },
+          "result": { "type": "string" },
+          "jobId": { "type": ["string", "null"] },
+          "message": { "type": "string" },
+          "warning": { "type": "string" }
+        },
+        "required": ["itemId", "fileName", "result"]
+      }
+    }
+  },
+  "required": [
+    "remainingReady", "submitted", "failed", "skipped", "notYetDue",
+    "budgetExhausted", "printerAvailable", "items"
+  ]
+}</code></pre>
+
+      <h3>5.3 Status response</h3>
+      <pre><code>{
+  "type": "object",
+  "properties": {
+    "checked": { "type": "integer" },
+    "completed": { "type": "integer" },
+    "failed": { "type": "integer" },
+    "requeued": { "type": "integer" },
+    "gaveUp": { "type": "integer" },
+    "stillRunning": { "type": "integer" },
+    "notFound": { "type": "integer" },
+    "malformed": { "type": "integer" },
+    "budgetExhausted": { "type": "boolean" },
+    "printerOverridden": { "type": "integer" },
+    "pendingFound": { "type": "integer" },
+    "uncheckedCount": { "type": "integer" },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "itemId": { "type": "string" },
+          "fileName": { "type": "string" },
+          "result": { "type": "string" },
+          "jobId": { "type": ["string", "null"] },
+          "message": { "type": "string" },
+          "warning": { "type": "string" },
+          "retry": { "type": "integer" },
+          "printTime": { "type": ["string", "null"] }
+        },
+        "required": ["itemId", "fileName", "result"]
+      }
+    }
+  },
+  "required": [
+    "checked", "completed", "failed", "requeued", "gaveUp", "stillRunning",
+    "notFound", "malformed", "budgetExhausted", "printerOverridden",
+    "pendingFound", "uncheckedCount", "items"
+  ]
+}</code></pre>
+    </section>
+
+    <section id="tests">
+      <h2>6. Test plan</h2>
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Test</th><th>Expected result</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>T01</td><td>Health is healthy and the queue is empty.</td><td>Health, Submit, and Status each run once and the flow succeeds.</td></tr>
+          <tr><td>T02</td><td>Health returns HTTP 200 with <code>healthy: false</code>.</td><td>The unhealthy notification placeholder runs; Submit and Status are skipped; the flow is cancelled.</td></tr>
+          <tr><td>T03</td><td>The Function key is invalid.</td><td>Health does not retry a 401/403; the Health catch runs and the flow fails.</td></tr>
+          <tr><td>T04</td><td>One PDF has <code>PRINT_READY</code>.</td><td>Submit reports one submission and SharePoint changes to <code>PRINT_PENDING</code>.</td></tr>
+          <tr><td>T05</td><td>The submitted job has completed.</td><td>Status changes the row to <code>PRINT_COMPLETED</code>.</td></tr>
+          <tr><td>T06</td><td>More than five files are ready.</td><td>Submit handles at most five; remaining files wait for the next five-minute run.</td></tr>
+          <tr><td>T07</td><td>Submit returns <code>failed &gt; 0</code>.</td><td>Status still runs and the consolidated notification includes the Submit counters.</td></tr>
+          <tr><td>T08</td><td>Submit times out or returns 5xx.</td><td>No automatic Submit retry occurs; Status still runs; the final flow status is Failed.</td></tr>
+          <tr><td>T09</td><td>Status times out or returns 5xx.</td><td>No automatic Status retry occurs; the notification runs and the flow fails.</td></tr>
+          <tr><td>T10</td><td>Status returns <code>printerOverridden &gt; 0</code>.</td><td>A configuration-risk notification is generated.</td></tr>
+          <tr><td>T11</td><td>Status returns <code>notFound &gt; 0</code>.</td><td>A duplicate-print-risk notification is generated.</td></tr>
+          <tr><td>T12</td><td>A response item contains <code>warning</code>.</td><td>The warning is included in the consolidated notification.</td></tr>
+          <tr><td>T13</td><td>A run lasts longer than five minutes.</td><td>Concurrency permits only one active run and a later recurrence waits.</td></tr>
+          <tr><td>T14</td><td>Inspect run history.</td><td>The Function key is not visible.</td></tr>
+          <tr><td>T15</td><td>Submit uses the configured format.</td><td>The request contains <code>printFormat: image/pwg-raster</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout warning">
+        <strong>Safe initial test.</strong>
+        <p>First run Health by itself. For the next run, change the Submit request object's <code>dryRun</code> value to <code>true</code> and insert a temporary <strong>Control → Terminate</strong> action with Status <strong>Succeeded</strong> immediately after <code>HTTP_Submit</code>. This stops the diagnostic run before the strict production <code>Parse_Submit</code> schema and before Status, which has no dry-run mode. Inspect <code>HTTP_Submit</code>'s response to validate the resolved columns and printer profile. Then delete the temporary Terminate action, restore <code>dryRun</code> to <code>false</code>, and test with one controlled PDF.</p>
+      </div>
+    </section>
+
+    <section id="checklist">
+      <h2>7. Go-live checklist</h2>
+      <ul class="checklist">
+        <li>The dedicated Azure Functions host key exists and is not the master key.</li>
+        <li>The Function key is stored in Key Vault and retrieved directly by the Azure Key Vault connector.</li>
+        <li>Azure Key Vault and Teams connection references have production owners.</li>
+        <li>The hashed Function App base URL matches the Azure portal.</li>
+        <li>The current Universal Print printer share ID has been verified.</li>
+        <li>The Submit body explicitly sends <code>image/pwg-raster</code>.</li>
+        <li>The Status body explicitly sends <code>printerShareId</code>.</li>
+        <li>Health retry is bounded; Submit and Status retries are disabled.</li>
+        <li>Asynchronous pattern is off on all three HTTP actions.</li>
+        <li>Secure inputs hide the Function key from run history.</li>
+        <li>The Team and Channel placeholders have been replaced.</li>
+        <li>Trigger concurrency is set to one.</li>
+        <li>The dry-run test and one-file live test have passed.</li>
+        <li><code>printerOverridden</code> equals zero in the Status response.</li>
+        <li>The flow is enabled only after all checks above pass.</li>
+      </ul>
+    </section>
+
+    <section id="references">
+      <h2>8. References</h2>
+      <ul>
+        <li><a href="power-automate-integration.md">Repository Power Automate integration reference</a></li>
+        <li><a href="deploy-to-azure.md">Repository Azure deployment runbook</a></li>
+        <li><a href="https://learn.microsoft.com/en-us/azure/azure-functions/function-keys-how-to">Microsoft: Work with access keys in Azure Functions</a></li>
+        <li><a href="https://learn.microsoft.com/en-us/connectors/keyvault/">Microsoft: Azure Key Vault connector</a></li>
+        <li><a href="https://learn.microsoft.com/en-us/power-automate/guidance/coding-guidelines/use-secure-inputs-outputs-triggers">Microsoft: Secure data used in cloud flows</a></li>
+        <li><a href="https://learn.microsoft.com/en-us/azure/logic-apps/error-exception-handling">Microsoft: Retry policies and workflow error handling</a></li>
+        <li><a href="https://learn.microsoft.com/en-us/power-automate/limits-and-config">Microsoft: Power Automate limits</a></li>
+        <li><a href="https://learn.microsoft.com/en-us/power-automate/guidance/coding-guidelines/optimize-power-automate-triggers">Microsoft: Trigger concurrency guidance</a></li>
+      </ul>
+    </section>
+
+    <footer>
+      This document contains no live Function key. Replace placeholders only inside the secured Power Automate solution and its approved connections.
+    </footer>
+  </main>
+</body>
+</html>

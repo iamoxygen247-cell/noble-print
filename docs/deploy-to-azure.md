@@ -3,12 +3,17 @@
 Step by step, in order. **The order matters**: several steps depend on the one
 before, and two of them fail *silently* if done out of sequence.
 
+> **Shipping a code change to an environment that already exists? You want
+> [`deploy-incremental.md`](deploy-incremental.md) instead.** This file builds
+> the environment; that one is the release loop, and its first section is the
+> question this file never asks — whether the change needs a deploy at all.
+
 > **Do [`docs/e2e-testing.md`](e2e-testing.md) Part A first.** If a page does not
 > come out of the tray from a standalone script, nothing here will make it print —
 > and Part A needs no Azure resources at all, so it costs nothing to find out.
 > Part A prints through `image/pwg-raster`, so it is also the test that proves the
 > PDF → raster conversion works against the real device. **Whether the printer
-> *requires* that conversion or merely accepts it decides Flow A's body** — see
+> *requires* that conversion or merely accepts it decides the Submit body** — see
 > [The printer](#the-printer) below, and settle it before step 10.
 
 ---
@@ -159,7 +164,7 @@ only symptom is a 404. Every recorded copy — this file, `README.md`,
 at that moment. Read the current one from *Universal Print → Printers → the
 printer → Overview*.
 
-> ### ⚠️ Read this printer's content types before step 10 — they decide Flow A's body
+> ### ⚠️ Read this printer's content types before step 10 — they decide the Submit body
 >
 > This is not documentation trivia. `printing/PROFILES` is ordered
 > `(PwgRasterProfile, PassthroughProfile)`, and `PwgRasterProfile.matches` stands
@@ -167,7 +172,7 @@ printer → Overview*.
 > device takes natively is wasted work. So **what the printer reports decides what
 > an omitted `printFormat` selects**:
 >
-> | Printer reports | Flow A omits `printFormat` | Flow A sends `image/pwg-raster` |
+> | Printer reports | Submit omits `printFormat` | Submit sends `image/pwg-raster` |
 > |---|---|---|
 > | `image/pwg-raster` only | `pdf-to-pwg-raster` | `pdf-to-pwg-raster` — identical |
 > | **both** raster **and** `application/pdf` | **`passthrough` — the PDF uploads unconverted** | `pdf-to-pwg-raster` |
@@ -671,9 +676,9 @@ makes. The 90-day clock resets every time step 3 runs.
 **What decides how often that happens is the worker process, not the call rate.**
 The cache is a module-level global, so a fresh Python process starts empty and
 rotates on its first Graph call; a process already warm reuses memory for 55–85
-minutes. Flex Consumption scales to zero when idle, so at Flow A's 15 minutes and
-Flow B's 10 minutes expect a mix of both. Either way the token is rotated many
-times a day and **no human ever touches it**.
+minutes. Flex Consumption scales to zero when idle, so at the flow's recurrence
+expect a mix of both. Either way the token is rotated many times a day and **no
+human ever touches it**.
 
 Rotation is also safe to race: Entra does not revoke an old refresh token when it
 is used to fetch a new one, so two overlapping runs both succeed and last-write-
@@ -689,7 +694,7 @@ wins leaves a valid token.
 > pipeline stops dead at 90 days.
 >
 > **An idle app never rotates.** Rotation only happens when the app runs. §12's
-> advice to switch off Flows A and B is the right first move in an incident and is
+> advice to switch the flow off is the right first move in an incident and is
 > safe indefinitely for the *queue* — files simply sit at `PRINT_READY`. It is not
 > safe indefinitely for the *token*: past 90 days with no runs, it expires and
 > recovery is a manual step 5.
@@ -998,7 +1003,7 @@ $BASE = "https://$HOST_NAME"
 Same harness as local, just pointed at the deployed app.
 
 ```powershell
-# The site, and the upload format. $FMT must carry whatever Flow A will carry --
+# The site, and the upload format. $FMT must carry whatever Submit will carry --
 # see "The printer" in step 0. Set it to @() only if the printer is raster-only,
 # where omitting and naming the format select the SAME profile.
 $SITE = @("--hostname", "noblehomes.sharepoint.com", "--site-path", "/sites/PM")
@@ -1026,7 +1031,7 @@ $FMT  = @("--print-format", "image/pwg-raster")
 Read three lines out of the dry run:
 
 * **`content`** — the printer's real capability list. This is the value step 0
-  told you to record, and it decides Flow A's body in step 10.
+  told you to record, and it decides the Submit body in step 10.
 * **`conversion`** — must be **`pdf-to-pwg-raster`** when `$FMT` names raster.
   **`NONE`** means no profile matched and every file would fail at preflight.
   `passthrough` here means `$FMT` was empty *and* the printer accepts PDF — legal,
@@ -1079,70 +1084,108 @@ same instant, and is emptied by a JSON `null`. Skip it and a mis-created column
 
 ---
 
-## 10. Power Automate flows
+## 10. Power Automate — the flow
 
-**Three flows.** Each calls the app with the function key in the `code` query
-parameter. **No flow may ever write the five columns itself** — one writer only,
-or you get a race you will debug at 2 a.m.
+**One flow**, on one recurrence, calling three endpoints in order:
 
-| Flow | Recurrence | Body |
+```
+Recurrence
+└─ POST /api/print/health
+   ├─ healthy == false  →  notify  →  TERMINATE
+   └─ healthy == true
+      ├─ POST /api/print/submit
+      └─ POST /api/print/status
+```
+
+**No flow may ever write the five columns itself** — one writer only, or you get
+a race you will debug at 2 a.m. The flow reads responses and notifies; the app
+owns every write.
+
+The existing `$KEY` authorises all three calls: `functionKeys.default` is a
+**host-level** key covering every function, so there is nothing extra to capture.
+
+### The parameters — read these off the live flow
+
+This table is the record of what is actually deployed. **Confirm each value
+against the flow before trusting it**, and re-date the heading when you do.
+
+| Setting | Value | Notes |
 |---|---|---|
-| **Health** | *(a step inside A and B, not its own flow)* | `{"printerShareId":"5f488e73-…"}` |
-| **A — Submit** | 15 min | `{"sharepointHostname":"noblehomes.sharepoint.com","sharepointSitePath":"/sites/PM","library":"AI_DropBox_V2026","folder":"/Backup/Invoice","printerShareId":"5f488e73-…","batchSize":5}` |
-| **B — Poll** | 10 min | `{"sharepointHostname":"noblehomes.sharepoint.com","sharepointSitePath":"/sites/PM","library":"AI_DropBox_V2026","folder":"/Backup/Invoice","giveUpDays":10,"stallMinutes":5}` |
-| **D — Digest** | Mon 07:00 | SharePoint *Get items* per status; email the counts |
+| Recurrence | *confirm* | Decides the retry ladder's opening rung — see below |
+| Trigger concurrency | *confirm* | `1` keeps one Health → Submit → Status sequence global |
+| `sharepointHostname` | `noblehomes.sharepoint.com` | Required; a 400 without it |
+| `sharepointSitePath` | `/sites/PM` | Required; `""` is legitimate, absent is not |
+| `library` / `folder` | `AI_DropBox_V2026` / `/Backup/Invoice` | |
+| `printerShareId` | `5f488e73-…` | On Submit **and** Status — see F3-R below |
+| `printFormat` | *confirm* | Decided by the printer, not preference — see below |
+| `batchSize` (Submit) | *confirm* | With no loop, this caps throughput per recurrence |
+| Submit loop | *confirm* | Whether Submit repeats on `remainingReady` |
+| `giveUpDays` / `stallMinutes` (Status) | *confirm* | The only two pacing knobs |
+| Key transport | *confirm* | `code` query parameter, or an `x-functions-key` header |
 
-> **Flow A's body above omits `printFormat`, and that is only correct on a
-> raster-only printer.** Read [`printFormat` in Flow A's body](#printformat-in-flow-as-body)
-> below before pasting it. If Health's `content` shows this printer also accepts
-> `application/pdf`, add `"printFormat":"image/pwg-raster"` — otherwise Flow A
-> silently runs passthrough.
+> **The retry ladder's opening rung follows the recurrence.** The retry count is
+> derived from the file's age when its *first* job is created, so a recurrence of
+> 15 min opens the ladder at retry 3, 5 min at retry 2, and 1 min at retry 1.
+> Status's own cadence does not change the sequence — `Print_Time` pins each
+> instant — so this is a property of how often **Submit** runs. Lowering
+> `stallMinutes` compresses the ladder and makes this worse, not better.
+> [`timing.md`](timing.md) is the authority on every clock here.
 
-> **The recurrences are not arbitrary, and Flow A's is the expensive one.**
-> [`timing.md`](timing.md) is the authority on every clock here. The consequence
-> worth knowing before you tune anything: the retry count is derived from the
-> file's age when its *first* job is created, so **Flow A every 15 min opens the
-> retry ladder at retry 3** — every 5 min at retry 2, every minute at retry 1
-> ([`timing.md`](timing.md), "Flow B's cadence no longer eats a boundary"). Flow B
-> at 10 min and at 1 min produce identical retry sequences, because `Print_Time`
-> pins the instant. Lowering `stallMinutes` compresses the ladder and makes this
-> worse, not better.
+> **There is no separate Poll flow, and no Flow C.** A daily Resubmit flow used to
+> exist; recovery moved into Status on 2026-09-01, and `POST /api/print/resubmit`
+> returns 404. Older copies of this runbook describe three flows — A Submit,
+> B Poll, D Digest — which were a design, not a deployment. **The weekly digest
+> does not exist**; build it from [`design.md`](design.md) §13 when it is wanted.
 
-> **There is no Flow C.** A daily Resubmit flow used to exist; recovery moved into
-> Flow B on 2026-09-01. If you are working from an older copy of this runbook, do
-> not create it — `POST /api/print/resubmit` returns 404. **Health is not its
-> replacement**: it is a step inside A and B, reads a printer, and writes nothing.
-
-### Call Health first in both flows
-
-`POST /api/print/health` is a step at the top of each flow, not a flow of its own.
-One share read, **no writes**, safe on every tick. The existing `$KEY` authorises
-it — `functionKeys.default` is a **host-level** key covering every function, so
-there is nothing new to capture.
-
-```
-Flow A:  health  →  Condition healthy == false  →  notify, TERMINATE
-                 →  else the Do Until / submit loop as before
-
-Flow B:  health  →  Condition healthy == false  →  notify, but CONTINUE
-                 →  poll anyway
-```
-
-**Flow A gates; Flow B does not.** Poll marks completions, appends retry history
-and gives up on rows past `giveUpDays` — none of which needs a working printer.
-Skipping Poll during an outage means rows reach no terminal status for exactly as
-long as the outage lasts, which is when recovery matters most.
+### Health gates everything — what that costs
 
 A sick printer is a **200 with `healthy: false`**, never a non-2xx, so the HTTP
-action succeeds and the flow keeps control of the branch. Read `healthy`;
+action succeeds and the flow keeps control of its branch. Read `healthy`;
 `errors[].code` says which of the ten conditions fired.
 
-> **Run B before A** if you ever put them in one flow. Poll's requeue writes
-> `PRINT_READY`, which Submit consumes, so Poll-first makes a recovery actionable
-> in the same cycle instead of up to 15 minutes later. They are separate flows on
-> separate timers here, which is fine — this only matters if you merge them.
+Gating **Submit** is exactly what Health is for: one share read, no writes, and
+nothing is claimed when the printer cannot serve it.
 
-### `printFormat` in Flow A's body
+Gating **Status** is a deliberate simplification with a real cost, recorded here
+so it is a decision rather than an accident. Of Health's ten error codes, only
+four would actually stop Status working:
+
+| Would break Status too | Says nothing about Status |
+|---|---|
+| `AUTH_BOOTSTRAP_REQUIRED` — no token, so no job reads | `PRINTER_NOT_ACCEPTING_JOBS` · `PRINTER_STOPPED` — the printer is offline or faulted, which is when Status matters **most** |
+| `PRINTER_UNREACHABLE` · `PRINTER_NOT_FOUND` | `FORMAT_NOT_SUPPORTED` · `NO_PROFILE` · `JOB_CONFIGURATION_FAILED` · `CONVERTER_UNAVAILABLE` — all about *producing and submitting* a document, which Status never does |
+| `NO_PRINTER_ID` — cancel resolves the printer id behind the share (rule 2) | |
+
+While Health is false, four things stop happening:
+
+1. **Completions are not recorded.** A file that printed before the fault sits at
+   `PRINT_PENDING`; the library is the audit trail, so it lags exactly when
+   somebody is reading it.
+2. **`giveUpDays` never fires.** The give-up branch is only reachable when Status
+   runs, so rows past the deadline stay `PRINT_PENDING` instead of `PRINT_FAILED`.
+3. **Stalled jobs are never requeued** — and a device fault is the canonical
+   reason jobs stall in the first place.
+4. **A long gate can produce a duplicate print.** Finished jobs age out of
+   Universal Print. Once one has, the job lookup 404s, and a row with no readable
+   job counts as *stalled immediately* — so it is requeued and the document may
+   print a second time. Gating Status lengthens precisely the gap this depends on;
+   see **Status's cadence is load-bearing** below.
+
+> **The next iteration, when this flow is enhanced: gate Status on those four
+> codes only.** The codes are a closed, stable vocabulary
+> (`print_policy.ALL_HEALTH_CODES`) and the flow already parses `errors[]`, so it
+> is one condition rather than a redesign — Submit stays gated on `healthy`, and
+> Status runs unless the failure is one that genuinely blocks it.
+
+### Submit runs before Status — what that costs
+
+Status's requeue writes `PRINT_READY`, which Submit consumes. Running Submit
+first means a file requeued on this tick is not picked up until the **next**
+recurrence, rather than in the same cycle. At a short recurrence that is a minor
+delay; it is recorded because it is otherwise invisible, and because reordering
+the two actions is the entire fix if it ever matters.
+
+### `printFormat` in the Submit body
 
 Optional. Leave it out and Submit picks a profile from what the printer reports,
 which is what happened before the key existed — so an existing flow needs no edit.
@@ -1164,8 +1207,8 @@ the two kinds of device:
 | `image/pwg-raster` only | `pdf-to-pwg-raster` | `pdf-to-pwg-raster` — identical, so omitting is right and the key buys nothing but an entry in the run history |
 | **both** raster **and** `application/pdf` | **`passthrough`** — the PDF goes up unconverted | `pdf-to-pwg-raster` |
 
-> **On a dual-format printer, put `"printFormat":"image/pwg-raster"` in Flow A.**
-> Both paths print, but only the raster one is bench-proved:
+> **On a dual-format printer, put `"printFormat":"image/pwg-raster"` in the
+> Submit body.** Both paths print, but only the raster one is bench-proved:
 > [`e2e-testing.md`](e2e-testing.md) Part A and Part B run with
 > `--print-format image/pwg-raster`. Omitting the key there would put production
 > on a pipeline nothing ever tested, and the only visible trace would be
@@ -1184,7 +1227,7 @@ just means nothing prints until you fix it. A format this *document* cannot be
 turned into is different: that is a per-file `PRINT_FAILED`, one bad file among
 good ones.
 
-### The two numbers in Flow B's body
+### The two numbers in the Status body
 
 They are the whole reason the retry pacing lives in the flow rather than in app
 settings: **changing them needs no deploy and no app restart.** Each falls back to
@@ -1200,18 +1243,18 @@ fallback** any more — the flow body is the only place either can be set.
 *work* while `giveUpDays` bounded the *waiting*, but the retry count is derived from
 the file's age anyway, so the two were one quantity in different units. A flow still
 sending `maxRetries` is accepted and ignored — which is what lets the code deploy
-before the flows are edited.
+before the flow is edited.
 
 An out-of-range value is a **400** — the response names the key and its range.
 The response echoes `giveUpDays`, `stallMinutes` and `printerShareId` back, so
 what was actually in force is visible in the run history rather than inferred from
 what you meant to send.
 
-### `printerShareId` in Flow B's body — optional, and read this first
+### `printerShareId` in the Status body — this flow sends it, so read this
 
-Poll accepts it, and when present it is a **hard override**: every job lookup and
+Status accepts it, and when present it is a **hard override**: every job lookup and
 every cancel in the run addresses that share instead of the `Printer_Name` on each
-row.
+row. **This flow sends it**, so the guard below is live rather than hypothetical.
 
 **With one printer registered it changes nothing** — the override equals what every
 row already says. It also rescues a row whose `Printer_Name` is empty but whose
@@ -1227,36 +1270,52 @@ The guard is in the response: **`printerOverridden` must be 0.** Anything higher
 the number of rows that disagreed with the override, and each one also logs a
 WARNING. The warning is graded, so read which you got: a disagreeing row **with**
 an outstanding job names **F3** and can genuinely print twice; one **without** a
-job says so and is only a configuration mismatch. Add a Flow B condition on it:
+job says so and is only a configuration mismatch. Add a condition on it:
 
 ```
 Condition: printerOverridden > 0  ->  notify
 ```
 
-If you register a second printer, either drop the key from Flow B or split into one
-flow per printer.
+If you register a second printer, either drop the key from the Status body or split
+into one flow per printer.
 
-Flow A must loop, because the batch is 5:
+### Submit's capacity, and the one response flag you must read
+
+**Without a loop, one recurrence submits at most `batchSize` files.** That is the
+throughput ceiling: `batchSize` per tick, no more, however long the queue is. It is
+a legitimate choice — the leftovers wait for the next tick — but it is a choice, so
+size it against the queue you actually see. If it is not enough, add a **bounded**
+Submit loop rather than raising `batchSize` indefinitely:
 
 ```
-Recurrence
-└─ Do Until   remainingReady = 0   OR   iterations >= 10     ← always bound it
-   └─ HTTP POST {BASE}/api/print/submit?code={KEY}
+Do Until   remainingReady = 0   OR   iterations >= 10     ← always bound it
+   └─ HTTP POST {BASE}/api/print/submit
    └─ Parse JSON → remainingReady, submitted, failed, printerAvailable
-└─ Condition: failed > 0  or  status <> 200  or  printerAvailable = false  → notify
 ```
 
-**Do not drop `printerAvailable` from that condition.** When the printer is not
-accepting jobs the run is a perfectly healthy `200` with `failed = 0`, so every
-other test passes and the flow says nothing. That flag is the only thing in the
-response that distinguishes "nothing to print" from "nothing *can* print".
+`remainingReady` is `0` — never a "we didn't look" sentinel — when nothing is
+submittable, so a `Do Until` on it terminates on an offline printer instead of
+spinning to its iteration cap.
 
-**Poll's cadence is load-bearing.** If Universal Print discards a finished job
-before Poll sees it, Poll gets a 404, reads that as a stalled attempt, and
-requeues the document — printing it twice. Measure how long finished jobs stay
-readable in your tenant and keep the interval well inside it. The risk is set by
-this cadence, not by the retry schedule, but the reprint now arrives in minutes
-rather than three days, so there is less time to catch it by hand.
+**Do not drop `printerAvailable` from the flow's notify condition:**
+
+```
+Condition: failed > 0  or  status <> 200  or  printerAvailable = false  → notify
+```
+
+When the printer is not accepting jobs the run is a perfectly healthy `200` with
+`failed = 0`, so every other test passes and the flow says nothing. That flag is
+the only thing in the response that distinguishes "nothing to print" from
+"nothing *can* print".
+
+**Status's cadence is load-bearing.** If Universal Print discards a finished job
+before Status sees it, the lookup 404s, a row with no readable job counts as
+stalled immediately, and the document is requeued — printing it twice. Measure how
+long finished jobs stay readable in your tenant and keep the interval well inside
+it. The risk is set by this cadence, not by the retry schedule, and the reprint
+arrives within the file's next retry boundary rather than three days later, so
+there is little time to catch it by hand. **Gating Status behind Health lengthens
+exactly this gap** — see above.
 
 Store the function key in the flow's HTTP action as a **secure input**, never in
 a description or a comment.
@@ -1289,12 +1348,17 @@ git checkout <GOOD_SHA>
 cd functionapp; func azure functionapp publish $APP --build remote; cd ..
 
 # Or stop the pipeline instantly without touching the app:
-#   turn OFF Power Automate flows A and B.
+#   turn OFF the Power Automate flow.
 # Files stay PRINT_READY and nothing is lost -- the library IS the queue.
 ```
 
-Turning the flows off is the safer first move in an incident: it stops new work
+Turning the flow off is the safer first move in an incident: it stops new work
 immediately and leaves the queue intact.
+
+> **Rolling back a release rather than the environment?**
+> [`deploy-incremental.md`](deploy-incremental.md) §8 covers the one thing this
+> section does not: a code rollback does **not** revert an application-settings
+> change made alongside it.
 
 > **Safe indefinitely for the queue, not for the token.** Files sit at
 > `PRINT_READY` for as long as you like — the library is the queue and nothing
@@ -1318,7 +1382,7 @@ immediately and leaves the queue intact.
 | Prints, but the page is cropped or scaled | The raster and the job configuration disagree | `scaling`/`margin`/`dpi` in `printing/profiles.py` must match the render dpi. Graph still reports `completed` — only the paper shows it |
 | `ModuleNotFoundError: pypdfium2` | Remote build did not install it | Confirm `pypdfium2` is in `functionapp/requirements.txt` and that publish used `--build remote` |
 | Stuck `PRINT_PENDING`, nothing prints | Nothing is delivering jobs to the device | [`e2e-testing.md`](e2e-testing.md) Part A |
-| Prints, but not the pipeline Part A proved | Flow A omitted `printFormat` on a printer that also accepts PDF, so passthrough won | Step 10, [`printFormat` in Flow A's body](#printformat-in-flow-as-body) |
+| Prints, but not the pipeline Part A proved | Submit omitted `printFormat` on a printer that also accepts PDF, so passthrough won | Step 10, [`printFormat` in the Submit body](#printformat-in-the-submit-body) |
 | Counts in the workbook look low | Adaptive sampling got enabled | Step 8 |
 | `ConnectionResetError [WinError 10054]` or `Connection aborted` from any `az` command | Local TLS interception on the **workstation**, not Azure. Heavier responses hit it more often | **Retry.** The `az` wrapper in the PowerShell profile already retries five times and is *silent on success*, so `az attempt N failed … retrying…` followed by nothing — and no `az failed after 5 attempts` warning — means a later attempt worked. §0, [`ai/troubleshooting.md`](ai/troubleshooting.md) |
 
@@ -1333,7 +1397,7 @@ cause and verified the fix.
 ```
 [ ]  0  e2e-testing.md Part A: a page came out of the tray, NOT cropped
 [ ]  0  PRINTER content types READ and RECORDED with a date (live-printer-check
-        -DiagnoseOnly). Raster-only or dual-format? It decides Flow A's body
+        -DiagnoseOnly). Raster-only or dual-format? It decides the Submit body
 [ ]  0  az reaches Azure through the truststore wrapper (az group list works)
 [ ]  0  az account show = dev-Document Intelligence (28e61545-...); role = Owner
 [ ]  0  did NOT run az upgrade
@@ -1374,17 +1438,24 @@ cause and verified the fix.
         format is simply healthy); an UNKNOWN format like image/png IS a 400;
         printer OFF gives PRINTER_NOT_ACCEPTING_JOBS -- and RECORD the observed
         `state` into design.md's status.state row
-[ ] 10  Flows A, B, D created -- there is NO Flow C; A loops on remainingReady
-        with an iteration cap; B carries stallMinutes/giveUpDays (NOT maxRetries)
-[ ] 10  Flow A's printFormat matches the step-0 reading: OMITTED on a raster-only
-        printer, "image/pwg-raster" on one that also accepts PDF (else Flow A
+[ ] 10  ONE flow: health -> submit -> status on one recurrence. There is no
+        Flow C and no separate Poll flow; the weekly digest does not exist
+[ ] 10  The parameter table in §10 filled in FROM THE LIVE FLOW, not from a
+        specification -- recurrence, batchSize, whether Submit loops,
+        giveUpDays/stallMinutes (NOT maxRetries), key transport
+[ ] 10  Submit's printFormat matches the step-0 reading: OMITTED on a raster-only
+        printer, "image/pwg-raster" on one that also accepts PDF (else Submit
         runs passthrough, which Part A never proved)
-[ ] 10  Every flow body carries share 5f488e73-... -- NOT the retired 4429bf4e-...
-[ ] 10  BOTH flow bodies carry sharepointHostname + sharepointSitePath -- without
-        them Submit and Poll are 400. Health is the signal during the cutover
-[ ] 10  BOTH flows call /api/print/health first: A TERMINATES on healthy==false,
-        B notifies but POLLS ANYWAY (Poll still marks completions and gives up)
-[ ] 10  If Flow B sends printerShareId: printerOverridden == 0 on a real run,
-        and a Flow B condition notifies when it is not (F3-R)
+[ ] 10  Every request body carries share 5f488e73-... -- NOT the retired 4429bf4e-...
+[ ] 10  Submit AND Status bodies carry sharepointHostname + sharepointSitePath --
+        without them both are 400
+[ ] 10  Health is called FIRST and gates the run. Understood and accepted: it
+        gates Status too, so while healthy==false nothing marks completions,
+        nothing gives up past giveUpDays, and a job aged out of Universal Print
+        can be requeued into a DUPLICATE print. Narrow gate = next iteration
+[ ] 10  Status sends printerShareId, so printerOverridden == 0 on a real run --
+        and a condition notifies when it is not (F3-R)
+[ ] 10  notify condition includes printerAvailable == false (a 200 with failed=0
+        is otherwise completely silent when the printer cannot print)
 [ ] 11  Silence alert created
 ```
