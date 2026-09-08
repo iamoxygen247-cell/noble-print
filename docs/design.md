@@ -77,9 +77,10 @@ Referred to by name throughout — never "endpoint 1/2/3".
 | R18 | Python | throughout | Azure Functions Python v2 model |
 | R19 | Reuse learnings/structure from `noble-invoice-process` | §8, §9, §13 | Playbook §§2.1–2.8, 5–7 applied |
 | R20 | Testing in the design | §10 | Five tiers |
-| **R21** | A stalled `PRINT_PENDING` job records **when** it will be retried, in `Print_Time`, and still returns to `PRINT_READY` | **Poll** check 4, §5.4, §5.7 | The retry time is the existing ladder, `stallMinutes × (2ⁿ − 1)` from `createdDateTime`, clamped to the give-up deadline. Written in the business zone **with its UTC offset** — see §5.7 |
+| **R21** | A stalled `PRINT_PENDING` job records **when** it will be retried, in `Print_Time`, and still returns to `PRINT_READY` | **Poll** check 4, §5.4, §5.7 | ⚠️ **"Stalled" narrowed on 2026-09-07 — see R24:** a `pending` job is not stalled at any age, so it never reaches this clause and never carries a `Print_Time`. The retry time is the existing ladder, `stallMinutes × (2ⁿ − 1)` from `createdDateTime`, clamped to the give-up deadline. Written in the business zone **with its UTC offset** — see §5.7 |
 | **R22** | Submit processes only files where `Print_Status = PRINT_READY` **and** `Print_Time <= Now` | **Submit** step 4 | Compared in Python, not `$filter` (one indexed field at a time). ⚠️ **A blank or unreadable `Print_Time` means DUE NOW** — upstream files carry none, and a human resetting a terminal row leaves none either; fail-closed would stop the queue dead |
 | **R23** | The site is named by the caller, not the deployment | **Submit** / **Poll** request | `sharepointHostname` + `sharepointSitePath` replace two app settings. Missing → **400**, previously a 500. Widens blast radius by design: §5.8 |
+| **R24** | Cancel a job only when the printer has it and it has breached the stall threshold. A `pending` job is not cancelled unless it breaches `giveUpDays` | **Poll — `job_is_stalled`**, §5.6 check 4 | Added 2026-09-07. Graph defines `pending` as "the print job is pending processing by the printer", so there is nothing stuck to cancel. **Scoped with the owner:** every non-terminal state *except* `pending` still stalls — `stopped` is the jam D1 was written for, `paused`/`unknown` are not documented as dead. Rows with **no job** are unchanged (rule 1's recovery). The threshold is now measured from `acknowledgedDateTime` when the job carries a usable one — see §5.7 |
 
 > **R11 revised 2026-08-30, after reading a real job back.** The original note said Universal Print
 > "returns no completion timestamp" and used that to justify stamping `Print_Message` with the moment
@@ -364,6 +365,8 @@ message. Mixing the two is how DST bugs get in; a test asserts both behaviours.
        │          │         └───────────────┘
        └──────────┴──  Poll: stalled past stallMinutes → cancel old job, back to
                        PRINT_READY with Print_Time = when the next retry falls due
+                       ("stalled" excludes `pending` — the printer has not taken
+                        that job, so only giveUpDays bounds it. R24)
 ```
 
 **Why the claim precedes submission (deviation at R5).** A crash after the claim leaves
@@ -391,7 +394,7 @@ uses the pair, and so does every log correlation (§13.3).
 | Submit — not yet due (`Print_Time` in the future) | — | — | — | — | — |
 | Poll — `completed` | `PRINT_COMPLETED` | — | — | `printed on YYYY-MM-DD HH:MM:SS` | **cleared** |
 | Poll — `canceled` / `aborted` | `PRINT_FAILED` | — | — | job `description` + `details` | **cleared** |
-| Poll — in flight, inside the stall threshold | — | — | — | — | — |
+| Poll — in flight and not stalled (inside the threshold, **or `pending` at any age**) | — | — | — | — | — |
 | **Poll — stalled** | `PRINT_READY` | — | **cleared** | **append** `Job Id N <cancel outcome>. Retry job (n)`, or `No job to cancel. Retry job (n)` when there was none | **next due time** |
 | **Poll — past the give-up threshold** | `PRINT_FAILED` | — | — | **append** the give-up reason, **including what the cancel achieved** | **cleared** |
 
@@ -575,17 +578,28 @@ POST /api/print/status {sharepointHostname, sharepointSitePath, library, folder,
         4. stalled              → ***CANCEL***, then PRINT_READY + appended note
                                   + Print_Time = when retry (spent+1) falls due,
                                     CLAMPED to created + giveUpDays
-        5. otherwise            → write NOTHING (a healthy job in flight)
+        5. otherwise            → write NOTHING (a healthy job in flight, or one
+                                  the printer has not taken yet)
 
       Check 4 used to carry two more conditions -- "retries left" and "a NEW
       boundary crossed" -- and a row failing either waited at PRINT_PENDING while
       every run re-derived the same silence. The waiting is Print_Time's job now,
       so a stalled row leaves PRINT_PENDING at once and waits where it can be seen.
 
-      "stalled" = no job at all (crashed submission or 404), or a live
-      non-terminal job whose own createdDateTime is older than stallMinutes.
+      "stalled" = no job at all (crashed submission or 404), or a live job that is
+      neither terminal NOR `pending`, and that the printer has held longer than
+      stallMinutes.
       A job whose age cannot be determined is NOT stalled -- cancelling one that
       might be printing would queue a second copy.
+      `pending` is NOT stalled at any age (R24): Graph defines it as "pending
+      processing by the printer", so the device never took it, nothing is stuck,
+      and cancelling would kill a document waiting its turn. giveUpDays still
+      bounds it, and check 3 still cancels before it fails the row.
+      The clock is acknowledgedDateTime when the job carries a usable one, else
+      createdDateTime -- the threshold asks how long the PRINTER has held the job.
+      "Usable" excludes an acknowledgement earlier than the job's own creation,
+      and one with no creation stamp beside it; both were measured to turn "leave
+      alone" into "cancel". See print_policy.stall_clock_start.
 
  ◄─ 200 {checked, completed, failed, requeued, gaveUp, stillRunning, notFound,
          malformed, pendingFound, uncheckedCount, budgetExhausted,
@@ -612,6 +626,21 @@ POST /api/print/status {sharepointHostname, sharepointSitePath, library, folder,
 ```
 
 ### 5.7 The retry schedule
+
+> **Revised 2026-09-07 (R24). The ladder is only reachable from a job the printer
+> has acquired.** A row whose job sits at `pending` climbs no rungs: it is not
+> stalled at any age, so it never requeues and never gets a `Print_Time`. It waits
+> at `PRINT_PENDING` until either the printer takes the job — in which case the job
+> prints itself and Poll records the completion — or `giveUpDays` passes, which
+> cancels the outstanding job and fails the row.
+>
+> **Two clocks, not one, since the same change.** `spent` is still read off the
+> file's age when the current job was **created** (R16), so a row that does reach a
+> stall lands on the correct rung. The **stall threshold** is measured from
+> `acknowledgedDateTime` when the job carries a usable one — the question it asks
+> is how long the *printer* has held the job, and measuring from creation means a
+> job that queued for three hours is already past a five-minute threshold the
+> instant it starts printing.
 
 Retry `n` falls due at file age **`stallMinutes × (2ⁿ − 1)`**. With the defaults:
 
@@ -700,10 +729,16 @@ question. With the cap gone the ladder reaches retry 11 at 7.11 days, and retry 
 >
 > **The grace period is gone with it.** Work now continues to the cutoff: twelve
 > renders for an undeliverable document instead of eleven. And because a requeue
-> cancels the outstanding job (rule 2), a row that is *waiting* has no live job —
-> so a printer fixed mid-wait no longer prints immediately, as it did when the last
-> job was left alive. Expect that during a live stall test; it looks like nothing
-> is happening.
+> cancels the outstanding job (rule 2), a row that is *waiting at `PRINT_READY`*
+> has no live job — so a printer fixed mid-wait no longer prints immediately, as it
+> did when the last job was left alive. Expect that during a live stall test; it
+> looks like nothing is happening.
+>
+> **R24 (2026-09-07) put the other case back, for one state.** A row whose job is
+> `pending` is never requeued, so it waits at `PRINT_PENDING` **with its job still
+> live** — and a printer fixed mid-wait *does* print it immediately, off the
+> original job, with the next Poll run recording the completion. The paragraph
+> above now describes only rows the schedule actually moved.
 
 **Unbounded, and safely so.** `retries_due` no longer takes a cap. The ladder
 doubles, so the loop is logarithmic — 32 iterations for a year-9999 timestamp at a
@@ -737,8 +772,9 @@ a `PRINT_*` setting, on the reasoning that a server should be able to retune its
 In practice it split the answer to *"why is the pacing wrong?"* across a flow and an
 app setting, with the flow silently winning — so a setting could be read, believed,
 and be doing nothing at all. A leftover value in the environment now changes
-nothing, which is what makes the deploy sequence in §5.10 safe: the settings can be
-deleted after the flows are confirmed green rather than before.
+nothing, which is what makes the deploy sequence in
+[`deploy-incremental.md`](deploy-incremental.md) safe: the settings can be
+deleted after the flow is confirmed green rather than before.
 
 `PRINT_BUDGET_SECONDS` and `PRINT_BUSINESS_TZ` keep their settings on purpose.
 Neither is something a flow sets: one is a property of the host's connector
@@ -898,7 +934,8 @@ kind of configuration: setting it appeared to work and did nothing (S4).
 | **UC-5** | Someone cancels at the printer. | Poll sees `canceled` → `PRINT_FAILED` + description. **Terminal** — a deliberate cancel is respected, not undone. |
 | **UC-6** | Crash between claim and job creation. | `PRINT_PENDING`, **empty** `Print_JobId`. Poll reads that as stalled and requeues it at the next Poll run, ≈10 min. No double print, no lost file. |
 | **UC-7** | Flow A schedules overlap; two runs start together. | Both pick the same files; `If-Match` means exactly one wins per file, the loser records `skipped`. **No file printed twice.** |
-| **UC-8** | Printer unplugged; job sits `stopped` for 4 days. | Poll **cancels the stopped job** and requeues on the backoff, the last requeue at ~3d 13h, then holds. When the printer is fixed the old jobs are gone, so only the newest prints. |
+| **UC-8** | Printer unplugged; job sits `stopped` for 4 days. | Poll **cancels the stopped job** and requeues on the backoff, the last requeue at ~3d 13h, then holds. When the printer is fixed the old jobs are gone, so only the newest prints. ⚠️ **A stuck queue does not always look like this.** What `e2e-testing.md` actually records for the Poll pass of 2026-09-02 is the four job states — `Pending` (40, 41), `Processing` (39), `Stopped` (38) — not the printer's power state, so read this as "`stopped` is one shape among several", not as a claim about outages. The two `Pending` ones would now take UC-14's path instead. |
+| **UC-14** | Job queued behind another document, or on a printer that has not started it: `pending` for hours. | **Nothing is written and nothing is cancelled** (R24). The row stays `PRINT_PENDING` and is reported as `still_running` with the queued wording. It resolves one of two ways: the printer takes the job and it completes normally, or `giveUpDays` passes and Poll cancels the job and writes `PRINT_FAILED`. **The cost:** a job that never leaves `pending` is not retried, so up to `giveUpDays` can pass before the row says anything is wrong. Accepted — cancelling a queued job kills a healthy document, and if the device acquired it between the read and the cancel, both copies print. |
 | **UC-9** | Job completes but Universal Print purges it before Poll runs. | Poll gets 404, reads it as stalled and requeues → **prints twice.** Unchanged in likelihood — the risk is set by Poll's 10-minute cadence against the retention window (§3) — but the reprint now lands in minutes, not days. |
 | **UC-10** | `PRINT_PENDING`, 25 days old. | **FIXED.** Past `giveUpDays` Poll cancels the outstanding job and writes `PRINT_FAILED` with a reason. Nothing strands (**G1** closed). |
 | **UC-11** | Malformed request. | 400 with a specific message and **zero** SharePoint writes, so the corrected retry is not locked out. |
@@ -994,6 +1031,10 @@ token provider. **The §5.4 write matrix is the specification: one test per row.
 - Poll — completion and failure: `completed` → exact regex, and it wins even past the give-up
   deadline; `canceled`/`aborted` → `PRINT_FAILED`; a job inside `stallMinutes` writes nothing;
   empty `Printer_Name` reported as malformed
+- Poll — `pending` is not a stall (R24): a `pending` job is **never cancelled** however old, is
+  reported `still_running`, and is still cancelled-then-failed past `giveUpDays`; every other
+  non-terminal state stalls as before; the stall clock prefers `acknowledgedDateTime` and refuses
+  both an acknowledgement earlier than the job's creation and one with no creation stamp
 - Poll — the retry schedule: every boundary pinned literally (5/15/35/…/5115 min), and
   `next_retry_time` agreeing with `retries_due` at each one; a stalled job is **requeued at once
   with the next boundary written into `Print_Time`**, clamped to the give-up deadline; a crashed

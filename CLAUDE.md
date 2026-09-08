@@ -37,6 +37,11 @@ only form that cannot install into the wrong environment.
   Stage 1 needs no Function App and no app registration.
 * `docs/deploy-to-azure.md` — production deployment, step by step, in the order
   that matters. Two steps fail *silently* if done out of sequence.
+* `docs/deploy-incremental.md` — **the release loop for a code change**, now that
+  the environment exists. Read §0 first: the most-changed knobs live in the Power
+  Automate request body and cannot be deployed at all. Read §3 before publishing
+  against a live flow — a publish mid-`Submit` can print a document twice, and
+  mid-`Status` can strand one terminally.
 * `docs/ai/troubleshooting.md` — confirmed mistakes, failed commands, verified
   fixes. **Check it before starting any debugging or environment work.**
 * `CLAUDE.local.md` — machine-specific notes. Gitignored.
@@ -87,6 +92,23 @@ The same applies when Poll **gives up**: the outstanding job is cancelled before
 `PRINT_FAILED` is written, or an abandoned job could print days later against a
 row claiming it failed.
 
+**But a `pending` job is never cancelled for being stalled (R24, 2026-09-07).**
+Graph defines it as "the print job is pending processing by the printer" — the
+device has *not* taken it, so nothing is stuck, and cancelling kills a healthy
+document waiting its turn. `NON_STALLING_JOB_STATES` carries the exemption;
+`giveUpDays` is the only bound on such a row, and that path still cancels first.
+Every other non-terminal state — `processing`, `paused`, `stopped`, `unknown`,
+anything unrecognised — stalls exactly as before. A row with **no job at all** is
+also unchanged: it is stalled immediately, which is rule 1's recovery.
+
+**And the stall threshold is measured from `acknowledgedDateTime` when the job
+carries a usable one**, falling back to `createdDateTime` — the question is how
+long the *printer* has held the job. `print_policy.stall_clock_start` owns that
+choice and refuses two shapes deliberately: an acknowledgement earlier than the
+job's own creation, and one with no creation stamp at all. Both were measured to
+turn "leave alone" into "cancel", which is the duplicate this rule exists to
+prevent.
+
 Cancel is documented **only** on `/print/printers/{id}/jobs/{id}/cancel`, so it
 needs the printer id, not the share id. `_cancel_outstanding` resolves it from the
 share named in `Printer_Name` — **or from Poll's `printerShareId` when one was
@@ -111,6 +133,12 @@ minutes by default. The count is **derived from the file's age, never stored**:
 there is no attempt counter. `retries_due` evaluated at the current job's creation
 time says how many retries preceded it, because every requeue makes a new job. Do
 not add a counter column to "simplify" this.
+
+Since R24 **the ladder is only reachable from a job the printer has acquired**. A
+row whose job sits at `pending` climbs no rungs at all: it waits, and `giveUpDays`
+is what ends the wait. `spent` is still derived from the file's age at the current
+job's creation, so a row that *does* reach a stall lands on the right rung anyway —
+the acknowledgement moved the stall clock, not the schedule.
 
 **The waiting happens in Submit, not Poll.** A stalled job is requeued *immediately*
 and the row carries `Print_Time` — when retry `spent + 1` falls due. Submit refuses
@@ -232,14 +260,14 @@ Five tiers, all but the last offline (design §10):
 |---|---|---|
 | A | `test_print_policy.py` | the rules — windows, state mapping, formatting |
 | B | `test_adapters.py` | the adapters against `FakeGraph` |
-| C | `test_submit/poll/auth.py` | the routes, end to end. **Poll carries the retry schedule, the cancel-first guard, the give-up path, the `Print_Time` clamp and the `printerShareId` override (F3-R). Submit carries the due filter** |
+| C | `test_submit/poll/auth.py` | the routes, end to end. **Poll carries the retry schedule, the cancel-first guard, the give-up path, the `Print_Time` clamp, the `pending` exemption and its give-up bound (R24), and the `printerShareId` override (F3-R). Submit carries the due filter** |
 | A+C | `test_printing.py` | the PWG encoder (byte-pinned), profile selection, and Submit against a raster-only printer |
 | A+C | `test_health.py` | the pre-flight endpoint — the finding matrix as pure rules, the route, and **parity with Submit's dryRun** so Health cannot describe a pipeline Submit would not run |
 | A+C | `test_print_format.py` | `printFormat` — the `matches`/`produces` split, the two refusals, and that the requested format reaches the wire |
 | C | `test_requirements.py` | **conformance, one test per requirement clause** |
 | C | `test_review_findings.py` | the six defects the first review found; each failed first |
 | C | `test_second_review.py` | the five the second review found (S1–S5); each failed first |
-| C | `test_acknowledged_time.py` | `printed on ...` uses the printer's `acknowledgedDateTime`, not our polling clock; and the stall clock reads `createdDateTime`, not it |
+| C | `test_acknowledged_time.py` | `printed on ...` uses the printer's `acknowledgedDateTime`, not our polling clock. **The stall clock now prefers it too** (R24) — `test_print_policy.py` carries that half, including the two shapes `stall_clock_start` refuses |
 | C | `test_dryrun.py` | the dry run, and that the 20-day strand (G1) is fixed rather than merely reported |
 | A | `test_make_test_pdf.py` | the live-test document is a structurally valid PDF |
 | D | `scripts/test.py` | the live host — **not** collected by pytest |

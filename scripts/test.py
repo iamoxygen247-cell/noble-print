@@ -278,7 +278,8 @@ def main() -> int:
     parser.add_argument("--give-up-days", type=int,
                         help="status: fail a PRINT_PENDING row older than this")
     parser.add_argument("--stall-minutes", type=int,
-                        help="status: a job idle this long counts as stalled")
+                        help="status: a job the printer has held this long "
+                             "counts as stalled (a job still 'pending' never does)")
     parser.add_argument("--print-format",
                         help="submit/dryrun/health: the format to UPLOAD, e.g. "
                              "application/pdf (no conversion -- the invoice "

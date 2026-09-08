@@ -96,22 +96,31 @@ def test_windows_are_computed_in_utc_across_a_dst_change():
 
 
 def decide(state="stopped", *, file_age_minutes=1.0, job_age_minutes=None,
-           spent_at_minutes=None, stall_minutes=5, give_up_days=10):
+           ack_age_minutes=None, spent_at_minutes=None, stall_minutes=5,
+           give_up_days=10):
     """poll_decision in the units the schedule is actually specified in.
 
     `spent_at_minutes` is the file's age when the current attempt began, which is
     what encodes how many retries are already spent. It defaults to 0 -- a first
     attempt, claimed the moment the file appeared, with nothing spent yet.
+
+    `ack_age_minutes` is printJob.acknowledgedDateTime -- when the PRINTER took
+    the job, which is what the stall threshold is measured from when the job
+    carries one. Absent by default, which is the shape every test written before
+    2026-09-07 assumed and which must keep behaving exactly as it did.
     """
     file_created = NOW - timedelta(minutes=file_age_minutes)
     job_created = (None if job_age_minutes is None
                    else NOW - timedelta(minutes=job_age_minutes))
+    job_acknowledged = (None if ack_age_minutes is None
+                        else NOW - timedelta(minutes=ack_age_minutes))
     started_at = 0 if spent_at_minutes is None else spent_at_minutes
     return policy.poll_decision(
         state,
         file_created=file_created,
         has_job=job_age_minutes is not None or state not in ("", None),
         job_created=job_created,
+        job_acknowledged=job_acknowledged,
         attempt_started=NOW - timedelta(minutes=file_age_minutes - started_at),
         now=NOW,
         stall_minutes=stall_minutes, give_up_days=give_up_days,
@@ -145,8 +154,7 @@ def test_poll_decision_handles_all_eight_states():
                           policy.POLL_REQUEUE, policy.POLL_GIVE_UP)
 
 
-@pytest.mark.parametrize("state", ["paused", "stopped", "unknown", "pending",
-                                   "processing"])
+@pytest.mark.parametrize("state", ["paused", "stopped", "unknown", "processing"])
 def test_every_non_terminal_state_can_stall(state):
     """THE double-print guard, at the rules layer.
 
@@ -154,6 +162,10 @@ def test_every_non_terminal_state_can_stall(state):
     requeue therefore has to cancel first -- which is exactly what POLL_REQUEUE
     tells the caller to do. Reprinting without the cancel means the original and
     the replacement both come out once someone clears the jam.
+
+    `pending` USED TO BE IN THIS LIST and was removed on 2026-09-07 (R24). It is
+    the one state that says the printer has NOT taken the job, so there is nothing
+    stuck to cancel -- see the tests below.
     """
     action, _ = decide(state, file_age_minutes=6.0, job_age_minutes=6.0)
     assert action == policy.POLL_REQUEUE
@@ -173,10 +185,117 @@ def test_an_unrecognised_state_is_treated_as_still_live():
     assert action == policy.POLL_REQUEUE
 
 
+# --- `pending` is not a stall (R24) -------------------------------------------
+# Graph documents `pending` as "The print job is pending processing by the
+# printer" -- the device has NOT taken it. There is nothing stuck to cancel, and
+# cancelling would kill a job that is merely waiting its turn, which is how a
+# healthy queue turned into a cancel-and-reprint loop before 2026-09-07.
+
+
+def test_a_pending_job_is_never_stalled_however_long_it_waits():
+    assert policy.job_is_stalled("pending", True, 10_000, 5) is False
+
+
+def test_a_row_with_no_job_is_stalled_even_if_a_state_says_pending():
+    """THE ORDER OF THE TWO CHECKS, pinned. `has_job` is tested BEFORE the state,
+    so a row Poll cannot find a job for is requeued whatever a stale state string
+    claims -- that is rule 1's recovery, and losing it strands the document.
+
+    Today the route cannot produce this input: it only reads a state when it has a
+    job, so `has_job=False` always arrives with an empty state, and reversing the
+    two checks changes nothing observable. That is exactly why this test exists --
+    it pins the ordering against a future where a 404 keeps the last known state.
+    """
+    assert policy.job_is_stalled("pending", False, None, 5) is True
+    assert policy.job_is_stalled("", False, None, 5) is True
+
+
+def test_a_pending_job_past_the_threshold_is_left_alone():
+    action, _ = decide("pending", file_age_minutes=60.0, job_age_minutes=60.0)
+    assert action == policy.POLL_NONE
+
+
+def test_a_pending_job_past_the_give_up_deadline_is_still_failed():
+    """The exemption cannot strand a row for ever: the give-up test runs BEFORE
+    the stall test, so `giveUpDays` still bounds a job the printer never took --
+    and the caller still cancels it first."""
+    action, _ = decide("pending", file_age_minutes=11 * 24 * 60,
+                       job_age_minutes=60.0)
+    assert action == policy.POLL_GIVE_UP
+
+
+# --- the stall clock: the printer's own acknowledgement, when there is one -----
+
+
+def test_the_stall_clock_prefers_the_acknowledgement():
+    """A job created three hours ago but acknowledged a minute ago has been with
+    the PRINTER for one minute. Measuring from creation would find it stalled on
+    the very first poll after it started printing."""
+    action, _ = decide("processing", file_age_minutes=180.0,
+                       job_age_minutes=180.0, ack_age_minutes=1.0)
+    assert action == policy.POLL_NONE
+
+
+def test_an_acknowledged_job_still_stalls_once_the_printer_has_held_it_too_long():
+    action, _ = decide("processing", file_age_minutes=180.0,
+                       job_age_minutes=180.0, ack_age_minutes=10.0)
+    assert action == policy.POLL_REQUEUE
+
+
+def test_without_an_acknowledgement_the_clock_falls_back_to_creation():
+    """Every test written before the acknowledgement existed asserts this shape,
+    so the fallback is not a courtesy -- it is the majority path."""
+    action, _ = decide("stopped", file_age_minutes=60.0, job_age_minutes=60.0)
+    assert action == policy.POLL_REQUEUE
+
+
+def test_an_acknowledgement_older_than_the_job_is_ignored():
+    """Incoherent -- a printer cannot acknowledge a job before it exists -- and
+    taking it at face value would cancel a ONE-MINUTE-OLD job, which is the
+    duplicate this whole change exists to avoid. This is one of the cells the
+    naive `acknowledged or created` rule moved from "leave alone" to "cancel";
+    the sweep that counted them is in docs/ai/troubleshooting.md."""
+    action, _ = decide("processing", file_age_minutes=60.0, job_age_minutes=1.0,
+                       ack_age_minutes=60.0)
+    assert action == policy.POLL_NONE
+
+
+def test_an_acknowledgement_alone_does_not_create_an_age():
+    """No `createdDateTime` means the age cannot be established, and the
+    abstention that guards against cancelling a job which might be printing right
+    now stands. An acknowledgement must not quietly supply the age it refused."""
+    assert policy.stall_clock_start(NOW - timedelta(minutes=60), None) is None
+    action, _ = decide("processing", file_age_minutes=60.0,
+                       job_age_minutes=None, ack_age_minutes=60.0)
+    assert action == policy.POLL_NONE
+
+
+def test_the_retry_number_is_still_read_off_the_creation_stamp():
+    """R16 survives the clock change. The acknowledgement moves the STALL clock
+    only; how many retries are already spent is still the file's age when the JOB
+    was created, because that is what a requeue resets."""
+    action, attempt = decide("processing", file_age_minutes=100.0,
+                             job_age_minutes=20.0, ack_age_minutes=6.0,
+                             spent_at_minutes=80.0)
+    assert action == policy.POLL_REQUEUE
+    # 80 minutes of file age when this attempt began: retries 1-4 had fallen due
+    # (5, 15, 35, 75 min), so the fifth is the one being scheduled.
+    assert attempt == policy.retries_due(80.0, 5) + 1 == 5
+
+
 @pytest.mark.parametrize("state", ["COMPLETED", " Completed ", "cOmPlEtEd"])
 def test_state_matching_is_case_and_space_insensitive(state):
     action, _ = decide(state, file_age_minutes=1.0, job_age_minutes=1.0)
     assert action == policy.POLL_COMPLETE
+
+
+@pytest.mark.parametrize("state", ["PENDING", " Pending ", "pEnDiNg"])
+def test_the_exemption_matches_the_state_the_same_way_everything_else_does(state):
+    """Comparing the RAW string would silently re-enable the cancel the moment the
+    service returned a capital P. Every other state test in this file normalises;
+    the exemption has to match, or the guard is one casing change from gone."""
+    action, _ = decide(state, file_age_minutes=60.0, job_age_minutes=60.0)
+    assert action == policy.POLL_NONE
 
 
 # --- the exponential retry schedule -------------------------------------------
@@ -526,6 +645,27 @@ def test_no_warning_when_no_duplicate_is_possible(result):
 def test_the_still_running_message_carries_the_stall_clock():
     message = policy.still_running_message("processing", 3.2, 5)
     assert "processing" in message and "3.2" in message and "5" in message
+
+
+def test_a_pending_row_is_not_described_against_a_threshold_it_cannot_reach():
+    """`pending` no longer stalls, so quoting "(stall 5)" at it would describe a
+    deadline that will never fire and send someone looking for a bug. Say what is
+    actually true: the printer has not taken it yet."""
+    message = policy.still_running_message("pending", 42.0, 5)
+    assert "pending" in message and "42.0" in message
+    assert "stall" not in message
+
+
+def test_a_pending_row_with_no_readable_age_still_says_why_it_was_left():
+    """The `pending` job whose createdDateTime is missing or unreadable. It was
+    reached by an existing test but nothing checked what it SAID, so the sentence
+    was free to drift into nonsense. It must not borrow the "age unknown - not
+    stalled" wording either: that one explains an ABSTENTION, and this row is not
+    an abstention -- it would be left alone at any age."""
+    message = policy.still_running_message("pending", None, 5)
+    assert "pending" in message
+    assert "stall" not in message and "age unknown" not in message
+    assert "printer has not taken it" in message
 
 
 def test_a_job_whose_age_is_unknown_says_so_rather_than_looking_healthy():

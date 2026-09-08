@@ -119,10 +119,15 @@ file until it passes:
 | 5 | 2h 35m | | 11 | 7d 2h 35m |
 | 6 | 5h 15m | | 12 | *14d 5h — clamped to 10d* |
 
-- **5 minutes** is both the stall threshold — how long a *job* may sit without
+- **5 minutes** is both the stall threshold — how long a job may sit without
   finishing — and the base of the schedule above. One knob rescales everything.
-  Measured from `printJob.createdDateTime`, the job's own clock, so a SharePoint
-  edit cannot reset it.
+  Measured from `printJob.acknowledgedDateTime` when the job carries a usable one,
+  which makes it "how long the **printer** has held it"; otherwise from
+  `printJob.createdDateTime`, which is "how long since **we** created it". The two
+  differ only for a job that waited before the device took it. Either way it is
+  the job's own clock, so a SharePoint edit cannot reset it.
+- **A `pending` job is never stalled** (R24). The printer has not taken it, so the
+  threshold does not apply at any age and `giveUpDays` is its only bound.
 - **10 days is the only bound.** Past it, Poll cancels the outstanding job and
   writes `PRINT_FAILED` with a reason. `maxRetries` used to bound the *work*
   separately, with a grace period between the two; both are gone. Work now runs to
@@ -161,8 +166,10 @@ file until it passes:
 > `file age = now − listItem.createdDateTime` — never changes; drives the retry
 > boundaries and the give-up test (R16). Our own writes would reset any clock based
 > on `lastModifiedDateTime`, so the schedule would stall after one retry.
-> `job age = now − printJob.createdDateTime` — the job's own clock; decides whether
-> THIS attempt has stalled. A SharePoint edit cannot touch it.
+> `job age = now − printJob.acknowledgedDateTime` (else `createdDateTime`) — how
+> long the PRINTER has held it; decides whether THIS attempt has stalled. A
+> SharePoint edit cannot touch it. The acknowledgement is ignored when it predates
+> the job's own creation, or when there is no creation stamp to check it against.
 > `attempt start` — the file's age when the current job was created. This is what
 > says how many retries are already spent, and it is why no counter column exists.
 

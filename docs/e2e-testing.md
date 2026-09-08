@@ -152,7 +152,7 @@ The app has **three endpoints**, all HTTP `POST`:
 |---|---|---|
 | **Health** | `/api/print/health` | Can the pipeline work right now? Run it first — it writes nothing |
 | **Submit** | `/api/print/submit` | Claims the oldest `PRINT_READY` files **that are due** (`Print_Time` empty or past) and creates print jobs |
-| **Poll** | `/api/print/status` | Checks `PRINT_PENDING` jobs: marks the finished, **requeues the stalled**, **fails the hopeless** |
+| **Poll** | `/api/print/status` | Checks `PRINT_PENDING` jobs: marks the finished, **requeues the stalled**, **fails the hopeless**. A job the printer has not taken (`pending`) is left alone until `giveUpDays` — R24 |
 
 > There is **no** `/api/print/resubmit`. It was retired on 2026-09-01 and its
 > recovery work folded into Poll. If you have an older copy of these notes, any
@@ -674,7 +674,31 @@ retry number is scheduled, not *whether* one is.)
 
 The cleanest test, and the one that pins the double-print guard. No hand editing.
 
-1. **Turn the printer off**, or take it offline at the panel.
+> ⚠️ **REWRITTEN FOR R24 (2026-09-07), AND STEP 1 IS THE PART THAT CHANGED.**
+> Turning the printer off may no longer produce a requeue. A `pending` job is now
+> deliberately never cancelled — the device has not taken it, so nothing is stuck —
+> and the Poll pass recorded further down this section found **two of its four
+> jobs sitting in `Pending`**. Whether an off printer *always* reports `pending` is
+> not established here; that run's power state is not recorded. So step 4 may
+> report `requeued : 1` or `stillRunning : 1`, and **which one tells you which
+> test you are actually running**: `stillRunning` means C1a below.
+>
+> To see a cancel-and-requeue you need a job the printer has **accepted and then
+> failed to finish**: let it start printing, then interrupt it — open the tray,
+> pull the paper out, or open the lid mid-page. **Which state that produces is not
+> recorded in this repo.** Read it before drawing conclusions:
+>
+> ```powershell
+> & $Python $TestScript status @Site --library $LIB --folder $FLD --json
+> ```
+>
+> The `message` on the `still_running` entry names the state. Anything other than
+> `pending` stalls on schedule; `pending` means the printer never took it and you
+> are testing C1a instead.
+
+1. **Start the job printing, then interrupt it** so the printer has the job but
+   cannot finish it (see the note above — if the job reports `pending`, the
+   printer never took it and you are running C1a, not this test).
 2. Upload a fresh PDF to the folder and set `Print_Status` = `PRINT_READY`.
 3. Submit it:
 
@@ -683,7 +707,8 @@ The cleanest test, and the one that pins the double-print guard. No hand editing
     --printer-share-id $SHARE --batch-size 1 @FMT
 ```
 
-Note the `Print_JobId` SharePoint now shows. The job is queued and going nowhere.
+Note the `Print_JobId` SharePoint now shows. The job is with the printer and going
+nowhere.
 
 4. Wait about two minutes, then poll with a one-minute stall threshold:
 
@@ -769,6 +794,46 @@ clearing the column again — that regression is pinned by
 6. **Turn the printer back on** and submit once more. Exactly **one** sheet must
    come out. More than one means a cancel silently failed — check the host window
    for `could not cancel print job`.
+
+## C1a. A queued job is left alone (R24)
+
+The other half of C1, and the behaviour that changed on 2026-09-07. It applies to
+any job Universal Print reports as `pending` — one queued behind another document,
+or one on a device that has not picked it up. Turning the printer off is the
+easiest way to *try* to produce that state, but it is not guaranteed to: confirm
+from the job's reported state in step 3, not from the power switch.
+
+1. **Turn the printer off**, or take it offline at the panel.
+2. Upload a fresh PDF, set `Print_Status` = `PRINT_READY`, and submit it exactly as
+   in C1 step 3. Note the `Print_JobId`.
+3. Wait a couple of minutes and poll with the shortest threshold the app accepts,
+   to prove the exemption is about the *state* and not about the clock:
+
+```powershell
+& $Python $TestScript status @Site --library $LIB --folder $FLD --stall-minutes 1
+```
+
+Expect `requeued : 0` and `stillRunning : 1`, with the entry reading something
+like `pending, queued 2.4 min - the printer has not taken it yet`. In SharePoint
+**nothing moves**: `Print_Status` stays `PRINT_PENDING`, `Print_JobId` still names
+the job, `Print_Message` is untouched, and `Print_Time` stays empty.
+
+**No `PRINT_EVENT ... result=cancelled` line may appear in the host window.** That
+is the assertion. One there means a queued job was killed and the document will
+print twice when the printer comes back.
+
+4. **Turn the printer back on.** What this repo guarantees is only the first half:
+   the job was **never cancelled**, so it is still there for the device to take.
+   What happens next is Universal Print's and the device's business — the expected
+   result is that the original job prints, the next `status` run marks the row
+   `PRINT_COMPLETED` with `printed on …`, no resubmission happens, and exactly one
+   sheet comes out. **If more than one sheet comes out, or the row never leaves
+   `PRINT_PENDING`, record what you saw here** — that is the outcome this change
+   is betting on and it has not been observed on the live printer yet.
+
+If instead the printer reports the job as something other than `pending`, this is
+C1 rather than C1a; read the state from the `--json` output before concluding
+anything.
 
 ## C2. A crashed submission is recovered
 

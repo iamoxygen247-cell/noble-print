@@ -1003,11 +1003,20 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                 universal_print.job_created_at(job)) if job else None
             attempt_started = job_created or item.modified
 
+            # When the PRINTER took the job, which is what the stall threshold is
+            # measured against -- `stall_clock_start` decides whether it is usable
+            # and falls back to the creation stamp. The same accessor already
+            # feeds the completion message below; this reads one field, not one
+            # more call.
+            job_acknowledged = print_policy.parse_graph_datetime(
+                universal_print.job_acknowledged_at(job)) if job else None
+
             action, attempt = print_policy.poll_decision(
                 state,
                 file_created=item.created,
                 has_job=job is not None,
                 job_created=job_created,
+                job_acknowledged=job_acknowledged,
                 attempt_started=attempt_started,
                 now=now,
                 stall_minutes=stall_minutes,
@@ -1152,7 +1161,9 @@ def poll_print_status(req: func.HttpRequest) -> func.HttpResponse:
                               "result": "still_running", "jobId": item.job_id,
                               "message": print_policy.still_running_message(
                                   state,
-                                  print_policy.minutes_between(job_created, now),
+                                  print_policy.minutes_between(
+                                      print_policy.stall_clock_start(
+                                          job_acknowledged, job_created), now),
                                   stall_minutes)})
 
         _run_summary(EP_POLL, library=library, folder=folder,

@@ -325,6 +325,12 @@ def job_acknowledged_at(job: Optional[Dict[str, Any]]) -> Optional[str]:
     closest thing printJob has to a print time, and much closer to the paper than
     the moment Poll happened to run. printJob has no completion field; see
     print_policy.completion_time for why this is used anyway.
+
+    IT NOW HAS A SECOND READER. Since R24 it is also the preferred STALL clock --
+    the threshold asks how long the printer has held the job, not how long ago we
+    created it. `print_policy.stall_clock_start` decides when it is usable and
+    falls back to createdDateTime; the two questions are separate and their
+    helpers must stay separate.
     """
     return (job or {}).get("acknowledgedDateTime") or None
 
@@ -332,10 +338,13 @@ def job_acknowledged_at(job: Optional[Dict[str, Any]]) -> Optional[str]:
 def job_created_at(job: Optional[Dict[str, Any]]) -> Optional[str]:
     """printJob.createdDateTime, or None.
 
-    THE STALL CLOCK. Poll measures how long a job has sat without finishing from
-    this, not from anything in SharePoint, because it belongs to the job: nobody
-    editing the library row can reset it, and it survives a requeue by virtue of
-    the replacement being a different job with its own value.
+    THE ATTEMPT CLOCK, AND THE FALLBACK STALL CLOCK. Poll reads how many retries
+    are already spent from this, and measures the stall threshold from it whenever
+    the job carries no usable acknowledgement (R24 moved the preference to
+    acknowledgedDateTime; see print_policy.stall_clock_start). Never from anything
+    in SharePoint, because this belongs to the job: nobody editing the library row
+    can reset it, and it survives a requeue by virtue of the replacement being a
+    different job with its own value.
 
     Costs no extra call -- `get_job` fetches the whole resource with no $select,
     so the field is already in the response. Confirmed present on a live job in

@@ -541,3 +541,66 @@ bench-tested one by construction rather than by luck.
 is a behaviour change. Record capabilities with the share id and a date next to
 them, and re-read them on every swap — an undated capability claim inherited from
 the previous device is the failure mode, not the value itself.
+
+---
+
+## Narrowing a decision rule quietly widened it somewhere else
+
+**What happened (2026-09-07):** R24 was meant to *stop* Poll cancelling jobs that
+Universal Print reports as `pending`. The plan paired it with a second change —
+measuring the stall threshold from `acknowledgedDateTime` instead of
+`createdDateTime` — written as `acknowledged or created`. Both changes were
+reasoned about in terms of the cells they were meant to affect.
+
+Running the real `poll_decision` against the proposed rule over 904 combinations
+(10 job states x 5 creation ages x 5 acknowledgement ages x 4 file ages, absent
+values and the exact threshold included, `stallMinutes` 5 / `giveUpDays` 10)
+showed the draft changing **120 cells, 60 of them the wrong way**: rows Poll
+leaves alone today became cancels. Two shapes did it — an acknowledgement stamped
+*earlier* than the job's own creation (which cancels a job seconds old), and an
+acknowledgement with no creation stamp beside it (which turned the deliberate
+"age unknown, do not guess" abstention into a cancel). A cancel that should not
+happen is a duplicate print, which is the exact failure the change existed to
+prevent.
+
+**Quote a cell count only with the grid that produced it.** The same three options
+measured over a smaller sweep (3 x 3 x 3) score 18/10, 13/5 and 8/0 — the same
+ranking, entirely different numbers. An unqualified count is not a fact about the
+code.
+
+**Cause:** not the code — the reasoning. A decision function was changed by
+thinking about the inputs it was aimed at, and nobody enumerated the inputs it was
+not.
+
+**Fix:** the anchor became "the acknowledgement only when both stamps exist and it
+is not earlier than the creation", which on the same 904-cell sweep scores **60
+changes, all of them `requeue -> none`**, with zero new cancels and zero movement
+on no-job rows, give-up rows, terminal states or retry numbers. A middle option
+(the later of the two stamps) still scored **30 wrong-way cells** there and was
+rejected on that number.
+
+The shipped rule also has a reason it *cannot* introduce a cancel, which the sweep
+only illustrates: `stall_clock_start` never returns an instant earlier than
+`createdDateTime`, so the measured age can only shrink, never grow — and a smaller
+age cannot cross a threshold the larger one did not. 300,000 randomised trials
+across the full legal knob ranges (`stallMinutes` 1-1440, `giveUpDays` 1-365)
+changed 13,119 decisions and every one was cancel -> no-op.
+The two rejected shapes are now pinned by
+`test_an_acknowledgement_older_than_the_job_is_ignored` and
+`test_an_acknowledgement_alone_does_not_create_an_age`.
+
+The check itself is worth repeating verbatim — load the pre-change module from git
+beside the new one and diff every combination:
+
+```python
+old_src = subprocess.run(["git", "show", "HEAD:functionapp/print_policy.py"],
+                         capture_output=True, text=True, encoding="utf-8").stdout
+old = types.ModuleType("old_print_policy")
+exec(compile(old_src, "old_print_policy.py", "exec"), old.__dict__)
+# then itertools.product over every input dimension, comparing old vs new
+```
+
+**Rule:** when a rule that decides whether to take a destructive action changes,
+diff the **whole decision matrix** against the previous implementation, and count
+the cells that move *toward* the destructive action. "Zero new cancels" is a number
+you can check; "it only affects pending jobs" is a belief.

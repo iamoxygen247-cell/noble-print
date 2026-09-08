@@ -481,3 +481,59 @@ def test_a_file_with_no_retry_time_is_treated_as_ready_to_print(graph, frozen_no
     graph.add_item("1")
 
     assert as_json(post(SUBMIT, SUBMIT_BODY))["submitted"] == 1
+
+
+# =============================================================================
+# "Only cancel job when job status in Universal Print is 'processing' and
+#  breached the stall threshold. Do not cancel job when its job status is
+#  'pending' in Universal Print unless it breaches the GiveUpDays."
+#  (R24, agreed 2026-09-07. Scoped with the owner the same day: every
+#   non-terminal state EXCEPT `pending` keeps stalling, because `stopped` is a
+#   jam and `paused`/`unknown` are not documented as dead either.)
+# =============================================================================
+
+
+def test_R24_a_pending_job_is_not_cancelled_however_long_it_waits(graph, frozen_now):
+    """Graph defines `pending` as "the print job is pending processing by the
+    printer" -- the device has not taken it, so nothing is stuck and there is
+    nothing to cancel."""
+    graph.add_item("1", status="PRINT_PENDING", job_id="1825",
+                   printer=graph.SHARE_ID, created=iso(minutes=600))
+    graph.add_job("1825", state="pending", created=iso(minutes=600))
+
+    payload = as_json(post(POLL, POLL_BODY))
+
+    assert graph.cancelled == []
+    assert payload["requeued"] == 0
+    assert graph.status_of("1") == "PRINT_PENDING"
+
+
+def test_R24_a_processing_job_past_the_threshold_is_still_cancelled(graph,
+                                                                    frozen_now):
+    """The other half of the clause: a job the printer IS working on and has not
+    finished is stuck, and the replacement must not print beside it."""
+    graph.add_item("1", status="PRINT_PENDING", job_id="1825",
+                   printer=graph.SHARE_ID, created=iso(minutes=600))
+    graph.add_job("1825", state="processing", created=iso(minutes=600))
+
+    payload = as_json(post(POLL, POLL_BODY))
+
+    assert graph.cancelled == ["1825"]
+    assert payload["requeued"] == 1
+    assert graph.status_of("1") == "PRINT_READY"
+
+
+def test_R24_a_pending_job_past_the_give_up_days_is_cancelled_and_failed(
+        graph, frozen_now):
+    """"unless it breaches the GiveUpDays" -- the exemption is bounded, and the
+    give-up path cancels before it writes, so no abandoned job can print days
+    later against a row that reads PRINT_FAILED."""
+    graph.add_item("1", status="PRINT_PENDING", job_id="1825",
+                   printer=graph.SHARE_ID, created=iso(days=11))
+    graph.add_job("1825", state="pending", created=iso(days=11))
+
+    payload = as_json(post(POLL, POLL_BODY))
+
+    assert payload["gaveUp"] == 1
+    assert graph.cancelled == ["1825"]
+    assert graph.status_of("1") == "PRINT_FAILED"

@@ -70,7 +70,7 @@ the write landed.
 |---|---|---|
 | **Health** | `POST /api/print/health` | Can the pipeline work right now? One share read, **no writes**. Called before the other two |
 | **Submit** | `POST /api/print/submit` | Claims the oldest `PRINT_READY` files **that are due** and creates print jobs |
-| **Poll** | `POST /api/print/status` | Checks `PRINT_PENDING` jobs: marks the finished, requeues the stalled, fails the hopeless |
+| **Poll** | `POST /api/print/status` | Checks `PRINT_PENDING` jobs: marks the finished, requeues the stalled, fails the hopeless. A job the printer has not taken yet is left alone |
 
 Submit and Poll both require the site in the request body —
 `sharepointHostname` and `sharepointSitePath`, alongside `library` and `folder`.
@@ -84,6 +84,13 @@ retry *n* falls due at `5 × (2ⁿ − 1)` minutes from the file's creation, so
 the only bound: the schedule is clamped to it, and past it the row is cancelled
 and written `PRINT_FAILED`. The pacing lives in the Power Automate request body
 (`stallMinutes`, `giveUpDays`) and nowhere else, so it is retuned without a deploy.
+
+**A job the printer has not taken is never "stalled" (R24).** Universal Print's
+`pending` means the device has not started it, so there is nothing stuck to
+cancel — cancelling would kill a document waiting its turn — and `giveUpDays` is
+the only bound on such a row. Every other non-terminal state stalls as before, and
+the threshold measures how long the *printer* has held the job:
+`acknowledgedDateTime` where there is a usable one, otherwise `createdDateTime`.
 
 > **Reading a live run:** the *waiting* is exact, but the front of the ladder is
 > skipped, and it is **Flow A's** recurrence that decides how much — `spent` is

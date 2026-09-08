@@ -49,7 +49,7 @@ DAY = 24 * 60
 
 def stalled(graph, item_id="1", *, job_id="1825", state="stopped",
             file_minutes_old=DAY, attempt_at_minutes=0, job_minutes_old=None,
-            **kwargs):
+            ack_minutes_old=None, **kwargs):
     """A file whose current print job has sat too long to be making progress.
 
     `attempt_at_minutes` is THE FILE'S AGE WHEN THE CURRENT ATTEMPT BEGAN, which
@@ -67,6 +67,11 @@ def stalled(graph, item_id="1", *, job_id="1825", state="stopped",
     and therefore what `Print_Time` a test should expect. A one-day-old file whose
     job was created an hour ago implies eight retries already spent, so the one
     scheduled is the ninth, not the first.
+
+    `ack_minutes_old` is printJob.acknowledgedDateTime -- when the PRINTER took the
+    job, and the stall clock when the job carries one. Absent by default, which is
+    the shape every caller written before 2026-09-07 assumes: the clock then falls
+    back to the job's own createdDateTime and nothing about them changes.
     """
     attempt_ago = file_minutes_old - attempt_at_minutes
     job_ago = attempt_ago if job_minutes_old is None else job_minutes_old
@@ -75,7 +80,9 @@ def stalled(graph, item_id="1", *, job_id="1825", state="stopped",
                    created=iso(minutes=file_minutes_old),
                    modified=iso(minutes=attempt_ago), **kwargs)
     graph.add_job(job_id, state=state, description="Out of paper",
-                  created=iso(minutes=job_ago))
+                  created=iso(minutes=job_ago),
+                  acknowledged=(None if ack_minutes_old is None
+                                else iso(minutes=ack_minutes_old)))
 
 
 # --- completion ---------------------------------------------------------------
@@ -410,12 +417,88 @@ def test_the_cancel_uses_the_printer_named_on_the_row(graph, frozen_now):
 
 @pytest.mark.parametrize("state", ["paused", "unknown", "stopped"])
 def test_every_non_terminal_stalled_state_is_cancelled(graph, frozen_now, state):
-    """None of these is documented as dead, so all of them may still print."""
+    """None of these is documented as dead, so all of them may still print.
+
+    `pending` is deliberately absent -- see the R24 tests below."""
     stalled(graph, state=state)
 
     post(POLL, body())
 
     assert graph.cancelled == ["1825"]
+
+
+# --- a job the printer has NOT taken is not stalled (R24) ---------------------
+
+
+def test_a_pending_job_past_the_threshold_is_not_cancelled(graph, frozen_now):
+    """THE BUG THIS CHANGE FIXES. `pending` means the printer has not started the
+    job. Cancelling it kills a healthy document waiting its turn, and if the
+    device acquired it between the read and the cancel, the original and the
+    replacement both print."""
+    stalled(graph, state="pending", job_minutes_old=60)
+
+    payload = as_json(post(POLL, body()))
+
+    assert graph.cancelled == [], "a queued job must never be cancelled"
+    assert payload["requeued"] == 0
+    assert payload["stillRunning"] == 1
+    assert graph.field("1", "Print_Status") == print_policy.PENDING
+    assert graph.field("1", "Print_JobId") == "1825", \
+        "the job id is the audit trail; a row left alone keeps it"
+    assert not graph.calls_to("/items/1/fields", method="PATCH")
+
+
+def test_a_pending_job_past_the_give_up_deadline_is_cancelled_then_failed(
+        graph, frozen_now):
+    """The exemption is bounded. Past `giveUpDays` the outstanding job is still
+    cancelled FIRST -- otherwise it could print days later against a row that
+    already reads PRINT_FAILED."""
+    stalled(graph, state="pending", file_minutes_old=11 * DAY,
+            job_minutes_old=60)
+
+    payload = as_json(post(POLL, body()))
+
+    assert payload["gaveUp"] == 1
+    assert graph.cancelled == ["1825"], "an abandoned job must not outlive the row"
+    assert graph.field("1", "Print_Status") == print_policy.FAILED
+
+
+def test_a_job_the_printer_only_just_took_is_not_stalled(graph, frozen_now):
+    """The stall clock is how long the PRINTER has held the job, not how long ago
+    we created it. A job queued for three hours and acknowledged a minute ago has
+    been printing for a minute -- measuring from creation would cancel it on the
+    first poll after it finally started."""
+    stalled(graph, state="processing", job_minutes_old=180, ack_minutes_old=1)
+
+    payload = as_json(post(POLL, body()))
+
+    assert graph.cancelled == []
+    assert payload["stillRunning"] == 1
+    assert graph.field("1", "Print_Status") == print_policy.PENDING
+
+
+def test_a_job_the_printer_has_held_too_long_is_still_cancelled(graph, frozen_now):
+    """The other half: an acknowledgement does not make a job immortal."""
+    stalled(graph, state="processing", job_minutes_old=180, ack_minutes_old=30)
+
+    payload = as_json(post(POLL, body()))
+
+    assert graph.cancelled == ["1825"]
+    assert payload["requeued"] == 1
+
+
+def test_the_reported_age_is_the_clock_the_decision_was_made_on(graph, frozen_now):
+    """The response must not describe a row against a different clock from the one
+    that judged it. A message reading `job 180.0 min old (stall 5)` beside a row
+    Poll deliberately left alone reads as a bug in Poll, and the next person spends
+    an afternoon on it."""
+    stalled(graph, state="processing", job_minutes_old=180, ack_minutes_old=1)
+
+    payload = as_json(post(POLL, body()))
+
+    message = result_for(payload, "1")["message"]
+    assert "1.0 min old" in message, message
+    assert "180" not in message, "the creation stamp leaked into the message"
 
 
 def test_a_failed_cancel_still_requeues(graph, frozen_now):

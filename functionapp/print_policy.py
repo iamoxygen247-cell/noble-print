@@ -131,6 +131,21 @@ ALL_JOB_STATES = (
 # States that will never make progress on their own.
 TERMINAL_JOB_STATES = (JOB_COMPLETED, JOB_CANCELED, JOB_ABORTED)
 
+# States that CANNOT be stalled, however old the job is (R24, 2026-09-07).
+#
+# Graph defines `pending` as "The print job is pending processing by the printer":
+# the device has NOT taken the job. Nothing is stuck, so there is nothing to
+# cancel -- and cancelling anyway kills a healthy document that is merely waiting
+# its turn. Worse, if the device acquires it between the read and the cancel, the
+# original and its replacement both print, which is the exact failure rule 2
+# exists to prevent.
+#
+# This is the OPPOSITE of TERMINAL_JOB_STATES and must not be merged with it. A
+# terminal job is finished and gets a terminal status; one of these is alive and
+# gets left alone. The only bound on it is `giveUpDays`, whose check runs BEFORE
+# the stall check in `poll_decision`, so an exemption here can never strand a row.
+NON_STALLING_JOB_STATES = (JOB_PENDING,)
+
 # --- Universal Print PRINTER states -------------------------------------------
 # printerProcessingState, on the SHARE. A DIFFERENT ENUM from the job states
 # above, and the trap is that both spell "stopped".
@@ -175,28 +190,76 @@ def job_is_stalled(state: Optional[str], has_job: bool,
                    job_age_minutes: Optional[float], stall_minutes: int) -> bool:
     """True if this attempt has stopped making progress.
 
-    Two shapes of "stuck" and one deliberate abstention:
+    Two shapes of "stuck" and two deliberate abstentions:
 
     * NO JOB (`has_job` false) -- either a crashed submission, the PRINT_PENDING
       row with an empty Print_JobId that claiming-before-printing deliberately
       creates (rule 1), or a job Universal Print has purged. Nothing is coming;
       stalled immediately, with no age to wait on.
-    * A LIVE JOB past the threshold in a non-terminal state.
+    * A LIVE JOB past the threshold in a state that is neither terminal nor one
+      the printer has yet to start.
+    * A job the printer HAS NOT TAKEN is not stalled, however old it is -- see
+      NON_STALLING_JOB_STATES. `giveUpDays` is its only bound.
     * A live job whose age CANNOT BE DETERMINED is NOT stalled. Universal Print
       returns createdDateTime, but if a job ever arrives without one, guessing
       "stalled" would cancel a job that might be printing right now and queue a
       second copy. Abstaining costs a delayed retry; guessing costs a duplicate.
 
     A terminal state is never stalled -- the caller resolves those first.
+
+    `has_job` IS TESTED BEFORE THE STATE, so a row with no job keeps requeuing
+    immediately -- rule 1's recovery depends on that. Today the order cannot be
+    observed: the route only reads a state when it has a job, so `has_job=False`
+    always arrives with an empty string, and swapping the two checks changes
+    nothing. It is pinned anyway, by
+    `test_a_row_with_no_job_is_stalled_even_if_a_state_says_pending`, against a
+    future where a 404 keeps the job's last known state.
     """
     normalized = (state or "").strip().lower()
     if normalized in TERMINAL_JOB_STATES:
         return False
     if not has_job:
         return True
+    if normalized in NON_STALLING_JOB_STATES:
+        return False
     if job_age_minutes is None:
         return False
     return job_age_minutes >= stall_minutes
+
+
+def stall_clock_start(acknowledged: Optional[datetime],
+                      created: Optional[datetime]) -> Optional[datetime]:
+    """When the stall threshold starts counting.
+
+    With an acknowledgement that is how long the PRINTER has held the job; without
+    one it falls back to how long since WE created it, which is the older, coarser
+    answer. The two differ only for a job that waited before the device took it.
+
+    `acknowledgedDateTime` -- "the dateTimeOffset when the job was acknowledged" --
+    is preferred, because the question the threshold asks is whether the DEVICE is
+    making progress. Measuring from `createdDateTime` instead means a job that
+    queued for three hours is already past a five-minute threshold the instant it
+    starts printing, and gets cancelled on the first poll that sees it working.
+
+    TWO GUARDS, BOTH MEASURED RATHER THAN IMAGINED. Replacing this with
+    `acknowledged or created` turns rows Poll leaves alone today into cancels --
+    a duplicate-print risk introduced while fixing one. The count depends on the
+    sweep you run, so it is recorded with its grid in docs/ai/troubleshooting.md
+    rather than quoted as a bare number here. The two shapes it gets wrong:
+
+      * an acknowledgement EARLIER than the job's own creation is incoherent, and
+        taking it at face value cancels a job that is seconds old;
+      * an acknowledgement with NO creation stamp must not manufacture an age the
+        abstention above deliberately refuses to guess.
+
+    Not to be confused with `completion_time`, which answers "when did this
+    print?" -- it takes the raw string, falls back to OUR observed moment, and
+    always returns an answer. This one may return None, and None means "unknown",
+    which the caller reads as "not stalled".
+    """
+    if acknowledged is not None and created is not None and acknowledged >= created:
+        return acknowledged
+    return created
 
 
 def cancel_confirmed(state_after: Optional[str]) -> bool:
@@ -307,11 +370,18 @@ def poll_decision(state: Optional[str], *,
                   job_created: Optional[datetime],
                   attempt_started: Optional[datetime],
                   now: datetime,
-                  stall_minutes: int, give_up_days: int) -> tuple:
+                  stall_minutes: int, give_up_days: int,
+                  job_acknowledged: Optional[datetime] = None) -> tuple:
     """(action, retry_number) for one PRINT_PENDING row.
 
     `attempt_started` is when the CURRENT attempt began -- the print job's own
     createdDateTime, or the row's lastModifiedDateTime when there is no job.
+
+    `job_acknowledged` is printJob.acknowledgedDateTime, and it moves THE STALL
+    CLOCK ONLY (see `stall_clock_start`). It deliberately does not touch
+    `attempt_started`: how many retries are already spent is the file's age when
+    the JOB was created, because that is what a requeue resets, and reading it off
+    the acknowledgement would misplace the row on the ladder (R16).
 
     THE RETRIES ALREADY SPENT ARE READ OFF THE CLOCK, NOT A COUNTER: they are
     `retries_due` evaluated at the FILE'S AGE WHEN THIS ATTEMPT STARTED. Every
@@ -333,8 +403,10 @@ def poll_decision(state: Optional[str], *,
     3. Past the give-up threshold: stop waiting. The caller cancels whatever is
        outstanding FIRST -- without that, an abandoned job could print days later
        against a row that says PRINT_FAILED.
-    4. Stalled: requeue, and say which retry is being scheduled.
-    5. Anything else -- a healthy job in flight -- is left alone.
+    4. Stalled: requeue, and say which retry is being scheduled. `pending` never
+       qualifies -- the printer has not taken the job, so 3 is its only bound.
+    5. Anything else -- a healthy job in flight, or one merely queued -- is left
+       alone.
 
     THERE IS NO BACKOFF TEST HERE ANY MORE. It used to sit between 4 and 5: a
     stalled job was requeued only once `retries_due(now)` exceeded `spent`, so a
@@ -360,8 +432,8 @@ def poll_decision(state: Optional[str], *,
     if not within_window(file_created, give_up_days, now):
         return POLL_GIVE_UP, spent
 
-    if not job_is_stalled(state, has_job, minutes_between(job_created, now),
-                          stall_minutes):
+    job_age = minutes_between(stall_clock_start(job_acknowledged, job_created), now)
+    if not job_is_stalled(state, has_job, job_age, stall_minutes):
         return POLL_NONE, spent
 
     return POLL_REQUEUE, spent + 1
@@ -835,10 +907,19 @@ def still_running_message(state: Optional[str],
     CANNOT BE DETERMINED is not stalled (see `job_is_stalled`), so its row sits at
     PRINT_PENDING for ever, and it reported the same bare word as a healthy job
     ten seconds old. These now read differently.
+
+    A NON-STALLING STATE GETS ITS OWN SENTENCE, WITHOUT THE THRESHOLD. Quoting
+    "(stall 5)" at a `pending` job would name a deadline that can never fire for
+    it, and someone comparing the age against it would go looking for a bug.
     """
     label = (state or "").strip().lower()
     if not label:
         return "no job"
+    if label in NON_STALLING_JOB_STATES:
+        if job_age_minutes is None:
+            return f"{label} - the printer has not taken it yet"
+        return (f"{label}, queued {job_age_minutes:.1f} min "
+                f"- the printer has not taken it yet")
     if job_age_minutes is None:
         return f"{label}, job age unknown - not stalled"
     return f"{label}, job {job_age_minutes:.1f} min old (stall {stall_minutes})"
