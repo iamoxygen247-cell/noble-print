@@ -16,6 +16,41 @@ cannot be deployed, because they live in the flow's request body.
 
 ---
 
+## Where to run these commands
+
+**Every command in this runbook runs from the repository root** — the folder that
+contains `functionapp\`, `scripts\`, `tests\` and `.venv\`. Set it once, in one
+PowerShell window, and stay there:
+
+```powershell
+$REPO = "C:\Users\georg\dev\Noble Homes\Invoice Extractor\noble-print"   # this machine
+Set-Location $REPO
+```
+
+**The one exception is the publish itself** (§4), which must run from
+`functionapp\` — that block changes directory and returns for you, so you start
+and finish at the root either way.
+
+| Commands | Directory |
+|---|---|
+| `pytest`, `scripts\test.py`, `scripts\verify_print_time.py`, `git` | **repository root** |
+| `func azure functionapp publish` | **`functionapp\`** — §4's block handles it |
+| `az …` | anywhere, but see the note on variables below |
+
+> **Why this is worth a section.** `.\.venv\Scripts\python.exe` and
+> `scripts\test.py` are *relative* paths. Run them from `functionapp\` — where the
+> previous step's `cd` may have left you — and PowerShell answers
+> `'.\.venv\Scripts\python.exe' is not recognized`, which reads like a broken
+> virtual environment and is nothing of the kind. If a command in this file fails
+> that way, check your location before you check anything else.
+
+> **Use one window for the whole release.** `$REPO`, `$RG`, `$APP`, `$HOST_NAME`,
+> `$KEY` and `$BASE` are shell variables, not saved settings. A new window has
+> none of them, and the `az` commands that look location-independent will fail on
+> an empty `$RG` rather than on anything real.
+
+---
+
 ## 0. Does this change need a deploy at all?
 
 | What changed | Where it actually lives | Publish? |
@@ -50,6 +85,8 @@ Three consequences worth having in your head before you start:
 ## 1. Gates — before anything moves
 
 ```powershell
+Set-Location $REPO                          # repository root -- see "Where to run these"
+
 .\.venv\Scripts\python.exe -m pytest        # must be GREEN
 git status                                  # know what you are shipping
 git log --oneline -1                        # the sha that is about to be live
@@ -87,6 +124,7 @@ silently, and a code default is not the live value — the failure that
 [`ai/project-playbook.md`](ai/project-playbook.md) §7.1 exists to prevent.
 
 ```powershell
+# Anywhere, but keep it in the same window -- these two are used through to §6.
 $RG  = "rg-noble-print"
 $APP = "func-noble-print"
 
@@ -171,6 +209,8 @@ away from being retried**, and the only way back is by hand.
 ## 4. Publish
 
 ```powershell
+Set-Location $REPO                          # start at the repository root
+
 .\.venv\Scripts\python.exe -m pytest        # green, again, on what you are shipping
 
 # func shells out to the RAW az.cmd for an ARM token and cannot refresh it over
@@ -178,9 +218,11 @@ away from being retried**, and the only way back is by hand.
 # truststore wrapper first, or publish fails with "Unable to connect to Azure".
 & 'C:\Program Files\Microsoft SDKs\Azure\CLI2\python.exe' -B "$env:LOCALAPPDATA\az-truststore\azrun.py" account get-access-token --output none
 
+# The ONLY step that runs from functionapp\ -- publish packages the folder it is
+# invoked in, which is why tests\, scripts\ and docs\ cannot reach the artifact.
 cd functionapp
 func azure functionapp publish $APP --build remote
-cd ..
+cd ..                                       # back to the root for §5 and §6
 ```
 
 **Publish is idempotent.** Retrying after any failure is always safe, and the two
@@ -277,6 +319,8 @@ release.** A response can look perfect while the write behind it is failing, and
 step 5 is the only thing that catches that.
 
 ```powershell
+Set-Location $REPO      # scripts\test.py is relative -- §4 left you here, but confirm
+
 $SITE  = @("--hostname", "noblehomes.sharepoint.com", "--site-path", "/sites/PM")
 $QUEUE = @("--library", "AI_DropBox_V2026", "--folder", "/Backup/Invoice")
 $SHARE = "5f488e73-ab80-4a6b-a60a-a0f883e17e2e"      # perishable -- see below
@@ -342,6 +386,7 @@ or when the column has been recreated — the offline suite cannot prove the rou
 trip, because `FakeGraph` stores whatever it is handed.
 
 ```powershell
+Set-Location $REPO      # repository root, and $SITE from the block above
 .\.venv\Scripts\python.exe scripts\verify_print_time.py @SITE --library "AI_DropBox_V2026"
 ```
 
@@ -384,6 +429,7 @@ nothing: files sit at `PRINT_READY` and the library *is* the queue, so nothing i
 lost. Diagnose afterwards.
 
 ```powershell
+Set-Location $REPO                                   # repository root
 git checkout <GOOD_SHA>
 cd functionapp; func azure functionapp publish $APP --build remote; cd ..
 ```
@@ -429,6 +475,10 @@ the fix verified.
 ```
 [ ]  0  Confirmed this actually needs a deploy -- not a flow-body or app-setting
         change (three of the most-changed knobs are flow-body only)
+[ ]  -  ONE PowerShell window, sitting at the REPOSITORY ROOT ($REPO). Every
+        command runs from there except the publish, which runs from functionapp\
+        and returns. A relative path failing means the wrong directory, not a
+        broken venv
 [ ]  1  pytest GREEN; committed; sha noted; az reaches Azure; right subscription
 [ ]  1  did NOT run az upgrade
 [ ]  2  New/renamed app settings written BEFORE the code that reads them
