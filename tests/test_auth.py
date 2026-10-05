@@ -2,25 +2,31 @@
 test_auth.py — Tier C: delegated token handling.
 
 Universal Print refuses app-only tokens, so the whole pipeline hangs off one
-refresh token in Key Vault. Two behaviours matter enough to pin:
+refresh token in Key Vault. Three behaviours matter enough to pin:
 
 * the rotated refresh token is written back on EVERY redemption. Entra returns a
   new one each time; failing to persist it means the stored token eventually
-  falls outside its 90-day life and the pipeline stops with no code change to
-  blame.
+  falls outside its 90-day life (sooner, if the MFA inside it ages out first)
+  and the pipeline stops with no code change to blame.
 
 * a dead token produces an error that names the fix. This failure is
   unrecoverable without a human at an interactive sign-in, and it looks identical
   to a dozen other 500s unless the message says so.
+
+* the bootstrap's Key Vault write fails loudly. The runtime's rotation write is
+  best-effort, but scripts/bootstrap_token.py exists only to store a token, so a
+  failed write must stop it rather than print "stored".
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 import sys
 import time
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -170,7 +176,7 @@ def test_a_key_vault_write_failure_does_not_fail_the_request(monkeypatch):
     assert len(calls) == 1
 
 
-def test_the_bootstrap_write_raises_where_the_rotation_write_swallows(monkeypatch):
+def test_the_bootstrap_write_raises_where_the_rotation_write_swallows(monkeypatch, caplog):
     """Same Key Vault write, opposite failure policy. The runtime's rotation must
     not fail a print run over the NEXT token; the bootstrap's whole job is the
     write, so its failure has to surface."""
@@ -181,7 +187,27 @@ def test_the_bootstrap_write_raises_where_the_rotation_write_swallows(monkeypatc
 
     with pytest.raises(RuntimeError, match="vault unreachable"):
         graph_auth.store_refresh_token("refresh-token-v2")
-    graph_auth.write_refresh_token("refresh-token-v2")  # logs a warning, raises nothing
+    with caplog.at_level(logging.WARNING):
+        graph_auth.write_refresh_token("refresh-token-v2")  # raises nothing
+    assert "could not write the rotated refresh token back to Key Vault" in caplog.text
+
+
+def test_the_rotation_write_reaches_the_vault(monkeypatch):
+    """The vault fixture replaces write_refresh_token wholesale, so this is the
+    test that the real one still stores the rotated token."""
+    monkeypatch.delenv("PRINT_REFRESH_TOKEN_SECRET", raising=False)
+    writes = []
+
+    class FakeSecretClient:
+        def set_secret(self, name, value):
+            writes.append((name, value))
+            return SimpleNamespace(properties=SimpleNamespace(version="v2", created_on=None))
+
+    monkeypatch.setattr(graph_auth, "_secret_client", FakeSecretClient)
+
+    graph_auth.write_refresh_token("refresh-token-v2")
+
+    assert writes == [("up-print-refresh-token", "refresh-token-v2")]
 
 
 # --- a dead token names its own fix ------------------------------------------
@@ -247,7 +273,7 @@ def test_the_endpoint_surfaces_the_remedy(graph, monkeypatch):
     assert payload["remedy"] == "run scripts/bootstrap_token.py"
 
 
-# --- the bootstrap --------------------------------------------------------------
+# --- the bootstrap ------------------------------------------------------------
 
 BOOTSTRAP_VAULT = "https://kv-bootstrap.vault.azure.net/"
 
@@ -273,17 +299,16 @@ def bootstrap(monkeypatch):
     and the vault named on the command line, as an operator would."""
     import msal
 
-    # The script pops REQUESTS_CA_BUNDLE when first imported; keep that inside
-    # this test's environment rather than the rest of the session's.
-    if "REQUESTS_CA_BUNDLE" in os.environ:
-        monkeypatch.setenv("REQUESTS_CA_BUNDLE", os.environ["REQUESTS_CA_BUNDLE"])
-    import bootstrap_token
+    # main() and the module's first import write os.environ directly (--vault,
+    # --secret, the REQUESTS_CA_BUNDLE pop); restore all of it afterwards.
+    with mock.patch.dict(os.environ):
+        import bootstrap_token
 
-    monkeypatch.delenv("PRINT_REFRESH_TOKEN_SECRET", raising=False)
-    monkeypatch.setattr(bootstrap_token, "_load_local_settings", lambda: None)
-    monkeypatch.setattr(msal, "PublicClientApplication", FakeDeviceFlowApp)
-    monkeypatch.setattr(sys, "argv", ["bootstrap_token.py", "--vault", BOOTSTRAP_VAULT])
-    return bootstrap_token.main
+        monkeypatch.delenv("PRINT_REFRESH_TOKEN_SECRET", raising=False)
+        monkeypatch.setattr(bootstrap_token, "_load_local_settings", lambda: None)
+        monkeypatch.setattr(msal, "PublicClientApplication", FakeDeviceFlowApp)
+        monkeypatch.setattr(sys, "argv", ["bootstrap_token.py", "--vault", BOOTSTRAP_VAULT])
+        yield bootstrap_token.main
 
 
 def test_the_bootstrap_stops_when_the_vault_write_fails(bootstrap, monkeypatch, capsys):
@@ -301,10 +326,12 @@ def test_the_bootstrap_stops_when_the_vault_write_fails(bootstrap, monkeypatch, 
         bootstrap()
 
     message = str(excinfo.value.code)
+    captured = capsys.readouterr()
     assert "NOTHING WAS WRITTEN" in message
     assert BOOTSTRAP_VAULT in message
     assert "vault unreachable" in message
-    assert "stored refresh token" not in capsys.readouterr().out
+    assert "stored refresh token" not in captured.out
+    assert "refresh-token-new" not in message + captured.out + captured.err
 
 
 def test_the_bootstrap_reports_the_version_it_stored(bootstrap, monkeypatch, capsys):
@@ -322,10 +349,11 @@ def test_the_bootstrap_reports_the_version_it_stored(bootstrap, monkeypatch, cap
 
     assert bootstrap() == 0
     assert writes == [("up-print-refresh-token", "refresh-token-new")]
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
     assert ("stored refresh token in secret 'up-print-refresh-token' at "
-            + BOOTSTRAP_VAULT) in out
-    assert "version v-new" in out
+            + BOOTSTRAP_VAULT) in captured.out
+    assert "version v-new" in captured.out
+    assert "refresh-token-new" not in captured.out + captured.err
 
 
 # --- required configuration ---------------------------------------------------

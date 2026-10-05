@@ -13,10 +13,11 @@ Run it:
   * when first setting up an environment
   * whenever the token stops working. Regular use does not prevent that: the
     MFA inside the token ages out after the tenant's "remember multifactor
-    authentication" days (AADSTS50078, about 30 days after the bootstrap on
-    2026-10-03), and a password change, a self-service password reset, an admin
-    reset or an explicit revocation ends it at once. Password EXPIRY alone will
-    not. The endpoints say so in their 500 body.
+    authentication" days (AADSTS50078; that ended it on 2026-10-03, about 30
+    days after the bootstrap). 90 days without a redemption ends it too, and a
+    password change, a self-service password reset, an admin reset or an
+    explicit revocation ends it at once. Password EXPIRY alone will not. The
+    endpoints say so in their 500 body.
 
     .\\.venv\\Scripts\\python.exe scripts\\bootstrap_token.py
 
@@ -108,7 +109,9 @@ def main() -> int:
     if args.secret:
         os.environ["PRINT_REFRESH_TOKEN_SECRET"] = args.secret
 
-    # A stale local override would be redeemed instead of the fresh sign-in.
+    # The runtime's local-development override. Nothing here reads it and
+    # store_refresh_token ignores it; cleared so it cannot be mistaken for this
+    # sign-in's token.
     os.environ.pop("PRINT_REFRESH_TOKEN", None)
 
     import msal
@@ -156,8 +159,9 @@ def main() -> int:
     except Exception as exc:
         raise SystemExit(
             "could not store the refresh token in secret {!r} at {}: {}: {}\n"
-            "The sign-in worked but NOTHING WAS WRITTEN: the Function App still "
-            "has the old token. Check the vault (--vault), your Azure sign-in "
+            "The sign-in worked, but the Key Vault write did not complete: assume "
+            "NOTHING WAS WRITTEN, so the Function App is still on its previous "
+            "token, if it had one. Check the vault (--vault), your Azure sign-in "
             "(az login) and that you hold Key Vault Secrets Officer on it, then "
             "run this script again.".format(
                 graph_auth.secret_name(), vault, type(exc).__name__, exc))
