@@ -25,7 +25,7 @@ does the same for Flow B. The schedule belongs to the flow, not to the app:
 
 > **No timer trigger exists anywhere in the function app** — both routes are
 > HTTP-triggered. Every row here is a flow edit with nothing to redeploy.
-> — `timing.md:171-172`
+> — `timing.md:174-175`
 
 The ownership table makes it a rule rather than an accident
 (`design.md:127-128`): *"**Power Automate decides when and how often. The
@@ -52,7 +52,7 @@ The reasons that *are* recorded:
 - **The model is batch-and-drain, not per-item.** *"Small synchronous batch
   (default **5**, max 15); the flow loops on `remainingReady`"* (`design.md:47`).
 - **Poll's cadence is a correctness control**, not a preference — a job purged
-  before Poll sees it is reprinted (`timing.md:238-244`; UC-9 at `design.md:902`).
+  before Poll sees it is reprinted (`timing.md:241-251`; UC-9 at `design.md:903`).
 
 ### What is not written down
 
@@ -71,11 +71,11 @@ a flow of its own.**
 > **Three flows.** Each calls the app with the function key in the `code` query
 > parameter. **No flow may ever write the five columns itself** — one writer
 > only, or you get a race you will debug at 2 a.m.
-> — `deploy-to-azure.md:1084-1086`
+> — `deploy-to-azure.md:1093-1095`
 
 | Flow | Recurrence | Calls |
 |---|---|---|
-| **Health** | *(a step inside A and B, not its own flow)* — `deploy-to-azure.md:1090` | `/api/print/health` |
+| **Health** | *(a step inside A and B, not its own flow)* — `deploy-to-azure.md:1099` | `/api/print/health` |
 | **A — Submit** | 15 min | `/api/print/health`, then `/api/print/submit` in a `Do Until` |
 | **B — Poll** | 10 min | `/api/print/health`, then `/api/print/status` |
 | **D — Digest** | Mon 07:00 | SharePoint *Get items* per status; no function code |
@@ -86,7 +86,7 @@ On Health's placement:
 > own. One share read, **no writes**, safe on every tick. The existing `$KEY`
 > authorises it — `functionKeys.default` is a **host-level** key covering every
 > function, so there is nothing new to capture.
-> — `deploy-to-azure.md:1116-1120`
+> — `deploy-to-azure.md:1125-1129`
 
 ### Child flows
 
@@ -100,7 +100,7 @@ repository. There is no position for or against.
 > actionable in the same cycle instead of up to 15 minutes later. They are
 > separate flows on separate timers here, which is fine — this only matters if
 > you merge them.
-> — `deploy-to-azure.md:1140-1143`
+> — `deploy-to-azure.md:1149-1152`
 
 ### The rule no flow may break
 
@@ -119,7 +119,7 @@ repository. There is no position for or against.
 > runbook, do not create it — `POST /api/print/resubmit` returns 404. **Health is
 > not its replacement**: it is a step inside A and B, reads a printer, and writes
 > nothing.
-> — `deploy-to-azure.md:1111-1114`
+> — `deploy-to-azure.md:1120-1123`
 
 ---
 
@@ -135,7 +135,7 @@ repository. There is no position for or against.
 
 The route named "Poll" is `print/status`: "Poll" is its role, `print/status` is
 its path. `POST /api/print/resubmit` **returns 404** and must not be called
-(`deploy-to-azure.md:1113`).
+(`deploy-to-azure.md:1122`).
 
 ### Environments
 
@@ -162,7 +162,7 @@ The literal hostname is recorded nowhere in the repo, deliberately:
 > Flex Consumption apps get a **hashed** default hostname —
 > `<app>.azurewebsites.net` may not resolve. Always read `defaultHostName`. A DNS
 > failure there is not an outage.
-> — `deploy-to-azure.md:991-992`
+> — `deploy-to-azure.md:1000-1001`
 
 So `{BASE}` is derived, not typed (`e2e-testing.md:596-599`):
 
@@ -180,7 +180,7 @@ Portal equivalent: **`func-noble-print` → Overview → Default domain**.
 | Local (`func start`) | `http://localhost:7071` — `e2e-testing.md:15` |
 
 Full form as the flows use it: `{BASE}/api/print/submit?code={KEY}`
-(`deploy-to-azure.md:1244`).
+(`deploy-to-azure.md:1253`).
 
 ### The function key stays a placeholder
 
@@ -193,7 +193,7 @@ $KEY = az functionapp keys list --resource-group rg-noble-print `
 
 > Store the function key in the flow's HTTP action as a **secure input**, never
 > in a description or a comment.
-> — `deploy-to-azure.md:1261-1262`
+> — `deploy-to-azure.md:1270-1271`
 
 ---
 
@@ -213,7 +213,7 @@ All three routes are declared `auth_level=func.AuthLevel.FUNCTION`
   validation, **no** API Management, **no** per-caller identity. The app never
   learns who called it.
 - `functionKeys.default` is a **host-level** key covering every function, so
-  Health needs no key of its own (`deploy-to-azure.md:1118-1120`).
+  Health needs no key of its own (`deploy-to-azure.md:1127-1129`).
 
 **The consequence to understand before handing the key out.**
 `sharepointHostname` and `sharepointSitePath` moved out of app settings and into
@@ -239,9 +239,9 @@ The shape: a human runs `scripts/bootstrap_token.py` once for a device-code
 sign-in as the print service account → the refresh token is stored in Key Vault
 as `up-print-refresh-token` → this module redeems it for access tokens and
 writes the rotated refresh token back. It is a `msal.PublicClientApplication`
-(`graph_auth.py:186`), so there is **no client secret** anywhere.
+(`graph_auth.py:198`), so there is **no client secret** anywhere.
 
-Delegated scopes (`graph_auth.py:68-74`), all five required:
+Delegated scopes (`graph_auth.py:72-78`), all five required:
 `Sites.ReadWrite.All`, `PrintJob.ReadWriteBasic`, `PrintJob.Create`,
 `Printer.Read.All`, `PrinterShare.ReadBasic.All`.
 
@@ -249,8 +249,8 @@ Delegated scopes (`graph_auth.py:68-74`), all five required:
 
 **Managed identity — the only place it is used.**
 `SecretClient(vault_url=key_vault_uri(), credential=DefaultAzureCredential())`
-(`graph_auth.py:126`), with the app's system-assigned identity holding
-**Key Vault Secrets Officer** (`deploy-to-azure.md:619`) because it both reads
+(`graph_auth.py:130`), with the app's system-assigned identity holding
+**Key Vault Secrets Officer** (`deploy-to-azure.md:625`) because it both reads
 and writes the rotated token.
 
 ### Two calls that must carry no Authorization header
@@ -262,15 +262,17 @@ adding a bearer token there *"might result in an HTTP 401"*. Both go through
 
 ### Operational note
 
-The refresh token lasts **90 days of inactivity** and rotates on every use, so a
-regularly-running app never ages out. What kills it: a password change, MFA
-reset, or admin revocation — *"**Password expiry alone does not.**"* When it
-dies, every endpoint 500s with an unambiguous instruction to re-run the bootstrap
-script. And:
+The refresh token lasts **90 days of inactivity** and rotates on every use, but a
+regularly-running app still ages out: every redemption checks that the MFA inside
+the token falls within the tenant's *remember multifactor authentication* days,
+and a redemption adds no MFA. That ended it on 2026-10-03, about 30 days after the
+bootstrap (`AADSTS50078`). A password change or reset, or an admin revocation,
+ends it at once — *"**Password expiry alone does not.**"* When it dies, every
+endpoint 500s with an unambiguous instruction to re-run the bootstrap script. And:
 
 > **Nothing alerts on this** — design §13.8 watches for *silence in the logs*,
 > which reads identically to a quiet week.
-> — `timing.md:235-236`
+> — `timing.md:249-250`
 
 ---
 
@@ -346,7 +348,7 @@ default (`function_app.py:176-183`, `:236-253`).
 - `remainingReady` counts **only due files**. Flow A's `Do Until` tests it, so
   `notYetDue` is deliberately excluded — *"a file waiting on a future Print_Time
   can never be submitted this cycle, so counting it there would spin the loop to
-  its iteration cap every recurrence"* (`design.md:518-523`).
+  its iteration cap every recurrence"* (`design.md:519-524`).
 - A `submitted` item may additionally carry a **`warning`** key. That is
   `CLAUDE.md` rule 1's unrecorded-job-id case: the paper is on its way but
   `Print_JobId` could not be written, so a duplicate is coming
@@ -442,7 +444,7 @@ Notes on that block, because two values are easy to get wrong:
   `scaling: fit` is load-bearing, not cosmetic.
 - `resolvedColumns` shows whatever SharePoint actually assigned. The encoded form
   is the expected case but is *"Plausible, unverified for your tenant"*
-  (`design.md:238-241`) — never hardcode it.
+  (`design.md:239-242`) — never hardcode it.
 - Datetimes are serialised with `json.dumps(..., default=str)`, hence the
   space-separated `2026-09-04 08:31:07+00:00` form rather than ISO `T`.
 - `jobConfiguration` for the **passthrough** profile is just `{"copies": 1}`
@@ -474,7 +476,7 @@ Notes on that block, because two values are easy to get wrong:
 | `printerShareId` | no | *each row's `Printer_Name`* | **hard override — read §5.4 first** |
 
 A leftover `maxRetries` key is accepted and silently ignored, *"which is what
-lets the code deploy before the flows are edited"* (`deploy-to-azure.md:1201-1203`).
+lets the code deploy before the flows are edited"* (`deploy-to-azure.md:1210-1212`).
 
 **200** (`function_app.py:1173-1195`) — all seven `result` values shown together
 for reference; a real run returns one entry per pending row.
@@ -665,14 +667,14 @@ job lookup and every cancel in the run addresses that share instead of the
 > the cancel both 404, the 404 reads as "already gone", the row is requeued
 > anyway, and the original prints **beside its replacement**. This is defect
 > **F3-R** in `docs/ai/open-defects.md`, reopened deliberately.
-> — `deploy-to-azure.md:1219-1224`
+> — `deploy-to-azure.md:1228-1233`
 
 Exposure is **zero with one printer registered** — the override equals
 `Printer_Name` on every row. The containment is the counter:
-**`printerOverridden` must be 0** (`deploy-to-azure.md:1226`).
+**`printerOverridden` must be 0** (`deploy-to-azure.md:1235`).
 
 ⚠️ **The repo disagrees with itself about whether Flow B should send this key.**
-`design.md:177-178` includes it in Flow B's body; `deploy-to-azure.md:1090` omits
+`design.md:177-178` includes it in Flow B's body; `deploy-to-azure.md:1099` omits
 it and `:1219-1224` says to leave it out. See the appendix.
 
 ### 5.5 Errors, all three endpoints
@@ -697,19 +699,19 @@ Anything else is `{"error": "TypeName: message"}` with no remedy.
 
 ### 5.6 One caveat before pasting Flow A's body
 
-`deploy-to-azure.md:1090` gives Flow A's body without `printFormat`, and warns
+`deploy-to-azure.md:1099` gives Flow A's body without `printFormat`, and warns
 that this is only correct on a raster-only printer:
 
 > **Flow A's body above omits `printFormat`, and that is only correct on a
 > raster-only printer.** … If Health's `content` shows this printer also accepts
 > `application/pdf`, add `"printFormat":"image/pwg-raster"` — otherwise Flow A
 > silently runs passthrough.
-> — `deploy-to-azure.md:1095-1099`
+> — `deploy-to-azure.md:1104-1108`
 
 And which kind of printer this is, is **not settled in the repo** — see the
 appendix. Sending `"application/pdf"` to a raster-only printer is *"a **400 on
 every recurrence**, so the flow fails continuously and prints nothing"*
-(`deploy-to-azure.md:1174-1176`).
+(`deploy-to-azure.md:1183-1185`).
 
 ---
 
@@ -739,7 +741,7 @@ What the returned values *are* for:
 
 **`jobId` is per-printer, not globally unique.** From `CLAUDE.md`: *"Job ids are
 **per-printer**, not globally unique. `Print_JobId` is only meaningful together
-with `Printer_Name`."* `design.md:1185-1186` says the same of the log lines:
+with `Printer_Name`."* `design.md:1186-1187` says the same of the log lines:
 *"`item` + (`printer`,`job`) are the correlation keys — remember job ids are only
 unique per printer."* A bare job id identifies nothing.
 
@@ -771,11 +773,11 @@ A fifth value exists in the live library and is **out of scope**:
 > this codebase — something upstream writes it. That is harmless, and arguably
 > useful: no route queries that value, so those files are inert and can never be
 > picked up. Do not "add support" for it.
-> — `deploy-to-azure.md:340-344`
+> — `deploy-to-azure.md:346-350`
 
 **A `PRINT_PENDING` row with an empty `Print_JobId` is normal, not an error.** It
 is a crashed submission — the deliberate cost of claiming before printing — and
-Poll requeues it (`CLAUDE.md` rule 1; UC-6 at `design.md:899`).
+Poll requeues it (`CLAUDE.md` rule 1; UC-6 at `design.md:900`).
 
 ### 7.2 `printJobStatus.state` — Universal Print's own job states
 
@@ -831,7 +833,7 @@ Seven values: `completed` · `failed_terminal` · `requeued` · `gave_up` ·
 ### 7.5 `result` in the log — a different, closed set
 
 Nine values, and **`still_running` is deliberately absent**
-(`design.md:1175-1183`):
+(`design.md:1176-1184`):
 
 `submitted` · `failed` · `skipped` · `completed` · `failed_terminal` ·
 `requeued` · `gave_up` · `not_found` · `cancelled`
@@ -854,7 +856,7 @@ to a Submit call. It runs every 10 minutes, reads every `PRINT_PENDING` row in
 the folder, and acts on each. Submit and Poll never share a run.
 
 The only loop in the flows is Flow A's, and it does **not** loop on completion —
-it loops to drain a batch of 5 (`deploy-to-azure.md:1239-1247`):
+it loops to drain a batch of 5 (`deploy-to-azure.md:1248-1256`):
 
 ```
 Recurrence
@@ -868,7 +870,7 @@ Recurrence
 > accepting jobs the run is a perfectly healthy `200` with `failed = 0`, so every
 > other test passes and the flow says nothing. That flag is the only thing in the
 > response that distinguishes "nothing to print" from "nothing *can* print".
-> — `deploy-to-azure.md:1249-1252`
+> — `deploy-to-azure.md:1258-1261`
 
 ### Maximum duration for one document
 
@@ -878,11 +880,11 @@ Recurrence
 > limit. `maxRetries` used to bound the *work* separately … but the retry count
 > is derived from the file's age anyway, so a count and a deadline were two
 > answers to one question.
-> — `design.md:687-691`
+> — `design.md:688-692`
 
 Retry `n` falls due at file age `stallMinutes × (2ⁿ − 1)` — 5, 15, 35, 75 minutes
 and so on, doubling; retry 11 lands at 7.11 days and retry 12 would be 14.22 days,
-**clamped to the deadline** (`design.md:691-692`). The waiting happens in Submit
+**clamped to the deadline** (`design.md:692-693`). The waiting happens in Submit
 against `Print_Time`, not in Poll.
 
 ### The interval — and the number nobody has
@@ -895,17 +897,17 @@ Flow B's 10 minutes is currently **a guess**, and the repo says so plainly.
 > the document — printing it twice. The mitigation is entirely the cadence, and
 > the cadence should be set from the measurement in **[7]**, which has not been
 > taken.
-> — `timing.md:238-243`
+> — `timing.md:241-250`
 
 **`NOT DECIDED IN THIS REPO`** — the correct interval. Universal Print job
-retention is `timing.md:191`'s *"🔴 **UNKNOWN — never measured**"* and is ranked
+retention is `timing.md:194`'s *"🔴 **UNKNOWN — never measured**"* and is ranked
 the project's #1 risk. `live-test.md:184-188` is blunt:
 
 > Until then Flow B's ten-minute cadence is a **guess** — a safe-looking one, but
 > UC-9's duplicate print is exactly what an unlucky guess costs.
 
 To settle it, poll a printed job daily on the **printer** route until it 404s
-(`timing.md:245-250`); `live-test.md:179-183` holds an empty table for the
+(`timing.md:252-257`); `live-test.md:179-183` holds an empty table for the
 readings.
 
 ### A cadence consequence worth knowing
@@ -913,7 +915,7 @@ readings.
 The cadence that costs retries is **Flow A's**, not Flow B's. Flow B at 10 min
 and at 1 min produce identical retry sequences because `Print_Time` pins the
 instant. But the retry count is derived from the file's age when its *first* job
-is created, so (`design.md:671-681`, `deploy-to-azure.md:1101-1109`):
+is created, so (`design.md:672-682`, `deploy-to-azure.md:1110-1118`):
 
 | Flow A recurrence | Schedule opens at |
 |---|---|
@@ -939,22 +941,22 @@ Flow A:  health  →  Condition healthy == false  →  notify, TERMINATE
 Flow B:  health  →  Condition healthy == false  →  notify, but CONTINUE
                  →  poll anyway
 ```
-— `deploy-to-azure.md:1123-1130`
+— `deploy-to-azure.md:1132-1139`
 
 > **Flow A gates; Flow B does not.** Poll marks completions, appends retry
 > history and gives up on rows past `giveUpDays` — none of which needs a working
 > printer. Skipping Poll during an outage means rows reach no terminal status for
 > exactly as long as the outage lasts, which is when recovery matters most.
-> — `deploy-to-azure.md:1132-1136`
+> — `deploy-to-azure.md:1141-1145`
 
 ### Read `healthy`, not the status code
 
 > A sick printer is a **200 with `healthy: false`**, never a non-2xx, so the HTTP
 > action succeeds and the flow keeps control of the branch. Read `healthy`;
 > `errors[].code` says which of the ten conditions fired.
-> — `deploy-to-azure.md:1137-1138`
+> — `deploy-to-azure.md:1146-1147`
 
-The reasoning (`design.md:776-780`): Power Automate marks a non-2xx HTTP action
+The reasoning (`design.md:777-781`): Power Automate marks a non-2xx HTTP action
 as *failed*, which halts the branch unless every downstream action carries a
 run-after override — *"and the body, which is the whole diagnosis, becomes
 awkward to read exactly when it matters."*
@@ -963,13 +965,13 @@ awkward to read exactly when it matters."*
 ever means "the printer is sick".
 
 `healthy`, `errors` and `warnings` are present on **every** 200, so a flow
-condition needs no null check (`design.md:782-783` — the S3 lesson).
+condition needs no null check (`design.md:783-784` — the S3 lesson).
 
 ### The codes a condition may key on
 
 A **closed, stable vocabulary** — *"a flow condition and a KQL query both key on
 them, so renaming one is a breaking change no Python would catch"*
-(`design.md:789-791`). `print_policy.ALL_HEALTH_CODES` is the list.
+(`design.md:790-792`). `print_policy.ALL_HEALTH_CODES` is the list.
 
 | Errors → `healthy: false` | Warnings → still healthy |
 |---|---|
@@ -977,7 +979,7 @@ them, so renaming one is a breaking change no Python would catch"*
 
 Health accumulates **every** finding rather than stopping at the first, *"or a
 flow learns one problem per cycle and takes an hour to hear six"*
-(`design.md:770-771`).
+(`design.md:771-772`).
 
 ### Why Health exists at all
 
@@ -1007,7 +1009,7 @@ Two different layers, and the repo decides only one of them.
 > **6.2 Retry and throttling.** Retry `429/503/504` honouring `Retry-After`; max
 > 3; exponential backoff with jitter. Never other 4xx. **The create-job `POST` is
 > attempted once** — a retry risks a duplicate job.
-> — `design.md:818-820`
+> — `design.md:819-821`
 
 Calls explicitly **not** retried, via `retry=False`: creating a print job
 (`universal_print.py:155`, `:170`) and cancelling one (`:372`). The
@@ -1016,7 +1018,7 @@ unauthenticated document download **is** retried, because a GET is idempotent an
 local TLS interception killed two of three attempts.
 
 A known hole worth knowing before touching these numbers
-(`timing.md:215-228`):
+(`timing.md:218-231`):
 
 ```
    3 attempts × 30 s socket timeout   =   90 s
@@ -1036,19 +1038,19 @@ recommendation here to quote.
 
 What the repo *does* establish, which bears on the decision:
 
-- **The timeout chain** (`timing.md:36-44`), each layer undercutting the next:
+- **The timeout chain** (`timing.md:38-46`), each layer undercutting the next:
   `GRAPH_TIMEOUT_SECONDS` 30 s < `PRINT_BUDGET_SECONDS` 90 s < Power Automate
   HTTP ~120 s (fixed, Azure's) < `functionTimeout` 30 min. *"The 120 s row is the
   only one we cannot move, so it is the one everything else is sized against."*
 - **A timed-out call is invisible, not failed.** *"A connector that has given up
   never receives the response, so Flow A neither loops on `remainingReady` nor
   fires its notify condition. The run is not reported as failed — it is not
-  reported at all."* (`timing.md:200-202`)
-- **Concurrent runs are safe by design.** UC-7 (`design.md:900`): *"Flow A
+  reported at all."* (`timing.md:203-205`)
+- **Concurrent runs are safe by design.** UC-7 (`design.md:901`): *"Flow A
   schedules overlap; two runs start together. Both pick the same files; `If-Match`
   means exactly one wins per file, the loser records `skipped`. **No file printed
   twice.**"*
-- **A 400 claims nothing.** UC-11 (`design.md:904`): *"400 with a specific message
+- **A 400 claims nothing.** UC-11 (`design.md:905`): *"400 with a specific message
   and **zero** SharePoint writes, so the corrected retry is not locked out."*
 - **Health writes nothing**, so it is *"safe to call as often as a flow likes"*
   (`function_app.py:1254-1257`).
@@ -1070,12 +1072,12 @@ Function App.** No flow may write them.
 
 `Print_Status` **must be indexed** — a non-indexed column cannot be used in a
 Graph `$filter` at all, so without it every query fails. Internal names are
-resolved at runtime and must never be hardcoded (`design.md:814-816`).
+resolved at runtime and must never be hardcoded (`design.md:815-817`).
 
 ### The write matrix — the complete contract
 
-Reproduced from `design.md:384-396`. `—` means the column is not touched. *"This
-table **is** the Tier C test suite: one assertion per row."* (`design.md:398`)
+Reproduced from `design.md:385-397`. `—` means the column is not touched. *"This
+table **is** the Tier C test suite: one assertion per row."* (`design.md:399`)
 
 | Event | `Print_Status` | `Printer_Name` | `Print_JobId` | `Print_Message` | `Print_Time` |
 |---|---|---|---|---|---|
@@ -1105,7 +1107,7 @@ purpose:
 > already answers exactly, and what Power Automate can already read with a
 > connector action. Adding an endpoint would create a second way to ask the same
 > question, with its own bugs and tests.
-> — `design.md:1307-1311`
+> — `design.md:1308-1312`
 
 ### The two-store split
 
@@ -1114,7 +1116,7 @@ purpose:
 | *"What is the state **right now**?"* | **SharePoint** — the five columns *are* the state |
 | *"What **happened** over time?"* | **Application Insights** — the columns hold only the latest state; *"A file retried three times looks identical to one retried once"* |
 
-— `design.md:1120-1126`
+— `design.md:1121-1127`
 
 ---
 
@@ -1132,17 +1134,17 @@ without opening any tooling.
 One thing deliberately **not** written there: a lingering cancel. *"A lingering
 job — the cancel accepted but the job still reporting a live state — is reported
 as a `warning` on the run's response item and an `ERROR` log line, **not** in
-`Print_Message`"* (`design.md:413-417`), because the message states fact and a
+`Print_Message`"* (`design.md:414-418`), because the message states fact and a
 lingering state is a snapshot that may resolve a second later.
 
 ### 12.2 In Application Insights — two log lines
 
-**Sampling must stay disabled in `host.json`** (`design.md:1188-1196`) — adaptive
+**Sampling must stay disabled in `host.json`** (`design.md:1189-1197`) — adaptive
 sampling silently drops `traces` rows, which would make every count quietly
 wrong with no error anywhere.
 
 Free-text fields go **last** so the KQL `parse` stays unambiguous
-(`design.md:1157-1167`):
+(`design.md:1158-1168`):
 
 ```
 RUN_SUMMARY  ep=submit lib=Documents printer=<shareId> found=23 ok=4 failed=1
@@ -1155,16 +1157,16 @@ PRINT_EVENT  ep=submit item=42 from=PRINT_READY to=PRINT_PENDING job=1825
 Changing a field name or its position breaks the workbook silently. On
 `ep=health`, `RUN_SUMMARY` reuses existing fields rather than adding any: `ok` is
 `1`/`0` for healthy, `failed` is the error count, `skipped` the warning count,
-and `lib`/`folder`/`found`/`remaining` are sentinels (`design.md:1141-1148`).
+and `lib`/`folder`/`found`/`remaining` are sentinels (`design.md:1142-1149`).
 **Health emits no `PRINT_EVENT`** — it touches no files.
 
-The query pack is `design.md:1198-1274`; query 6 answers *"did the schedule
-stop?"*, and the workbook build is `design.md:1276-1290`.
+The query pack is `design.md:1199-1275`; query 6 answers *"did the schedule
+stop?"*, and the workbook build is `design.md:1277-1291`.
 
 ### 12.3 Azure Monitor alerts
 
 Four rules, all pointed at **one action group with an email target**
-(`design.md:1313-1323`):
+(`design.md:1314-1324`):
 
 | Name | Scope | Condition | Sev | Catches |
 |---|---|---|---|---|
@@ -1175,11 +1177,11 @@ Four rules, all pointed at **one action group with an email target**
 
 The runbook's minimum is the **silence** alert, *"because a stopped flow produces
 no errors at all, so it is the one failure with no other signal"*
-(`deploy-to-azure.md:1268-1278`).
+(`deploy-to-azure.md:1277-1287`).
 
 Also available and often forgotten: **Power Automate run history** holds each
 flow run and its retries for 28 days — the store that answers *"did the schedule
-actually fire?"* (`design.md:1133`).
+actually fire?"* (`design.md:1134`).
 
 ### 12.4 The in-flow notify conditions — what must fire
 
@@ -1191,19 +1193,19 @@ These *are* specified, verbatim:
 | A | `failed > 0 OR status != 200 OR printerAvailable == false` → notify | `design.md:166` |
 | B | `healthy == false` → notify, but **CONTINUE** | `design.md:173` |
 | B | `status != 200` → notify | `design.md:179` |
-| B | `printerOverridden > 0` → notify (F3-R) | `design.md:180`, `deploy-to-azure.md:1233` |
+| B | `printerOverridden > 0` → notify (F3-R) | `design.md:180`, `deploy-to-azure.md:1242` |
 
 For the last one, the WARNING in the log is graded and worth reading: a
 disagreeing row **with** an outstanding job names F3 and can genuinely print
 twice; one **without** a job is only a configuration mismatch
-(`deploy-to-azure.md:1226-1230`).
+(`deploy-to-azure.md:1235-1239`).
 
 ### 12.5 Who receives them
 
 **`NOT DECIDED IN THIS REPO`.** Every flow sketch ends with the word `notify` and
 no document names a connector, a recipient, or a message template. Teams appears
 nowhere in the repository. The only channel named anywhere is the Azure Monitor
-action group's **email** target (`design.md:1322`), which covers the four alert
+action group's **email** target (`design.md:1323`), which covers the four alert
 rules above — not the in-flow conditions.
 
 The conditions in §12.4 are settled; the routing is an open decision.
@@ -1216,7 +1218,7 @@ The conditions in §12.4 are settled; the routing is an open decision.
 |---|---|---|
 | Notification channel and recipient for the in-flow `notify` steps | `NOT DECIDED IN THIS REPO` | The flows, plus a line in `design.md` §3 |
 | Power Automate HTTP action retry policy, async pattern, per-action timeout | `NOT DECIDED IN THIS REPO` | The flows, plus `timing.md` §6 |
-| Universal Print job retention — and therefore Flow B's cadence | **Unmeasured.** `timing.md:191` marks it 🔴 *"UNKNOWN — never measured"* and ranks it risk #1 | Measure per `timing.md:245-250`; log in `live-test.md:179-183` |
+| Universal Print job retention — and therefore Flow B's cadence | **Unmeasured.** `timing.md:194` marks it 🔴 *"UNKNOWN — never measured"* and ranks it risk #1 | Measure per `timing.md:252-257`; log in `live-test.md:179-183` |
 | Whether the current printer accepts `application/pdf`, deciding whether Flow A needs `printFormat` | Unresolved — see Appendix B | A live read: `.\scripts\live-printer-check.ps1 -DiagnoseOnly` |
 | The deployed app's literal hostname | Not recorded, by design (hashed for Flex Consumption) | `az functionapp show … --query defaultHostName` |
 
@@ -1228,8 +1230,8 @@ Three places. None is adjudicated here; each needs a decision or a live read.
 
 | Says include it | Says leave it out |
 |---|---|
-| `design.md:177-178` — the Flow B sketch has `"printerShareId":"<guid>"` in the body | `deploy-to-azure.md:1090` — the flow table omits it entirely |
-| | `deploy-to-azure.md:1219-1224` — *"**Leave it out unless you want that rescue.**"* |
+| `design.md:177-178` — the Flow B sketch has `"printerShareId":"<guid>"` in the body | `deploy-to-azure.md:1099` — the flow table omits it entirely |
+| | `deploy-to-azure.md:1228-1233` — *"**Leave it out unless you want that rescue.**"* |
 
 This is not cosmetic: the key is the precondition for defect F3-R, where the
 original job *"prints beside its replacement"*. Exposure is zero with one printer
@@ -1252,11 +1254,11 @@ dual-format printer, omitting it silently runs `passthrough` — a pipeline noth
 has bench-tested. On a raster-only printer, sending `application/pdf` is a 400 on
 every recurrence.
 
-**3. Stale text naming a retired flow.** UC-12 at `design.md:905` still ends
+**3. Stale text naming a retired flow.** UC-12 at `design.md:906` still ends
 *"Flow C's notification fires"*, although `design.md:186-187` retires Flow C and
-`deploy-to-azure.md:1111` says calling it returns 404. The failure it describes —
+`deploy-to-azure.md:1120` says calling it returns 404. The failure it describes —
 a revoked refresh token — is real; the flow that would notice it no longer
-exists, and nothing replaced that notification (`timing.md:235-236`).
+exists, and nothing replaced that notification (`timing.md:238-239`).
 
 ---
 

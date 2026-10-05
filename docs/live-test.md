@@ -332,7 +332,7 @@ exactly that reason.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| 500, `remedy: run scripts/bootstrap_token.py` | Refresh token expired or revoked | Re-run the bootstrap |
+| 500, `remedy: run scripts/bootstrap_token.py` | Refresh token revoked, idle for 90 days, or the MFA inside it aged out (`AADSTS50078`) | Re-run the bootstrap |
 | 500 naming a column | Display name mismatch in the library | Fix the column name, or tell me the real ones |
 | Every query fails / times out | `Print_Status` is not indexed | Add the index |
 | `candidatesFound: 0` but files are there | Folder path or status value mismatch | Check `dryrun`'s resolved folder; confirm the status text is exactly `PRINT_READY` |

@@ -231,6 +231,7 @@ Read from Microsoft's documentation, not recalled.
 | "Refresh tokens replace themselves… **the platform doesn't revoke old refresh tokens** when used to fetch new access tokens." | same |
 | Refresh tokens are **not tied to a resource** — one token covers print *and* Sites scopes. | same |
 | Revoked by password change, SSPR, admin reset, explicit revocation. Password *expiry* alone does not. | same |
+| With per-user MFA's *remember multifactor authentication* on, "When a refresh token is validated, Microsoft Entra ID checks that the last multifactor authentication occurred within the specified number of days." A redemption adds no MFA, so regular use does not extend this. It ended the token on 2026-10-03 (`AADSTS50078`), about 30 days after the bootstrap. | [MFA settings](https://learn.microsoft.com/en-us/entra/identity/authentication/howto-mfa-mfasettings) |
 | `Key Vault Secrets User` = read only; **`Key Vault Secrets Officer`** = any secret action incl. `set` → Officer required, because rotation writes back. | [Key Vault RBAC](https://learn.microsoft.com/en-us/azure/key-vault/general/rbac-guide) |
 | **Application Insights tables keep data 90 days at no charge** (`AppTraces`, `AppRequests`, `AppExceptions`, …); extendable to 730 days at cost. 90 days ≈ 13 weeks of weekly reporting, free. | [Data retention](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/data-retention-configure) |
 
@@ -939,7 +940,7 @@ kind of configuration: setting it appeared to work and did nothing (S4).
 | **UC-9** | Job completes but Universal Print purges it before Poll runs. | Poll gets 404, reads it as stalled and requeues → **prints twice.** Unchanged in likelihood — the risk is set by Poll's 10-minute cadence against the retention window (§3) — but the reprint now lands in minutes, not days. |
 | **UC-10** | `PRINT_PENDING`, 25 days old. | **FIXED.** Past `giveUpDays` Poll cancels the outstanding job and writes `PRINT_FAILED` with a reason. Nothing strands (**G1** closed). |
 | **UC-11** | Malformed request. | 400 with a specific message and **zero** SharePoint writes, so the corrected retry is not locked out. |
-| **UC-12** | Refresh token revoked (service account password reset). | Every endpoint 500s with an unambiguous "re-run `scripts/bootstrap_token.py`"; no partial writes; Flow C's notification fires. |
+| **UC-12** | Refresh token revoked (service account password reset), or the MFA inside it aged out (`AADSTS50078`, 2026-10-03). | Every endpoint 500s with an unambiguous "re-run `scripts/bootstrap_token.py`"; no partial writes; Flow C's notification fires. |
 | **UC-13** | "How many printed last week?" | §13.5 query 2, or the workbook's weekly chart. |
 
 ---

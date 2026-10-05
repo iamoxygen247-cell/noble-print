@@ -624,7 +624,7 @@ or cold start. See `README.md`, "What a local run cannot prove".
 | `invalid choice: 'resubmit'` / `'stale'` | Both are gone. Recovery is Poll's now — see Part C |
 | `could not reach http://localhost:7071` | `start-local.ps1` is not running, or it failed to start. Check the first window |
 | `HTTP 401` (deployed only) | Missing or wrong `--key` |
-| `remedy: run scripts/bootstrap_token.py` | The delegated refresh token is dead. A password change or reset revokes it; expiry alone does not |
+| `remedy: run scripts/bootstrap_token.py` | The delegated refresh token is dead. The MFA inside it ages out after the tenant's *remember multifactor authentication* days however often it is used (`AADSTS50078`); a password change or reset revokes it; password expiry alone does not |
 | `remedy: add the missing column(s)` | One of the five columns is missing or renamed — `Print_Time` is the newest, and the likeliest |
 | Every query fails | `Print_Status` is not indexed. A non-indexed column cannot be used in a Graph `$filter` at all |
 | `printerAvailable: false` | The printer is not accepting jobs. HTTP 200 with `failed=0`, so only that flag reveals it |

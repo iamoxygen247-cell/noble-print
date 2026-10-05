@@ -604,3 +604,66 @@ exec(compile(old_src, "old_print_policy.py", "exec"), old.__dict__)
 diff the **whole decision matrix** against the previous implementation, and count
 the cells that move *toward* the destructive action. "Zero new cancels" is a number
 you can check; "it only affects pending jobs" is a belief.
+
+---
+
+## `the stored refresh token is no longer valid (invalid_grant)`: `AADSTS50078`, 30 days after the bootstrap
+
+**What happened (2026-10-03):** Health started answering `AUTH_BOOTSTRAP_REQUIRED`
+at 21:00 local, and the flow cancelled every run from then on; the 18:00 run had
+succeeded. The token had been redeemed every 1–3 hours since the bootstrap (667
+Key Vault versions), so age did not look like a risk. Entra's non-interactive
+sign-in log for the 21:00 redemption, and for every one after it:
+
+| Field | Value |
+|---|---|
+| `status.errorCode` | `50078`: "Presented multi-factor authentication has expired due to policies configured by your administrator, you must refresh your multi-factor authentication…" |
+| `authenticationRequirementPolicies` | *Per-user MFA* |
+| `sessionLifetimePolicies` | *Remember MFA* (`rememberMultifactorAuthenticationOnTrustedDevices`) |
+| `conditionalAccessStatus` | `notApplied` |
+
+The secret's first version was written at 2026-09-04 03:18:05Z. The last success
+came 29 d 21 h 42 m later and the first failure 30 d 0 h 42 m later. The Entra
+audit log showed no change to the account or to any policy in between. Health
+does not log the error text, so none of this was in App Insights; it came from
+the sign-in log.
+
+**Cause:** not the refresh token's lifetime and not a revocation, but the age of
+the MFA inside it. Microsoft documents the check: "When a refresh token is
+validated, Microsoft Entra ID checks that the last multifactor authentication
+occurred within the specified number of days", the number being per-user MFA's
+tenant-wide *remember multifactor authentication* setting. A redemption is
+non-interactive and adds no MFA, so rotating the token every few hours never reset
+that clock. The timing fits a 30-day setting (*inferred*: the setting itself had
+not been read). No doc in the repo mentioned an MFA-age limit, and two said a
+regularly running app "never ages out". The token had also been minted for an
+administrator's own account rather than the print service account the runbook
+asks for. That did not cause this: a service account under the same per-user MFA
+would expire the same way.
+
+**Fix:** a new interactive sign-in with MFA, as in
+[access-and-refresh-tokens.md §4.1](../access-and-refresh-tokens.md#41-running-it).
+On the dev PC that needs two lines first, both measured on 2026-10-04:
+
+```powershell
+$env:PYTHONPATH = "$env:LOCALAPPDATA\az-truststore"             # without it: SSLError on login.microsoftonline.com; with it: 200
+$env:PATH = "$env:LOCALAPPDATA\az-truststore\shim;$env:PATH"    # the vault write's az.cmd then resolves to the truststore shim
+.\.venv\Scripts\python.exe scripts\bootstrap_token.py --vault https://kv-noble-print.vault.azure.net/
+```
+
+`--vault` is needed because `functionapp/local.settings.json` still held the
+template's placeholder `KEY_VAULT_URI`. Found and fixed at the same time: the
+script used the runtime's best-effort write, so a failed write would still have
+printed "stored refresh token". It now stops with an error
+(`graph_auth.store_refresh_token`, pinned by
+`test_the_bootstrap_stops_when_the_vault_write_fails`).
+
+**Not yet verified:** when this entry was written, the re-bootstrap had not been
+run. Confirm it with a new Key Vault version and then Health `healthy: true`, and
+update this line.
+
+**Rule:** "rotates on every use" is not "never expires". A delegated refresh
+token lasts only until the strictest check Entra applies at redemption, and the
+age of the MFA inside it is one that no amount of use renews. Read that limit
+(the remember-MFA days, or a Conditional Access sign-in frequency) and diarise the
+next sign-in before it runs out.

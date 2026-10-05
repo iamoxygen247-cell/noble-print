@@ -124,15 +124,17 @@ What [`bootstrap_token.py`](../scripts/bootstrap_token.py) does, in order:
 
 1. Copies the non-empty `Values` from `functionapp/local.settings.json` into the
    environment, **skipping keys that are already set**.
-2. Applies `--vault` / `--secret`, then removes `PRINT_REFRESH_TOKEN`. While that
-   variable is set, `write_refresh_token` skips the Key Vault write without a
-   warning, and the local settings file may set it.
+2. Applies `--vault` / `--secret`, then removes `PRINT_REFRESH_TOKEN`, a
+   local-development override that the local settings file may set and that has
+   no part in a bootstrap.
 3. Starts an MSAL **device-code** flow for `graph_auth.SCOPES` and prints a code
    to enter at the device-login page.
 4. Writes the refresh token (from the result, or from MSAL's cache) to Key Vault
-   with `graph_auth.write_refresh_token`. The sign-in also returns an access
-   token, which the script discards. The app's first access token comes from its
-   own first redemption (§5).
+   with `graph_auth.store_refresh_token`, and prints the new version. If the
+   write fails, the script stops with an error and exit code 1, saying that
+   nothing was written. Before 2026-10-04 it printed success either way. The
+   sign-in also returns an access token, which the script discards. The app's
+   first access token comes from its own first redemption (§5).
 
 ### 4.1 Running it
 
@@ -152,11 +154,12 @@ Then:
    actually prompted (§7). Continue only if the page names *Noble Universal
    Print* and the code matches the one the script printed. Sign in as the
    intended account (§4.2) and complete MFA.
-2. Read the output. It should say `signed in as <account>`. A
-   `could not write the rotated refresh token back to Key Vault` warning means
-   the write failed, whatever the next line says.
-3. Prove that the write landed. The Versions blade should show a new
-   *CURRENT VERSION*, or:
+2. Read the output. It should say `signed in as <account>`, then
+   `stored refresh token in secret ... (version <id>, created <time>)`. If it
+   stops with `could not store the refresh token ...` instead, nothing was
+   written: fix the cause it names and run it again.
+3. Cross-check the write. The Versions blade's *CURRENT VERSION* should be the
+   version the script printed, or:
 
    ```powershell
    # prints UTC (+00:00): Vancouver + 7 h in summer, + 8 h in winter
@@ -174,11 +177,12 @@ Then:
 >   https://YOUR-KEYVAULT.vault.azure.net/`, and this machine's did on
 >   2026-10-04. The runbook's `$env:KEY_VAULT_URI = "https://$VAULT.vault.azure.net/"`
 >   becomes `https://.vault.azure.net/` in a new window where `$VAULT` is not
->   set. That value is non-empty, so it also blocks the settings file.
-> - **The write is best-effort.** If it fails, the script prints the warning and
->   then `stored refresh token in secret ...` anyway. The warning adds "the
->   previous token remains valid", which is untrue at this moment: the previous
->   token is the dead one.
+>   set. That value is non-empty, so it also blocks the settings file. Either
+>   way, the write fails only after you have signed in.
+> - **The write must succeed.** Until 2026-10-04 the script used the runtime's
+>   best-effort write, so a failed write printed a warning and then
+>   `stored refresh token ...` anyway. It now stops with an error that names the
+>   vault and says nothing was written.
 > - **The write uses your own Azure sign-in.** `DefaultAzureCredential` runs
 >   `az.cmd` as a child process, so a PowerShell-profile `az` wrapper does not
 >   apply. You need *Key Vault Secrets Officer* on `kv-noble-print`.
@@ -202,7 +206,7 @@ under per-user MFA, because the remember-MFA period is tenant-wide.
 
 ### 4.3 Scopes
 
-[`graph_auth.SCOPES`](../functionapp/graph_auth.py#L67): `Sites.ReadWrite.All`,
+[`graph_auth.SCOPES`](../functionapp/graph_auth.py#L71): `Sites.ReadWrite.All`,
 `PrintJob.ReadWriteBasic`, `PrintJob.Create`, `Printer.Read.All`,
 `PrinterShare.ReadBasic.All`. MSAL adds `offline_access`, `openid` and
 `profile` itself.
@@ -256,7 +260,7 @@ and every 3 hours by October.
 
 ### 5.2 The code: `get_access_token()`
 
-From [`graph_auth.py`](../functionapp/graph_auth.py#L203). The docstring is
+From [`graph_auth.py`](../functionapp/graph_auth.py#L215). The docstring is
 omitted and the `# step` markers are added:
 
 ```python
@@ -288,7 +292,7 @@ def get_access_token() -> str:
 
 ### 5.3 The exchange with Entra: `_redeem()`
 
-From [`graph_auth.py`](../functionapp/graph_auth.py#L183), with comments omitted:
+From [`graph_auth.py`](../functionapp/graph_auth.py#L195), with comments omitted:
 
 ```python
 def _redeem(refresh_token: str) -> dict:
@@ -388,7 +392,8 @@ Three qualifications:
 
 **Entra creates it**, in the same response as the access token; the app never
 builds or changes a token. The app's part is to store it
-(`write_refresh_token` → `set_secret`, which creates a new version) and to read
+(`write_refresh_token` → `store_refresh_token` → `set_secret`, which creates a
+new version) and to read
 the newest version next time (`read_refresh_token` → `get_secret` with no
 version, which returns the latest).
 
@@ -508,16 +513,6 @@ Multifactor authentication → Configure → Additional cloud-based MFA settings
 | More than 30 (Microsoft training material gives 90 as the default) | The token's MFA predates the bootstrap, from an earlier sign-in or a browser that remembered MFA. Microsoft does not document that case, and the interval cannot be predicted from the bootstrap date. |
 | Less than 30 | It was lowered after the 18:00 success; a chain could not have lasted 30 days under it. |
 
-> **Other docs miss this.** [timing.md](timing.md) note [5] and
-> [power-automate-integration.md](power-automate-integration.md) say a regularly
-> running app "never ages out", and list password change, MFA reset and admin
-> revocation. [deploy-to-azure.md §1](deploy-to-azure.md#the-service-account)
-> and the `graph_auth.py` docstring give 90 days and list password changes,
-> resets and revocation. The same list recurs elsewhere in deploy-to-azure.md,
-> and in design.md, README.md, e2e-testing.md and the `bootstrap_token.py`
-> docstring. None of them mentions an MFA-age limit, which ends the token
-> however often it is used.
-
 ## 8. Diagnosing
 
 1. **The error text.** In Power Automate, open *Parse Health* (or the Health
@@ -597,4 +592,4 @@ Multifactor authentication → Configure → Additional cloud-based MFA settings
 | Bearer header, token fetched per attempt | `graph_client.GraphClient.request` | none |
 | No token on download or upload | `graph_client.*_unauthenticated` | `tests/test_adapters.py`: `test_download_url_is_fetched_without_an_authorization_header`, `test_the_upload_put_carries_no_authorization_header` |
 | Error to flow response | `function_app.check_printer_health`, `function_app._server_error` | `test_the_endpoint_surfaces_the_remedy`, `tests/test_health.py` |
-| The bootstrap | `scripts/bootstrap_token.py` | none: it is interactive |
+| The bootstrap's write, which must fail loudly | `scripts/bootstrap_token.py` → `graph_auth.store_refresh_token` | `test_the_bootstrap_stops_when_the_vault_write_fails`, `test_the_bootstrap_reports_the_version_it_stored`, `test_the_bootstrap_write_raises_where_the_rotation_write_swallows`. The sign-in itself is faked. |

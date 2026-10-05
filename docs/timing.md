@@ -12,6 +12,7 @@ the **code**, not the other docs — a few of those have drifted.
 | 🛠 | **App — code** | edit the constant in source | **yes** |
 | 📄 | **App — host.json** | edit `functionapp/host.json` | **yes** |
 | 🔁 | **Power Automate** | edit the flow's Recurrence trigger | no |
+| 🛡️ | **Entra tenant setting** | an administrator, in the Microsoft Entra admin center | no |
 | 🔒 | **Azure / Microsoft** | **cannot be changed** | — |
 
 ---
@@ -25,6 +26,7 @@ the **code**, not the other docs — a few of those have drifted.
 | 🛠 App — code | 4 | retry attempts, backoff, `Retry-After` cap, token refresh margin |
 | 📄 App — host.json | 1 | `functionTimeout` (currently unset) |
 | 🔁 Power Automate | 3 | Flow A / B / D recurrences |
+| 🛡️ Entra tenant setting | 1 | the MFA age limit on the refresh token (*remember multifactor authentication* days) |
 | 🔒 Azure / Microsoft | 6 | connector budget, token lifetimes, URL expiries, job retention |
 
 ---
@@ -74,8 +76,9 @@ Note **[4]**.
 | Timer | Value | Owner | Defined in |
 |---|---|---|---|
 | Access token lifetime | **~60–90 min** | 🔒 **fixed** (Entra) | — |
-| `REFRESH_MARGIN_SECONDS` | **300 s (5 min)** | 🛠 code | [graph_auth.py:57](../functionapp/graph_auth.py#L57) |
+| `REFRESH_MARGIN_SECONDS` | **300 s (5 min)** | 🛠 code | [graph_auth.py:82](../functionapp/graph_auth.py#L82) |
 | **Refresh token lifetime** | **90 days** inactivity | 🔒 **fixed** (Entra) | — |
+| **MFA age limit** on the refresh token | per-user MFA *remember multifactor authentication* days. **30** fits the 2026-10-03 failure; read the setting to confirm | 🛡️ tenant setting | *Entra ID → Users → Per-user MFA → service settings* |
 
 Note **[5]**.
 
@@ -236,11 +239,15 @@ without it a throttled batch retries in lockstep and trips the throttle again.
 
 **[5] The refresh token is the operational timer to watch.** It rotates on every
 redemption and Entra does not revoke the old one, so an app that runs regularly
-never ages out — 90 days is an **inactivity** window. What kills it: a password
-change, MFA reset, or admin revocation. **Password expiry alone does not.** When it
-dies every call fails with `AuthBootstrapRequired` and recovery needs a human
-running `scripts/bootstrap_token.py`. **Nothing alerts on this** — design §13.8
-watches for *silence in the logs*, which reads identically to a quiet week.
+stays clear of the 90-day **inactivity** window. It does **not** stay clear of the
+MFA age limit: every redemption checks that the MFA inside the token falls within
+the tenant's *remember multifactor authentication* days, and a redemption adds no
+MFA. That ended the token on 2026-10-03, about 30 days after the bootstrap
+(`AADSTS50078`). A password change or reset, or an admin revocation, ends it at
+once. **Password expiry alone does not.** When it dies every call fails with
+`AuthBootstrapRequired` and recovery needs a human running
+`scripts/bootstrap_token.py`. **Nothing alerts on this** — design §13.8 watches for
+*silence in the logs*, which reads identically to a quiet week.
 
 **[6] Flow B's 10-minute cadence prevents UC-9.** Poll must run more often than
 Universal Print discards finished jobs. If a job completes and is purged before
@@ -271,7 +278,7 @@ accepts `image/pwg-raster` only.
 | # | Timer | Why |
 |---|---|---|
 | 1 | UP job retention **[7]** | Unmeasured, and it is the input to Flow B's cadence. Everything else here is a knob; this is a fact nobody has yet. |
-| 2 | Refresh token 90 days **[5]** | Silent until it is not. Recovery needs a human, and no alert exists. |
+| 2 | Refresh token: the MFA inside it ages out (about 30 days on 2026-10-03) **[5]** | Silent until it is not, and regular use does not prevent it. Recovery needs a human, and no alert exists. |
 | 3 | The 90 s / 120 s pair **[1]** | The only chain where a violation is invisible — no response, so no retry and no notification. |
 
 ---

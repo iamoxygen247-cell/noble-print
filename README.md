@@ -144,10 +144,14 @@ account signs in once interactively and its refresh token lives in Key Vault:
 .\.venv\Scripts\python.exe scripts\bootstrap_token.py
 ```
 
-Run that once per environment, and again whenever the token is revoked — a
-password change, an SSPR, an admin reset, or an explicit revocation will do it.
-Password *expiry* alone will not. When it breaks, every endpoint returns 500 with
-`"remedy": "run scripts/bootstrap_token.py"`.
+Run that once per environment, and again whenever the token stops working.
+Regular use does not prevent that: on every redemption Entra checks the age of the
+MFA inside the token against the tenant's *remember multifactor authentication*
+days, which is what ended it on 2026-10-03, about 30 days after the bootstrap
+(`AADSTS50078`). A password change, an SSPR, an admin reset or an explicit
+revocation ends it at once. Password *expiry* alone will not. When it breaks,
+every endpoint returns 500 with `"remedy": "run scripts/bootstrap_token.py"`. See
+[docs/access-and-refresh-tokens.md](docs/access-and-refresh-tokens.md#7-what-ends-a-refresh-token).
 
 ## Prerequisites
 

@@ -16,13 +16,21 @@ refresh token in Key Vault. Two behaviours matter enough to pin:
 
 from __future__ import annotations
 
+import os
+import pathlib
+import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
 import function_app
 import graph_auth
 from helpers import SITE, SUBMIT, as_json, post
+
+_SCRIPTS = pathlib.Path(__file__).resolve().parent.parent / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
 
 
 @pytest.fixture(autouse=True)
@@ -162,14 +170,29 @@ def test_a_key_vault_write_failure_does_not_fail_the_request(monkeypatch):
     assert len(calls) == 1
 
 
+def test_the_bootstrap_write_raises_where_the_rotation_write_swallows(monkeypatch):
+    """Same Key Vault write, opposite failure policy. The runtime's rotation must
+    not fail a print run over the NEXT token; the bootstrap's whole job is the
+    write, so its failure has to surface."""
+    def unreachable_vault():
+        raise RuntimeError("vault unreachable")
+
+    monkeypatch.setattr(graph_auth, "_secret_client", unreachable_vault)
+
+    with pytest.raises(RuntimeError, match="vault unreachable"):
+        graph_auth.store_refresh_token("refresh-token-v2")
+    graph_auth.write_refresh_token("refresh-token-v2")  # logs a warning, raises nothing
+
+
 # --- a dead token names its own fix ------------------------------------------
 
 
 @pytest.mark.parametrize("error", ["invalid_grant", "interaction_required",
                                    "invalid_client"])
 def test_a_revoked_token_asks_for_the_bootstrap_script(monkeypatch, vault, error):
-    """A password change, an SSPR, an admin reset or an explicit revocation all
-    land here, and none of them can be fixed in code."""
+    """A password change, an SSPR, an admin reset, an explicit revocation or an
+    MFA that has aged out (AADSTS50078) all land here, and none of them can be
+    fixed in code."""
     import msal
 
     class FakeApp:
@@ -222,6 +245,87 @@ def test_the_endpoint_surfaces_the_remedy(graph, monkeypatch):
 
     assert response.status_code == 500
     assert payload["remedy"] == "run scripts/bootstrap_token.py"
+
+
+# --- the bootstrap --------------------------------------------------------------
+
+BOOTSTRAP_VAULT = "https://kv-bootstrap.vault.azure.net/"
+
+
+class FakeDeviceFlowApp:
+    """msal.PublicClientApplication for the bootstrap: the device-code sign-in
+    always succeeds and hands back a refresh token."""
+
+    def __init__(self, **kwargs):
+        pass
+
+    def initiate_device_flow(self, scopes):
+        return {"user_code": "ABC123", "message": "enter ABC123 at the device login page"}
+
+    def acquire_token_by_device_flow(self, flow):
+        return {"access_token": "access-1", "refresh_token": "refresh-token-new",
+                "id_token_claims": {"preferred_username": "print@contoso.example"}}
+
+
+@pytest.fixture
+def bootstrap(monkeypatch):
+    """bootstrap_token.main() offline: no local settings file, no real sign-in,
+    and the vault named on the command line, as an operator would."""
+    import msal
+
+    # The script pops REQUESTS_CA_BUNDLE when first imported; keep that inside
+    # this test's environment rather than the rest of the session's.
+    if "REQUESTS_CA_BUNDLE" in os.environ:
+        monkeypatch.setenv("REQUESTS_CA_BUNDLE", os.environ["REQUESTS_CA_BUNDLE"])
+    import bootstrap_token
+
+    monkeypatch.delenv("PRINT_REFRESH_TOKEN_SECRET", raising=False)
+    monkeypatch.setattr(bootstrap_token, "_load_local_settings", lambda: None)
+    monkeypatch.setattr(msal, "PublicClientApplication", FakeDeviceFlowApp)
+    monkeypatch.setattr(sys, "argv", ["bootstrap_token.py", "--vault", BOOTSTRAP_VAULT])
+    return bootstrap_token.main
+
+
+def test_the_bootstrap_stops_when_the_vault_write_fails(bootstrap, monkeypatch, capsys):
+    """It used to call the best-effort write_refresh_token, so a failed write --
+    a placeholder vault URL, a credential that cannot reach the vault -- logged a
+    warning and then printed "stored refresh token" anyway, leaving the Function
+    App on the dead token. Found 2026-10-04, with this repo's placeholder
+    KEY_VAULT_URI still in a local.settings.json."""
+    def unreachable_vault():
+        raise RuntimeError("vault unreachable")
+
+    monkeypatch.setattr(graph_auth, "_secret_client", unreachable_vault)
+
+    with pytest.raises(SystemExit) as excinfo:
+        bootstrap()
+
+    message = str(excinfo.value.code)
+    assert "NOTHING WAS WRITTEN" in message
+    assert BOOTSTRAP_VAULT in message
+    assert "vault unreachable" in message
+    assert "stored refresh token" not in capsys.readouterr().out
+
+
+def test_the_bootstrap_reports_the_version_it_stored(bootstrap, monkeypatch, capsys):
+    """The success line names the new version, so it can be matched against the
+    vault's Versions blade instead of being taken on trust."""
+    writes = []
+
+    class FakeSecretClient:
+        def set_secret(self, name, value):
+            writes.append((name, value))
+            return SimpleNamespace(properties=SimpleNamespace(
+                version="v-new", created_on="2026-10-05 03:00:00+00:00"))
+
+    monkeypatch.setattr(graph_auth, "_secret_client", FakeSecretClient)
+
+    assert bootstrap() == 0
+    assert writes == [("up-print-refresh-token", "refresh-token-new")]
+    out = capsys.readouterr().out
+    assert ("stored refresh token in secret 'up-print-refresh-token' at "
+            + BOOTSTRAP_VAULT) in out
+    assert "version v-new" in out
 
 
 # --- required configuration ---------------------------------------------------

@@ -27,9 +27,13 @@ two concurrent invocations both succeed and last-write-wins stores a valid token
 An earlier draft of this design serialised the read-redeem-write with a blob
 lease; it was solving a problem that does not exist and was removed.
 
-WHAT BREAKS IT. The refresh token lasts 90 days and is revoked by a password
-change, a self-service password reset, an admin password reset, or an explicit
-revocation. Password *expiry* alone does not revoke it. When it does break, every
+WHAT BREAKS IT. Rotation keeps the refresh token clear of its 90-day inactivity
+limit, but not of the age of the MFA inside it: with per-user MFA's "remember
+multifactor authentication" on, every redemption checks that the last MFA falls
+within that many days, and a redemption adds none. That ended the token on
+2026-10-03, about 30 days after the bootstrap (AADSTS50078). A password change, a
+self-service password reset, an admin password reset or an explicit revocation
+ends it at once; password *expiry* alone does not. Whatever the cause, every
 endpoint fails the same way and the fix is always the same, so the error names the
 script to run rather than making someone diagnose it.
 """
@@ -40,7 +44,7 @@ import logging
 import os
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 # Delegated scopes. offline_access / openid / profile are added by MSAL itself
 # and must not be listed here -- MSAL rejects the reserved scopes.
@@ -149,6 +153,14 @@ def read_refresh_token() -> str:
         )
 
 
+def store_refresh_token(value: str) -> Any:
+    """Write the refresh token as a new version of the secret and return that
+    version's properties. Raises on any failure. scripts/bootstrap_token.py calls
+    this directly: there the write is the whole point, and a failure must stop the
+    script rather than let it report success."""
+    return _secret_client().set_secret(secret_name(), value).properties
+
+
 def write_refresh_token(value: str) -> None:
     """Persist the rotated refresh token. Best-effort: the access token we just
     obtained is valid regardless, and failing the request because we could not
@@ -158,7 +170,7 @@ def write_refresh_token(value: str) -> None:
     if os.getenv("PRINT_REFRESH_TOKEN"):
         return  # local dev: nothing to write back to
     try:
-        _secret_client().set_secret(secret_name(), value)
+        store_refresh_token(value)
     except Exception:
         logging.warning("could not write the rotated refresh token back to Key Vault; "
                         "the previous token remains valid", exc_info=True)
@@ -190,7 +202,7 @@ def _redeem(refresh_token: str) -> dict:
         error = result.get("error", "unknown_error")
         description = result.get("error_description", "")
         # invalid_grant is the whole family of "the token is no longer usable":
-        # expired, revoked, password changed, consent withdrawn.
+        # expired, revoked, password changed, consent withdrawn, MFA too old.
         if error in ("invalid_grant", "interaction_required", "invalid_client"):
             raise AuthBootstrapRequired(
                 f"the stored refresh token is no longer valid ({error}). "

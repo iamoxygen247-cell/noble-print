@@ -284,6 +284,12 @@ Whoever signs in at step 5 **owns every print job**. Use a dedicated account, no
 a person's. Its lifecycle is now load-bearing:
 
 - The refresh token lasts **90 days**, rolling.
+- **Rolling does not renew the MFA inside it.** With per-user MFA's *remember
+  multifactor authentication* on, every redemption checks that the account's last
+  MFA falls within that many days, and a redemption adds none. That ended the
+  token on 2026-10-03, about 30 days after step 5 (`AADSTS50078`). Read the
+  setting (*Entra ID → Users → Per-user MFA → service settings*) and diarise
+  re-running step 5 before it elapses.
 - It is revoked by a password change, a self-service reset, an admin reset, or an
   explicit revocation. **Password expiry alone does not revoke it.**
 - Exclude the account from password-expiry policy, or diarise re-running step 5.
@@ -635,8 +641,9 @@ the right to. This is inherent to Azure RBAC; it is stated here so nobody reads
 > broadest by far is **`Sites.ReadWrite.All`** — read and write **every SharePoint
 > site collection that account can reach** — alongside the four print scopes.
 > Whoever holds it can act as that account across SharePoint generally. It lasts
-> 90 days rolling and is revoked by a password change or reset, **not** by password
-> expiry; see the service-account note in §1.
+> 90 days rolling, ends sooner when the MFA inside it ages out, and is revoked by a
+> password change or reset, **not** by password expiry; see the service-account
+> note in §1.
 
 **Two exposures this vault does not cover.** `PRINT_REFRESH_TOKEN` as an app
 setting bypasses it completely — a local-development escape hatch that must never
@@ -652,7 +659,7 @@ on — the trade recorded in CLAUDE.md.
 | | Access token | Refresh token |
 |---|---|---|
 | Kept in | the worker process's **memory** | **Key Vault** |
-| Lasts | ~60–90 minutes | **90 days** |
+| Lasts | ~60–90 minutes | **90 days** idle, or until the MFA inside it ages out (§1) |
 | Used for | every Graph call | obtaining the next access token |
 
 Every Graph call needs an access token, and `graph_auth.get_access_token` is what
@@ -671,7 +678,8 @@ Almost every one of those returns the token already in memory and touches nothin
 4. cache the access token in memory
 
 So at most **one** rotation per invocation, regardless of how many Graph calls it
-makes. The 90-day clock resets every time step 3 runs.
+makes. The 90-day clock resets every time step 3 runs; the MFA clock does not
+(§1).
 
 **What decides how often that happens is the worker process, not the call rate.**
 The cache is a module-level global, so a fresh Python process starts empty and
@@ -701,9 +709,10 @@ wins leaves a valid token.
 
 Only that recovery is manual. It cannot be automated — a dead refresh token needs
 a human at an interactive sign-in — so every endpoint answers 500 with
-`remedy: run scripts/bootstrap_token.py` until someone does. Being revoked by a
-password change or reset (not expiry) is the other way to get there; see the
-service-account note in §1.
+`remedy: run scripts/bootstrap_token.py` until someone does. The other ways to get
+there are the MFA inside the token ageing out, which happens however often the app
+runs, and a password change or reset (not expiry); see the service-account note
+in §1.
 
 ### 3.6 Confirm what exists
 
@@ -1372,11 +1381,12 @@ immediately and leaves the queue intact.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| 500, `remedy: run scripts/bootstrap_token.py` | Refresh token revoked or expired | Re-run step 5 |
+| 500, `remedy: run scripts/bootstrap_token.py` | Refresh token revoked, idle for 90 days, or the MFA inside it aged out (`AADSTS50078`) | Re-run step 5 |
 | 500 naming a column | Display-name mismatch in the library | Fix the column, or change the constants in `print_policy.py` |
 | Every query fails | `Print_Status` not indexed | Step 2 |
 | 403 from Key Vault in App Insights | Role is *Secrets User*, not *Officer* | Re-run step 4 |
 | Works for ~90 days then stops | Rotation was failing all along (read-only vault role) | Step 4, then step 5 |
+| Works for weeks (about 30 days on 2026-10-03), then stops, although rotation works | The MFA inside the token outlived the tenant's *remember multifactor authentication* days (`AADSTS50078`) | Step 5, then diarise the next one (§1) |
 | `does not accept application/pdf` | No printer profile matched this device's capability list | The app converts PDF → PWG raster; if it still refuses, the printer reports neither PDF nor `image/pwg-raster`. Check with `test.py dryrun` (`conversion: NONE`) and `live-printer-check.ps1 -DiagnoseOnly` |
 | `convert: ...` in `Print_Message` | The document could not be rasterized | A damaged or password-protected PDF, or one over `PRINT_RASTER_MAX_BYTES`. Reproduce locally: `python -m printing <file>.pdf out.pwg --dpi 300` |
 | Prints, but the page is cropped or scaled | The raster and the job configuration disagree | `scaling`/`margin`/`dpi` in `printing/profiles.py` must match the render dpi. Graph still reports `completed` — only the paper shows it |

@@ -11,9 +11,12 @@ and keep redeeming its refresh token. This script is that one time.
 
 Run it:
   * when first setting up an environment
-  * whenever the token stops working -- a password change, a self-service
-    password reset, an admin reset, or an explicit revocation will do it.
-    Password EXPIRY alone will not. The endpoints say so in their 500 body.
+  * whenever the token stops working. Regular use does not prevent that: the
+    MFA inside the token ages out after the tenant's "remember multifactor
+    authentication" days (AADSTS50078, about 30 days after the bootstrap on
+    2026-10-03), and a password change, a self-service password reset, an admin
+    reset or an explicit revocation ends it at once. Password EXPIRY alone will
+    not. The endpoints say so in their 500 body.
 
     .\\.venv\\Scripts\\python.exe scripts\\bootstrap_token.py
 
@@ -145,9 +148,21 @@ def main() -> int:
         print(refresh_token)
         return 0
 
-    graph_auth.write_refresh_token(refresh_token)
-    print("stored refresh token in secret {!r} at {}".format(
-        graph_auth.secret_name(), graph_auth.key_vault_uri()))
+    # Not write_refresh_token: that one is best-effort for the runtime's rotation
+    # and swallows failures, which here printed "stored" over an empty write.
+    vault = os.getenv("KEY_VAULT_URI") or "(KEY_VAULT_URI is not set)"
+    try:
+        stored = graph_auth.store_refresh_token(refresh_token)
+    except Exception as exc:
+        raise SystemExit(
+            "could not store the refresh token in secret {!r} at {}: {}: {}\n"
+            "The sign-in worked but NOTHING WAS WRITTEN: the Function App still "
+            "has the old token. Check the vault (--vault), your Azure sign-in "
+            "(az login) and that you hold Key Vault Secrets Officer on it, then "
+            "run this script again.".format(
+                graph_auth.secret_name(), vault, type(exc).__name__, exc))
+    print("stored refresh token in secret {!r} at {} (version {}, created {})".format(
+        graph_auth.secret_name(), vault, stored.version, stored.created_on))
     print()
     print("Verify with:")
     print("  .\\.venv\\Scripts\\python.exe scripts\\test.py dryrun "
